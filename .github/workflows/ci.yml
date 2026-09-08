@@ -66,3 +66,33 @@ jobs:
             ${{ github.ref_type == 'tag' && format('{0}:{1}', env.IMAGE_NAME, github.ref_name) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Smoke the pushed image
+        run: |
+          IMAGE="${IMAGE_NAME}:${{ steps.tag.outputs.tag }}"
+          echo "smoking $IMAGE"
+          docker rm -f apigw-tester-ci || true
+          docker run -d --name apigw-tester-ci \
+            -e APP_BASIC_AUTH=ci:ci-test-pass \
+            -p 18080:8080 "$IMAGE"
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/health || true)
+            if [ "$code" = "200" ]; then break; fi
+            if [ "$i" = "60" ]; then
+              docker logs apigw-tester-ci; exit 1
+            fi
+            sleep 2
+          done
+          # unauthorised requests must be rejected
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/summary)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/pets)"    = "401"
+          # authorized request works
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-test-pass http://127.0.0.1:18080/api/summary)" = "200"
+          # start a small run so the metrics pipeline really flows
+          curl -s -u ci:ci-test-pass -X POST http://127.0.0.1:18080/api/run/start \
+            -H "Content-Type: application/json" -d '{}' > /dev/null
+          sleep 15
+          total=$(curl -s -u ci:ci-test-pass "http://127.0.0.1:18080/api/summary?window=5m" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).total))")
+          echo "total=$total"
+          test "$total" -gt 50
+          docker rm -f apigw-tester-ci
