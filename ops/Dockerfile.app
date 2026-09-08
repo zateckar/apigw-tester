@@ -1,10 +1,11 @@
 # Build the React dashboard first
 FROM node:22-alpine AS ui
-WORKDIR /repo/packages/ui
-COPY packages/ui/package.json package.json
-RUN npm install
-COPY packages/ui ./
-RUN npm run build
+WORKDIR /repo
+COPY package.json tsconfig.base.json ./
+COPY packages/ui/package.json packages/ui/
+RUN npm install -w @apigw/ui --include-workspace-root=false
+COPY packages/ui packages/ui
+RUN npm run build -w @apigw/ui
 
 # Build the app (TS → JS), prune to prod deps
 FROM node:22-alpine AS server
