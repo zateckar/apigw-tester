@@ -1,6 +1,6 @@
 # apigw-tester
 
-A self-contained, always-on test rig for an **API gateway**: it continuously hammers the gateway with realistic Petstore traffic (REST + SOAP), captures per-request metrics, and shows everything on a live dashboard — **as one process, one port, one Docker container**.
+A self-contained, always-on test rig for an **API gateway**: it continuously hammers the gateway with realistic Petstore traffic (REST + SOAP), captures **per-request metrics including how much the gateway is adding to each call**, and shows everything on a live dashboard — **as one process, one port, one Docker container, secured with Basic auth**.
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -9,14 +9,18 @@ A self-contained, always-on test rig for an **API gateway**: it continuously ham
 │  │  React dashboard (served from / , poll /api/*)    │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │  Metrics store (node:sqlite, minute+hour roll-ups)│ │
+│  │         baseline: direct-to-SUT vs through-GW     │ │
 │  ├──────────────────────────────────────────────────┤ │
-│  │  Load driver  ── in-process ──►  metrics store    │ │
-│  │      │                                            │ │
+│  │  Load driver  ── class-tagged requests            │ │
+│  │      │  small-rest | soap | big-response           │ │
+│  │      │  big-request | slow-upstream | concurrency │ │
 │  │      └── HTTP/SOAP ──► target gateway             │ │
 │  │             (default: built-in petstore, this app)│ │
 │  └──────────────────────────────────────────────────┘ │
 │  ┌──────────────────────────────────────────────────┐ │
 │  │  Petstore SUT  (/api/pets, /soap/petservice)     │ │
+│  │    + synthetic endpoints for GW stress testing:   │ │
+│  │    /api/big/:size  /api/slow/:ms  /api/echo       │ │
 │  └──────────────────────────────────────────────────┘ │
 └────────────────────────────────────────────────────────┘
 ```
@@ -63,10 +67,10 @@ You can also pull the image built by CI directly:
 
 | Piece | Where | Notes |
 |---|---|---|
-| Petstore SUT | `packages/app/src/petstore/` | REST CRUD + SOAP WSDL; per-endpoint latency distributions, response padding, optional chaos via `/admin/*` |
-| Load driver | `packages/app/src/loadgen/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily`; weighted scenario mix; bounded spool; day-long runs |
-| Metrics store | `packages/app/src/metrics/` | `node:sqlite` (no native deps), WAL mode, 24h raw ring + minute + hour histogram roll-ups |
-| Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme |
+| Petstore SUT | `packages/app/src/petstore/` | REST CRUD + SOAP WSDL; per-endpoint latency distributions, response padding, optional chaos via `/admin/*`. Stress endpoints: `GET /api/big/:size`, `GET /api/slow/:ms`, `POST /api/echo` |
+| Load driver | `packages/app/src/loadgen/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily / real`; weighted scenario + stress-class mix; per-class baseline (direct-to-SUT) probes |
+| Metrics store | `packages/app/src/metrics/` | `node:sqlite` (no native deps), WAL mode, 24h raw ring + minute + hour histogram roll-ups with per-class use |
+| Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme; "GW overhead" is the headline metric |
 | Shared types | `packages/shared/` | Everything the layers share |
 
 ## Development
@@ -74,38 +78,45 @@ You can also pull the image built by CI directly:
 ```bash
 npm install        # needs Node >= 22.5 (node:sqlite)
 npm run build      # shared → app → ui, then bake ui/dist into app/dist/public
-npm test           # 41 tests across the monorepo
-npm run compose:up # one container on :8080
+npm test           # 51 tests across the monorepo
+npm run compose:up # one container on :8080 (must set APP_BASIC_AUTH first)
 ```
 
 Run locally without Docker:
 
 ```bash
+$env:APP_BASIC_AUTH = "admin:dev-local"   # or export on Linux/macOS
 npm run build
 cp -r packages/ui/dist packages/app/dist/public
-npm start          # serves on http://localhost:8080
+npm start          # serves on http://localhost:8080 with auth
 ```
+
+**How the "GW overhead" metric works.** Each stress class (`small-rest`, `soap`, `big-response`, `big-request`, `slow-upstream`, `concurrency`) has an associated baseline profile. Once a minute the driver calls the same class's endpoint **directly against the in-process Petstore** (bypassing any gateway), measures the latency distribution, and stores it. Every outgoing request then carries `latencyMs` (through the GW) and `overheadMs = latencyMs − baselineMs(class)`. The dashboard's top-row tile, the "GW overhead" time series, and the per-class table all read that — so the number you see is how slow your gateway makes each call class compared with raw target.
 
 ## Load profiles
 
 Controlled from the UI drawer (`Configure → Load profile`) or directly:
 
 ```bash
-curl -X PUT http://localhost:8080/api/config/profile \
+curl -u admin:your-strong-password \
+  -X PUT http://localhost:8080/api/config/profile \
   -H "Content-Type: application/json" \
   -d '{
-    "mode": "constant", "rps": 25,
-    "maxConcurrency": 25,
-    "soapRatioPct": 25,
+    "mode": "real", "rps": 25,
+    "maxConcurrency": 50,
+    "soapRatioPct": 20,
     "scenarioWeights": { "listPets": 50, "getPet": 20, "createPet": 10, "updatePet": 5, "deletePet": 5, "placeOrder": 10 }
   }'
 ```
 
-Modes: `constant`, `ramp`, `spike`, `sine-daily` (day/night pattern). Start/stop runs:
+Modes: `constant`, `ramp`, `spike`, `sine-daily`, **`real`** (workweek simulation: workday peaks, lunch dip, overnight dip, slow drift, jitter — starting at a random time-of-day so consecutive runs don't align).
+
+Start/stop runs:
 
 ```bash
-curl -X POST http://localhost:8080/api/run/start -H "Content-Type: application/json" -d '{}'
-curl -X POST http://localhost:8080/api/run/stop
+curl -u admin:your-strong-password -X POST http://localhost:8080/api/run/start \
+  -H "Content-Type: application/json" -d '{}'
+curl -u admin:your-strong-password -X POST http://localhost:8080/api/run/stop
 ```
 
 ## Metrics API (all same-host, same port)
@@ -129,4 +140,7 @@ curl -X POST http://localhost:8080/api/run/stop
 
 ## CI
 
-`.github/workflows/ci.yml` runs: lint → typecheck → unit tests → full `docker build` + `docker compose` smoke test that starts a tiny load run and asserts metrics flow.
+`.github/workflows/ci.yml`:
+
+1. `build-test` (fast) — lint, `tsc --noEmit`, 51 unit tests.
+2. `image` (`needs: build-test`) — multi-stage docker build from `ops/Dockerfile.app`, push to `ghcr.io/<owner>/apigw-tester:<sha>` and `:latest`, then a **smoke test**: pulls the image, runs it with a test credential, asserts unauthorized requests get 401, authorized get 200, then fires a short real load run and verifies metrics flow into the DB.
