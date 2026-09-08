@@ -2,19 +2,22 @@ name: apigw-tester
 
 services:
   app:
+    image: ${IMAGE:-apigw-tester:latest}
     build:
       context: .
       dockerfile: ops/Dockerfile.app
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:8080"
     environment:
+      # Mandatory. The container refuses to start if APP_BASIC_AUTH is missing.
+      APP_BASIC_AUTH: ${APP_BASIC_AUTH:?set APP_BASIC_AUTH=name:password before running}
       DB_PATH: /app/data/metrics.db
       PETSTORE_SELF_URL: http://127.0.0.1:8080
     volumes:
       - app-data:/app/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 15s
       timeout: 3s
       retries: 5

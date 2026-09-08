@@ -23,14 +23,41 @@ A self-contained, always-on test rig for an **API gateway**: it continuously ham
 
 ## Quick start
 
-```bash
+```powershell
+# One command, mandatory credential picked up from environment
+$env:APP_BASIC_AUTH = "admin:your-strong-password"
 docker compose up --build -d
-# open http://localhost:8080
+# open http://localhost:8080 (Basic auth, your name/password)
 ```
 
 That's the whole stack. The dashboard opens on the same port as the API; Petstore is the SUT at `/api/pets` (REST) and `/soap/petservice` (SOAP) on the same port; the load driver starts stopped, hit **Start run** in the UI to begin.
 
 Default gateway target is the bundled Petstore on `127.0.0.1:8080` (so everything works out of the box). To test a real gateway open **Configure → API Gateway** and set the base URL + API key.
+
+## Production deployment
+
+The compose file and image are intended to be safe on the public internet:
+
+- **Authentication is mandatory.** The container exits at startup with a FATAL if `APP_BASIC_AUTH` (`name:password`) is unset. Every route — UI, petstore, admin, metrics — requires the same `Authorization: Basic …` header. Only `/health` is public, deliberately, for load-balancer probes (returns just `{status: "ok"}`).
+- **Single bounded port.** `EXPOSE 8080`, `USER node` — no root, no extra listeners.
+- **Persistent state.** `/app/data` is a named volume with the SQLite file and the `config` table (GW + load-profile settings survive restarts).
+- **Credentials via env or secret store only.** Never commit `APP_BASIC_AUTH` to git. For a real deployment source it from `APP_BASIC_AUTH=$(pass show apigw)` / Docker secrets / your orchestrator's secret mount.
+- **TLS terminate upstream.** Put the container behind your reverse proxy (Caddy, nginx, Traefik, cloudflare tunnel) so Basic credentials never transit the internet in plain text.
+
+Health checks online: `GET /health` — no auth needed.
+
+```yaml
+# docker-compose.yml snippet for a production host
+services:
+  app:
+    image: ghcr.io/<owner>/apigw-tester:latest
+    environment:
+      APP_BASIC_AUTH: ${APP_BASIC_AUTH:?'set a credentialed name:password'}
+    volumes: [app-data:/app/data]
+```
+
+You can also pull the image built by CI directly:
+`docker pull ghcr.io/<owner>/apigw-tester:latest` or a versioned tag (`ghcr.io/<owner>/apigw-tester:v1.0.0`).
 
 ## What's inside
 

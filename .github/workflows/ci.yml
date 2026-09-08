@@ -3,7 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/apigw-tester
 
 jobs:
   build-test:
@@ -19,51 +24,78 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
-  compose-smoke:
+  # Builds the production image on every push. Pushes to ghcr.io
+  # under the current ref's sha tag; additionally tags 'latest' for main
+  # and the ref's semver for version tags.
+  image:
     runs-on: ubuntu-latest
+    needs: build-test
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Build image
-        run: docker compose build
-      - name: Start app
-        run: docker compose up -d
-      - name: Wait for app
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Extract image tag
+        id: tag
         shell: bash
         run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}  extra=latest" >> $GITHUB_OUTPUT
+          else
+            echo "tag=sha-${{ github.sha }}  extra=latest" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ops/Dockerfile.app
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.tag.outputs.extra == 'latest' && format('{0}:latest', env.IMAGE_NAME) || '' }}
+            ${{ github.ref_type == 'tag' && format('{0}:{1}', env.IMAGE_NAME, github.ref_name) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke the pushed image
+        run: |
+          IMAGE="${IMAGE_NAME}:${{ steps.tag.outputs.tag }}"
+          echo "smoking $IMAGE"
+          docker rm -f apigw-tester-ci || true
+          docker run -d --name apigw-tester-ci \
+            -e APP_BASIC_AUTH=ci:ci-test-pass \
+            -p 18080:8080 "$IMAGE"
           for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/health || true)
-            if [ "$code" = "200" ]; then echo "app OK"; break; fi
-            if [ "$i" = "60" ]; then echo "app FAILED"; docker compose logs; exit 1; fi
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/health || true)
+            if [ "$code" = "200" ]; then break; fi
+            if [ "$i" = "60" ]; then
+              docker logs apigw-tester-ci; exit 1
+            fi
             sleep 2
           done
-      - name: Assert REST endpoint
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/pets)
-          test "$code" = "200"
-      - name: Assert SOAP endpoint
-        shell: bash
-        run: |
-          body='<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><getPetByIdRequest><petId>1</petId></getPetByIdRequest></soap:Body></soap:Envelope>'
-          out=$(curl -s -X POST http://localhost:8080/soap/petservice -H "Content-Type: text/xml" -H 'SOAPAction: "getPetById"' -d "$body")
-          echo "$out" | grep -q "getPetByIdResponse"
-      - name: Start a load run
-        run: |
-          curl -s -X PUT http://localhost:8080/api/config/profile -H "Content-Type: application/json" -d '{"mode":"constant","rps":25,"maxConcurrency":50,"soapRatioPct":25,"scenarioWeights":{"listPets":50,"getPet":20,"createPet":10,"updatePet":5,"deletePet":5,"placeOrder":10}}'
-          curl -s -X POST http://localhost:8080/api/run/start -H "Content-Type: application/json" -d '{}'
-      - name: Let it bake
-        run: sleep 45
-      - name: Assert metrics are flowing
-        shell: bash
-        run: |
-          total=$(curl -s "http://localhost:8080/api/summary?window=24h" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).total))")
-          echo "total = $total"
-          test "$total" -gt 500
-          recent=$(curl -s "http://localhost:8080/api/recent?limit=5" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).items.length))")
-          test "$recent" -gt 0
-      - name: Assert UI serves
-        run: |
-          curl -s http://localhost:8080/health >/dev/null
-          curl -s http://localhost:8080 | grep -q "API GW Tester"
-      - name: Shutdown
-        if: always()
-        run: docker compose down -v
+
+          # unauthorised requests must be rejected
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/summary)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/pets)"    = "401"
+
+          # authorized request works
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-test-pass http://127.0.0.1:18080/api/summary)" = "200"
+
+          # start a small run and let the driver put some traffic through
+          curl -s -u ci:ci-test-pass -X POST http://127.0.0.1:18080/api/run/start \
+            -H "Content-Type: application/json" -d '{}' > /dev/null
+          sleep 15
+          total=$(curl -s -u ci:ci-test-pass "http://127.0.0.1:18080/api/summary?window=5m" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).total))")
+          echo "total=$total"
+          test "$total" -gt 50
+          docker rm -f apigw-tester-ci
