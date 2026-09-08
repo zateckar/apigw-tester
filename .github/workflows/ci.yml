@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker compose build
+      - name: Start app
+        run: docker compose up -d
+      - name: Wait for app
+        shell: bash
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/health || true)
+            if [ "$code" = "200" ]; then echo "app OK"; break; fi
+            if [ "$i" = "60" ]; then echo "app FAILED"; docker compose logs; exit 1; fi
+            sleep 2
+          done
+      - name: Assert REST endpoint
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/pets)
+          test "$code" = "200"
+      - name: Assert SOAP endpoint
+        shell: bash
+        run: |
+          body='<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><getPetByIdRequest><petId>1</petId></getPetByIdRequest></soap:Body></soap:Envelope>'
+          out=$(curl -s -X POST http://localhost:8080/soap/petservice -H "Content-Type: text/xml" -H 'SOAPAction: "getPetById"' -d "$body")
+          echo "$out" | grep -q "getPetByIdResponse"
+      - name: Start a load run
+        run: |
+          curl -s -X PUT http://localhost:8080/api/config/profile -H "Content-Type: application/json" -d '{"mode":"constant","rps":25,"maxConcurrency":50,"soapRatioPct":25,"scenarioWeights":{"listPets":50,"getPet":20,"createPet":10,"updatePet":5,"deletePet":5,"placeOrder":10}}'
+          curl -s -X POST http://localhost:8080/api/run/start -H "Content-Type: application/json" -d '{}'
+      - name: Let it bake
+        run: sleep 45
+      - name: Assert metrics are flowing
+        shell: bash
+        run: |
+          total=$(curl -s "http://localhost:8080/api/summary?window=24h" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).total))")
+          echo "total = $total"
+          test "$total" -gt 500
+          recent=$(curl -s "http://localhost:8080/api/recent?limit=5" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).items.length))")
+          test "$recent" -gt 0
+      - name: Assert UI serves
+        run: |
+          curl -s http://localhost:8080/health >/dev/null
+          curl -s http://localhost:8080 | grep -q "API GW Tester"
+      - name: Shutdown
+        if: always()
+        run: docker compose down -v
