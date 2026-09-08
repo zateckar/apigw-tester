@@ -4,6 +4,8 @@
     "outDir": "dist",
     "rootDir": "src",
     "types": ["node"]
+    // no paths here — build mode uses the workspace node_modules
+    // @apigw/shared entry, which is what ends up in dist/
   },
   "include": ["src"],
   "exclude": ["src/**/*.test.ts"]

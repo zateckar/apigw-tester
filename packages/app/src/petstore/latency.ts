@@ -16,6 +16,8 @@ export function sampleLatency(d: LatencyDistribution, rand: () => number): numbe
       const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
       return Math.max(0, d.meanMs + z * (d.stddevMs ?? 1));
     }
+    default:
+      return 0; // future kinds default to no delay
   }
 }
 

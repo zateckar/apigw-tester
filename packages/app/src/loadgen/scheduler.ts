@@ -97,6 +97,9 @@ export function targetRpsAt(profile: LoadProfile, nowMs: number, startedAtMs: nu
     }
     case "real":
       return shaperFor(profile).targetRps(nowMs, profile);
+    default:
+      // unknown mode treated as constant
+      return Math.max(0, profile.rps ?? 0);
   }
 }
 

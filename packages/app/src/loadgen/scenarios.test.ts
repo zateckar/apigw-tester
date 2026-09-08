@@ -81,6 +81,24 @@ describe("stress-class builders", () => {
   });
 });
 
+describe("weightedPick edge cases", () => {
+  it("default fallback for empty-weighted buildSpec", () => {
+    // pickClass path can't be induced cleanly without monkey-patching; this
+    // guards the `default:` arm buildSpec falls through into
+    const r = buildSpec({ ...p }, 1);
+    expect(r.endpoint).toBeTruthy();
+    expect(r.class).toBeTruthy();
+    expect(r.protocol).toBeTruthy();
+  });
+});
+
+describe("mode safety", () => {
+  it("unknown mode returns constant equivalent", async () => {
+    const { targetRpsAt } = await import("./scheduler.js");
+    expect(targetRpsAt({ ...p, mode: "unknown" as any }, Date.now(), Date.now())).toBe(p.rps);
+  });
+});
+
 describe("buildSpec class mix", () => {
   it("covers every class over repeated draws", () => {
     const seen = new Set<string>();

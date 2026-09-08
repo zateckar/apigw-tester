@@ -170,6 +170,7 @@ export function buildSpec(profile: LoadProfile, seedId: number): ReqSpec {
     case "big-request": return buildBigRequestSpec();
     case "slow-upstream": return buildSlowSpec();
     case "concurrency": return buildConcurrencySpec(seedId);
+    default: return buildRestSpec(profile, seedId, "small-rest");
   }
 }
 
