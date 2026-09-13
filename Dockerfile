@@ -26,6 +26,8 @@ RUN npm run build -w @apigw/shared && npm run build -w @apigw/app && npm prune -
 FROM node:22-alpine
 ENV NODE_ENV=production
 WORKDIR /app
+# su-exec lets the entrypoint drop to `node` after repairing volume ownership
+RUN apk add --no-cache su-exec
 COPY --from=server /repo/node_modules ./node_modules
 COPY --from=server /repo/packages/app/dist ./dist
 COPY packages/app/package.json ./
@@ -35,12 +37,18 @@ COPY packages/shared/package.json /app/node_modules/@apigw/shared/package.json
 COPY --from=server /repo/packages/shared/dist /app/node_modules/@apigw/shared/dist
 # UI bundle baked in, served from the same process
 COPY --from=ui /repo/packages/ui/dist ./dist/public
-# chown before VOLUME so a fresh named volume inherits node-owned /app/data
+# chown before VOLUME so a fresh named volume inherits node-owned /app/data.
+# A volume that already has content is mounted verbatim and never re-seeded —
+# docker-entrypoint.sh is what covers that case.
 RUN mkdir -p /app/data && chown -R node:node /app
 ENV PORT=8080
 EXPOSE 8080
 VOLUME ["/app/data"]
-USER node
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=5 \
   CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+# Starts as root only long enough to chown /app/data; the server itself runs as
+# `node`. See docker-entrypoint.sh.
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]
