@@ -110,7 +110,8 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/summary")" = "200"
 
           # health identifies the build, and security headers are present on every response
-          curl -sf "$BASE/health" | grep -q '"version"'
+          curl -sf "$BASE/health" -o /tmp/health.json
+          grep -q '"version"' /tmp/health.json
           hdrs=$(curl -sD - -o /dev/null "$BASE/health")
           for h in "content-security-policy" "x-content-type-options" "x-frame-options" "referrer-policy"; do
             echo "$hdrs" | grep -qi "^$h:" || { echo "missing header $h"; echo "$hdrs"; exit 1; }
@@ -126,8 +127,15 @@ jobs:
             for(const p of ['/api/pets','/api/pets/{petId}','/api/echo','/api/big/{size}'])
               if(!d.paths[p]) throw new Error('missing path '+p);
             console.log('openapi ok:',Object.keys(d.paths).length,'paths');"
-          curl -sf "${AUTH[@]}" "$BASE/api/definitions/openapi.yaml" | head -2 | grep -q "openapi:"
-          curl -sf "${AUTH[@]}" "$BASE/api/definitions/petservice.wsdl" | grep -q "PetServicePortType"
+          # download before asserting: piping curl into head/grep lets the reader
+          # close the pipe first, and curl then exits 23 ("failed writing body"),
+          # which pipefail turns into a failed step even though the fetch was fine
+          curl -sf "${AUTH[@]}" "$BASE/api/definitions/openapi.yaml" -o /tmp/openapi.yaml
+          grep -q "^openapi:" /tmp/openapi.yaml   # root key, only ever at column 0
+          curl -sf "${AUTH[@]}" "$BASE/api/definitions/petservice.wsdl" -o /tmp/petservice.wsdl
+          grep -q "PetServicePortType" /tmp/petservice.wsdl
+          # the service location really was substituted in the built image
+          if grep -q "__SERVICE_LOCATION__" /tmp/petservice.wsdl; then echo "WSDL placeholder not filled"; exit 1; fi
 
           # drive a short run with a deliberate slice of contract violations
           curl -s "${AUTH[@]}" -X PUT "$BASE/api/config/profile" \
