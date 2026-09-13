@@ -1,8 +1,26 @@
+# Keep the build context small and make sure nothing host-local is baked in.
 node_modules
 **/node_modules
 **/dist
-git
+.git
 .github
 data
+**/data
 *.log
 .env
+.env.*
+.env.example
+.vscode
+.claude
+.tmp-review
+
+# never needed to build or run the image
+docs
+*.md
+.editorconfig
+.nvmrc
+docker-compose.yml
+**/*.test.ts
+**/*.test.tsx
+packages/app/tsconfig.typecheck.json
+packages/app/vitest.config.ts

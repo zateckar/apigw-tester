@@ -8,9 +8,14 @@ import type {
   RunStatus,
   ScenarioClass
 } from "@apigw/shared";
-import { DEFAULT_GW_CONFIG as defaultGw, DEFAULT_LOAD_PROFILE as defaultProfile } from "@apigw/shared";
-import { TokenBucket, targetRpsAt } from "./scheduler.js";
-import { buildSpec, buildBaselineProbe, type ReqSpec } from "./scenarios.js";
+import {
+  DEFAULT_GW_CONFIG as defaultGw,
+  DEFAULT_LOAD_PROFILE as defaultProfile,
+  sanitizeGwConfig,
+  sanitizeLoadProfile
+} from "@apigw/shared";
+import { TokenBucket } from "./scheduler.js";
+import { buildSpec, buildBaselineProbe, type ReqSpec, type SpecContext } from "./scenarios.js";
 import { readBasicAuthCreds } from "../auth.js";
 
 // NOTE on HTTP agents: I benchmarked a tuned undici Agent({ connections: 512,
@@ -25,7 +30,15 @@ const TICK_MS = 100;
 const FLUSH_MS = 5000;
 const BASELINE_PROBE_MS = 60_000;
 const BASELINE_SAMPLES_PER_CLASS = 8;
+const BASELINE_PROBE_TIMEOUT_MS = 15_000;
 const MAX_SPOOL = 50_000;
+/** how long stop() waits for in-flight requests before giving up on them */
+const DRAIN_TIMEOUT_MS = 10_000;
+const DRAIN_POLL_MS = 250;
+/** ids of pets we created, kept so deletePet has something real to remove */
+const MAX_TRACKED_IDS = 2_000;
+/** give up on a batch the store keeps refusing, rather than wedging the spool */
+const MAX_INGEST_ATTEMPTS = 3;
 
 export type IngestFn = (batch: IngestBatch) => { ingested: number } | Promise<{ ingested: number }>;
 
@@ -39,20 +52,26 @@ export class Driver {
   private state: RunState = "idle";
   private runId: string | null = null;
   private startedAt: number | null = null;
+  private stoppedAt: number | null = null;
 
   private bucket = new TokenBucket();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private baselineTimer: ReturnType<typeof setInterval> | null = null;
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
 
   private inFlight = 0;
-  private seedId = 120; // best-effort guess for the petstore's id space
-  private counters = { sent: 0, ok: 0, errors: 0, timeouts: 0 };
+  private seedId = 120; // ids <= this are seeded by the petstore and never evicted
+  private createdIds: number[] = [];
+  private counters = { sent: 0, ok: 0, errors: 0, timeouts: 0, invalidSent: 0, invalidRejected: 0 };
   private spool: RequestResult[] = [];
   private targetRps = 0;
   private errLogBudget = 30; // log first N request errors per run
+  private probing = false;   // re-entrancy guard for baseline probes
+  private flushing = false;
+  private ingestAttempts = 0;
 
-  // baseline endpoint: which :8080 to hit directly for class-level baselines (defaults to same-app)
+  // baseline endpoint: which host to hit directly for class-level baselines
   private baselineUrl = "http://127.0.0.1:8080";
   // per-class baselines from direct calls — used to compute GW overhead per request
   private baselines = new Map<ScenarioClass, number[]>();
@@ -66,11 +85,11 @@ export class Driver {
   get currentProfile(): LoadProfile { return { ...this.profile }; }
 
   setGw(gw: Partial<GwConfig>): void {
-    this.gw = { ...this.gw, ...gw };
+    this.gw = sanitizeGwConfig({ ...this.gw, ...gw }, this.gw);
   }
 
   setProfile(profile: Partial<LoadProfile>): void {
-    this.profile = { ...this.profile, ...profile };
+    this.profile = sanitizeLoadProfile({ ...this.profile, ...profile }, this.profile);
   }
 
   /** Wire the ingest function (in-process, called from the metrics module). */
@@ -78,39 +97,55 @@ export class Driver {
     this.ingestFn = fn;
   }
 
+  private get ctx(): SpecContext {
+    return { seedId: this.seedId, createdIds: this.createdIds };
+  }
+
   async init(): Promise<void> {
     this.flushTimer = setInterval(() => void this.flush(), FLUSH_MS);
     this.flushTimer.unref?.();
     this.baselineTimer = setInterval(() => void this.probeBaselines(), BASELINE_PROBE_MS);
     this.baselineTimer.unref?.();
+    // establish baselines immediately so the first minute of a run reports
+    // real overhead instead of "overhead == latency"
+    await this.probeBaselines();
   }
 
   /** Hit the SUT directly (no GW) to establish per-class baseline latencies. */
   private async probeBaselines(): Promise<void> {
-    const specs = buildBaselineProbe(this.seedId);
-    for (const spec of specs) {
-      const lat = await this.timeDirect(spec);
-      if (lat !== null) {
-        let arr = this.baselines.get(spec.class);
-        if (!arr) this.baselines.set(spec.class, (arr = []));
-        arr.push(lat);
-        if (arr.length > BASELINE_SAMPLES_PER_CLASS * 2) arr.shift();
+    if (this.probing) return; // a previous probe is still outstanding
+    this.probing = true;
+    try {
+      for (const spec of buildBaselineProbe(this.ctx)) {
+        const lat = await this.timeDirect(spec);
+        if (lat !== null) {
+          let arr = this.baselines.get(spec.class);
+          if (!arr) this.baselines.set(spec.class, (arr = []));
+          arr.push(lat);
+          if (arr.length > BASELINE_SAMPLES_PER_CLASS) arr.shift();
+        }
       }
+    } finally {
+      this.probing = false;
     }
   }
 
   private async timeDirect(spec: ReqSpec): Promise<number | null> {
     const url = `${this.baselineUrl}${spec.path}`;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), BASELINE_PROBE_TIMEOUT_MS);
     const t0 = Date.now();
     try {
       const headers: Record<string, string> = { ...spec.headers };
       const creds = readBasicAuthCreds();
       if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
-      const res = await fetch(url, { method: spec.method, headers, body: spec.body });
+      const res = await fetch(url, { method: spec.method, headers, body: spec.body, signal: ac.signal });
       await res.arrayBuffer();
       return Date.now() - t0;
     } catch {
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -123,34 +158,54 @@ export class Driver {
 
   start(runId: string): { ok: true; runId: string } {
     if (this.state === "running") return { ok: true, runId: this.runId ?? runId };
+    // a stop() still draining is superseded by the new run
+    if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; }
+    if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
+
     this.state = "running";
     this.runId = runId;
     this.startedAt = Date.now();
+    this.stoppedAt = null;
     this.bucket = new TokenBucket();
-    this.counters = { sent: 0, ok: 0, errors: 0, timeouts: 0 };
+    this.counters = { sent: 0, ok: 0, errors: 0, timeouts: 0, invalidSent: 0, invalidRejected: 0 };
     this.errLogBudget = 30;
+    this.ingestAttempts = 0;
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);
+    this.tickTimer.unref?.();
     console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.baseUrl}`);
     return { ok: true, runId };
   }
 
   stop(): { stopped: true; runId: string | null } {
     const runId = this.runId;
+    if (this.state === "idle") return { stopped: true, runId: null };
     this.state = "stopping";
+    this.stoppedAt = Date.now();
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.tickTimer = null;
+
     const drain = () => {
-      if (this.inFlight === 0 || Date.now() - (this.startedAt ?? 0) > 10_000) {
-        this.state = "idle";
-        this.runId = null;
-        this.startedAt = null;
-        this.spool.length = 0;
-        console.log(`[driver] run ${runId} stopped, sent=${this.counters.sent} ok=${this.counters.ok} errors=${this.counters.errors}`);
-      } else {
-        setTimeout(drain, 500).unref();
+      this.drainTimer = null;
+      if (this.state !== "stopping") return; // a new run took over
+      const waitedMs = Date.now() - (this.stoppedAt ?? Date.now());
+      if (this.inFlight > 0 && waitedMs < DRAIN_TIMEOUT_MS) {
+        this.drainTimer = setTimeout(drain, DRAIN_POLL_MS);
+        this.drainTimer.unref?.();
+        return;
       }
+      if (this.inFlight > 0) {
+        console.warn(`[driver] run ${runId} drain timed out with ${this.inFlight} request(s) still in flight`);
+      }
+      this.state = "idle";
+      this.runId = null;
+      this.startedAt = null;
+      this.stoppedAt = null;
+      console.log(`[driver] run ${runId} stopped, sent=${this.counters.sent} ok=${this.counters.ok} errors=${this.counters.errors}`);
+      // hand whatever we collected to the store rather than dropping it
+      void this.flush();
     };
-    setTimeout(drain, 500).unref();
+    this.drainTimer = setTimeout(drain, DRAIN_POLL_MS);
+    this.drainTimer.unref?.();
     return { stopped: true, runId };
   }
 
@@ -164,18 +219,28 @@ export class Driver {
     }
   }
 
+  private trackCreatedId(id: number): void {
+    this.createdIds.push(id);
+    if (this.createdIds.length > MAX_TRACKED_IDS) this.createdIds.shift();
+  }
+
   private async fire(): Promise<void> {
-    if (!this.runId || this.startedAt === null) return;
-    const spec = buildSpec(this.profile, this.seedId);
+    // capture the run identity up front: the run may end while we await below,
+    // and a result must never be attributed to a null run
+    const runId = this.runId;
+    if (runId === null || this.startedAt === null) return;
+
+    const spec = buildSpec(this.profile, this.ctx);
     this.inFlight++;
     this.counters.sent++;
+    if (spec.expectInvalid) this.counters.invalidSent++;
 
     const url = this.buildUrl(spec.path);
     const started = Date.now();
     const ac = new AbortController();
     const budgetMs =
       spec.class === "slow-upstream" || spec.class === "big-response" || spec.class === "big-request" ? 60_000 : 15_000;
-    const timeout = setTimeout(() => ac.abort("timeout"), budgetMs);
+    const timeout = setTimeout(() => ac.abort(), budgetMs);
     let status = 0;
     let bytesResp = 0;
     let error: string | null = null;
@@ -194,6 +259,15 @@ export class Driver {
       status = res.status;
       const buf = await res.arrayBuffer();
       bytesResp = buf.byteLength;
+
+      if (spec.captureId && status >= 200 && status < 300 && buf.byteLength < 1_000_000) {
+        try {
+          const parsed = JSON.parse(Buffer.from(buf).toString("utf-8")) as { id?: unknown };
+          if (typeof parsed.id === "number" && Number.isSafeInteger(parsed.id)) this.trackCreatedId(parsed.id);
+        } catch { /* padded or proxied into something unparsable — ignore */ }
+      }
+      if (spec.expectInvalid && status >= 400 && status < 500) this.counters.invalidRejected++;
+
       if (status < 500) this.counters.ok++;
       else this.counters.errors++;
     } catch (e) {
@@ -214,22 +288,25 @@ export class Driver {
       this.inFlight--;
     }
 
+    const finished = Date.now();
+    const latencyMs = finished - started;
+    const baselineMs = this.baselineFor(spec.class);
+
     this.record({
-      runId: this.runId,
+      runId,
       ts: started,
       protocol: spec.protocol,
       endpoint: spec.endpoint,
       class: spec.class,
       method: spec.method,
       status,
-      latencyMs: Date.now() - started,
-      baselineMs: this.baselineFor(spec.class),
-      overheadMs: Math.max(0, Date.now() - started - this.baselineFor(spec.class)),
+      latencyMs,
+      baselineMs,
+      overheadMs: Math.max(0, latencyMs - baselineMs),
       bytesReq: Buffer.byteLength(spec.body ?? ""),
       bytesResp,
       error
     });
-    void spec.expectBytes;
   }
 
   private buildUrl(path: string): string {
@@ -239,24 +316,38 @@ export class Driver {
   }
 
   private record(r: RequestResult): void {
-    if (this.spool.length >= MAX_SPOOL) this.spool.shift();
+    if (this.spool.length >= MAX_SPOOL) {
+      // drop the oldest decile in one splice rather than shifting per insert
+      this.spool.splice(0, Math.ceil(MAX_SPOOL / 10));
+    }
     this.spool.push(r);
   }
 
   private async flush(): Promise<void> {
-    if (this.spool.length === 0) return;
+    if (this.flushing || this.spool.length === 0) return;
+    if (!this.ingestFn) return; // metrics module not wired yet
+    this.flushing = true;
     const chunk = this.spool.splice(0, this.spool.length);
-    if (!this.ingestFn) return; // metrics module not wired yet; drop silently
     const batch: IngestBatch = { batchId: randomUUID(), results: chunk };
     try {
       await this.ingestFn(batch);
-    } catch {
-      if (this.spool.length + chunk.length > MAX_SPOOL) {
-        const drop = this.spool.length + chunk.length - MAX_SPOOL;
-        this.spool.splice(0, drop);
+      this.ingestAttempts = 0;
+    } catch (e) {
+      this.ingestAttempts++;
+      if (this.ingestAttempts >= MAX_INGEST_ATTEMPTS) {
+        // never let one poison batch wedge the pipeline forever
+        console.error(
+          `[driver] dropping ${chunk.length} results after ${this.ingestAttempts} failed ingest attempts:`,
+          (e as Error).message
+        );
+        this.ingestAttempts = 0;
+      } else {
+        // put them back at the front, newest data still wins if we overflow
+        this.spool = chunk.concat(this.spool);
+        if (this.spool.length > MAX_SPOOL) this.spool = this.spool.slice(this.spool.length - MAX_SPOOL);
       }
-      this.spool.push(...chunk);
-      if (this.spool.length > MAX_SPOOL) this.spool = this.spool.slice(this.spool.length - MAX_SPOOL);
+    } finally {
+      this.flushing = false;
     }
   }
 
@@ -267,9 +358,9 @@ export class Driver {
       startedAt: this.startedAt,
       uptimeSec: this.startedAt ? Math.floor((Date.now() - this.startedAt) / 1000) : null,
       profile: { ...this.profile },
-      targetRps: this.state === "running" && this.startedAt
-        ? targetRpsAt(this.profile, Date.now(), this.startedAt)
-        : 0,
+      // reported from the last scheduler tick: reading status must never
+      // advance the mode=real drift model
+      targetRps: this.state === "running" ? this.targetRps : 0,
       counters: { ...this.counters }
     };
   }
@@ -277,6 +368,11 @@ export class Driver {
   async shutdown(): Promise<void> {
     if (this.tickTimer) clearInterval(this.tickTimer);
     if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.baselineTimer) clearInterval(this.baselineTimer);
+    if (this.drainTimer) clearTimeout(this.drainTimer);
+    this.tickTimer = this.flushTimer = this.baselineTimer = null;
+    this.drainTimer = null;
+    this.state = "idle";
     await this.flush();
   }
 }

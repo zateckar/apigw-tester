@@ -65,6 +65,30 @@ describe("apigw-tester app (auth protected)", () => {
     expect(r.status).toBe(200);
   });
 
+  it("health identifies the build without leaking anything else", async () => {
+    const body = (await (await fetch(`${base}/health`)).json()) as Record<string, unknown>;
+    expect(body["status"]).toBe("ok");
+    expect(typeof body["version"]).toBe("string");
+    expect(body["version"]).not.toBe("unknown");
+    expect(typeof body["uptimeSec"]).toBe("number");
+    // nothing an anonymous caller could use to learn about the target or the run
+    expect(Object.keys(body).sort()).toEqual(["status", "uptimeSec", "version"]);
+  });
+
+  it("sends security headers on every response, authed or not", async () => {
+    for (const res of [await fetch(`${base}/health`), await fetch(`${base}/api/summary`), await authed("/api/summary")]) {
+      expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
+      expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+      expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+      expect(res.headers.get("cross-origin-opener-policy")).toBe("same-origin");
+      expect(res.headers.get("x-powered-by")).toBeNull();
+      // no HSTS over a plain-HTTP hop — it would pin a client that has no https origin
+      expect(res.headers.get("strict-transport-security")).toBeNull();
+    }
+  });
+
   it("petstore REST responds when authorized", async () => {
     const r = await authed("/api/pets?size=2");
     expect(r.status).toBe(200);
@@ -137,6 +161,222 @@ describe("apigw-tester app (auth protected)", () => {
     await authed("/api/config/gateway", { method: "PUT", body: JSON.stringify(cfg) });
     expect(await (await authed("/api/config/gateway")).json()).toEqual(cfg);
   });
+
+  it("rejects anonymous callers before parsing their body", async () => {
+    // a body-parser-first ordering would answer 400 (bad JSON) and burn the
+    // parse; the auth gate must answer 401 without ever looking at the body
+    const r = await fetch(`${base}/api/ingest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{ this is not json"
+    });
+    expect(r.status).toBe(401);
+  });
+
+  it("clamps a hostile load profile instead of persisting it", async () => {
+    const r = await authed("/api/config/profile", {
+      method: "PUT",
+      body: JSON.stringify({
+        mode: "constant", rps: 1e12, maxConcurrency: 0,
+        soapRatioPct: 999, invalidRatioPct: -4,
+        scenarioWeights: { listPets: -1, getPet: 0, createPet: 0, updatePet: 0, deletePet: 0, placeOrder: 0 }
+      })
+    });
+    expect(r.status).toBe(200);
+    const saved = (await (await authed("/api/config/profile")).json()) as {
+      rps: number; maxConcurrency: number; soapRatioPct: number; invalidRatioPct: number;
+    };
+    expect(saved.maxConcurrency).toBeGreaterThanOrEqual(1);
+    expect(saved.rps).toBeLessThanOrEqual(10_000);
+    expect(saved.soapRatioPct).toBe(100);
+    expect(saved.invalidRatioPct).toBe(0);
+  });
+
+  it("rejects a non-object profile body", async () => {
+    const r = await authed("/api/config/profile", { method: "PUT", body: JSON.stringify([1, 2, 3]) });
+    expect(r.status).toBe(400);
+  });
+
+  it("rejects a gateway config that is not an absolute http(s) URL", async () => {
+    for (const baseUrl of ["", "not a url", "file:///etc/passwd", "ftp://x/y"]) {
+      const r = await authed("/api/config/gateway", {
+        method: "PUT",
+        body: JSON.stringify({ baseUrl, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })
+      });
+      expect(r.status, baseUrl).toBe(400);
+    }
+  });
+
+  it("validates query parameters instead of letting them reach SQL", async () => {
+    expect((await authed("/api/summary?window=99y")).status).toBe(400);
+    expect((await authed("/api/recent?limit=-1")).status).toBe(400);
+    expect((await authed("/api/recent?limit=abc")).status).toBe(400);
+    expect((await authed("/api/recent?limit=99999")).status).toBe(400);
+    expect((await authed("/api/timeseries?bucket=7")).status).toBe(400);
+    expect((await authed("/api/timeseries?from=abc&to=1")).status).toBe(400);
+  });
+
+  it("clamps an enormous timeseries span rather than allocating it", async () => {
+    const r = await authed(`/api/timeseries?bucket=60&from=0&to=${Date.now()}`);
+    expect(r.status).toBe(200);
+    const ts = (await r.json()) as { points: unknown[]; truncated?: boolean };
+    expect(ts.points.length).toBeLessThanOrEqual(10_000);
+    expect(ts.truncated).toBe(true);
+  });
+
+  it("petstore rejects requests that violate the published contract", async () => {
+    const cases: [string, RequestInit, number][] = [
+      ["/api/pets?status=teleported", {}, 400],
+      ["/api/pets?size=9999", {}, 400],
+      ["/api/pets?size=abc", {}, 400],
+      ["/api/pets/not-a-number", {}, 400],
+      ["/api/pets", { method: "POST", body: JSON.stringify({ status: "available" }) }, 400],
+      ["/api/pets", { method: "POST", body: JSON.stringify({ name: 12345 }) }, 400],
+      ["/api/pets", { method: "POST", body: JSON.stringify({ name: "x", status: "liquidated" }) }, 400],
+      ["/api/store/order", { method: "POST", body: JSON.stringify({ petId: "1" }) }, 400],
+      ["/api/slow/999999", {}, 400],
+      ["/api/big/99999999999", {}, 400]
+    ];
+    for (const [path, init, want] of cases) {
+      const r = await authed(path, init);
+      expect(r.status, `${path}`).toBe(want);
+    }
+  });
+
+  it("a poisoned pet name cannot break the SOAP endpoint", async () => {
+    // the store used to accept any JSON type for name, and esc() then threw,
+    // returning an HTML 500 for every SOAP call touching that pet
+    const bad = await authed("/api/pets/3", { method: "PUT", body: JSON.stringify({ name: 12345 }) });
+    expect(bad.status).toBe(400);
+
+    const injected = await authed("/api/pets", {
+      method: "POST",
+      body: JSON.stringify({ name: "Evil</name><injected>&" })
+    });
+    expect(injected.status).toBe(201);
+    const id = ((await injected.json()) as { id: number }).id;
+
+    const soap = await fetch(`${base}/soap/petservice`, {
+      method: "POST",
+      headers: { "Content-Type": "text/xml", SOAPAction: '"getPetById"', authorization: AUTH },
+      body: `<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><getPetByIdRequest><petId>${id}</petId></getPetByIdRequest></soap:Body></soap:Envelope>`
+    });
+    expect(soap.status).toBe(200);
+    const xml = await soap.text();
+    expect(xml).toContain("&lt;/name&gt;");   // escaped, not injected
+    expect(xml).not.toContain("<injected>");
+  });
+
+  it("honours X-Test-Delay-Ms and caps X-Test-Size-B", async () => {
+    // the *bound* on the delay is unit-tested in petstore/contract.test.ts — waiting
+    // out the real 30 s clamp here would dominate the suite. This only proves the
+    // header is wired through at all.
+    const started = Date.now();
+    const r = await authed("/api/pets/1", { headers: { "X-Test-Delay-Ms": "250" } });
+    expect(r.status).toBe(200);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(200);
+
+    const padded = await authed("/api/pets/1", { headers: { "X-Test-Size-B": "1099511627776" } });
+    expect(padded.status).toBe(200);
+    const body = await padded.text();
+    expect(body.length).toBeLessThanOrEqual(11 * 1024 * 1024);
+  }, 20_000);
+
+  it("rejects an unvalidated admin latency profile", async () => {
+    const r = await authed("/admin/latency-profile", {
+      method: "PATCH",
+      body: JSON.stringify({ "get-pet": { kind: "normal", meanMs: "abc", stddevMs: 5 } })
+    });
+    expect(r.status).toBe(400);
+    const proto = await authed("/admin/latency-profile", {
+      method: "PATCH",
+      body: JSON.stringify({ __proto__: { kind: "fixed", ms: 1 } })
+    });
+    expect([200, 400]).toContain(proto.status);
+  });
+
+  it("rejects Object.prototype keys as a summary window", async () => {
+    // a plain-object lookup table resolves `constructor` to a function, which is
+    // not undefined — the guard has to reject it, not hand NaN to the store
+    for (const win of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+      const r = await authed(`/api/summary?window=${encodeURIComponent(win)}`);
+      expect(r.status, win).toBe(400);
+    }
+    // a repeated parameter arrives as an array, not a string
+    expect((await authed("/api/summary?window=5m&window=1h")).status).toBe(400);
+  });
+
+  it("normalises the ?server= override before reflecting it into the definitions", async () => {
+    const hostile = [
+      'http://x" fake="y',        // would break out of the XML attribute
+      "javascript:alert(1)",      // not an http(s) origin
+      "http://gw.example.com/a<b>c",
+      "not a url"
+    ];
+    for (const server of hostile) {
+      const wsdl = await (await authed(`/api/definitions/petservice.wsdl?server=${encodeURIComponent(server)}`)).text();
+      // check the whole document, not just the captured attribute: an injected
+      // attribute lands *outside* the capture group and would otherwise pass
+      expect(wsdl, server).not.toContain("fake=");
+      const location = /<soap:address location="([^"]*)"/.exec(wsdl)?.[1];
+      expect(location, server).toBeTruthy();
+      expect(location, server).not.toContain("<");
+      expect(location, server).not.toContain("javascript:");
+      // whatever survived is still a usable absolute URL
+      expect(() => new URL((location as string).replace(/&amp;/g, "&")), server).not.toThrow();
+
+      const doc = (await (await authed(`/api/definitions/openapi.json?server=${encodeURIComponent(server)}`)).json()) as {
+        servers: { url: string }[];
+      };
+      expect(doc.servers[0]?.url, server).toMatch(/^https?:\/\//);
+    }
+  });
+
+  it("honours a well-formed ?server= override and escapes it for XML", async () => {
+    const wsdl = await (await authed("/api/definitions/petservice.wsdl?server=https%3A%2F%2Fgw.example.com%2Fv1%2F")).text();
+    expect(wsdl).toContain('location="https://gw.example.com/v1/soap/petservice"');
+
+    const doc = (await (await authed("/api/definitions/openapi.json?server=https%3A%2F%2Fgw.example.com%2Fv1%2F")).json()) as {
+      servers: { url: string }[];
+    };
+    expect(doc.servers[0]?.url).toBe("https://gw.example.com/v1");
+
+    // `&` is legal in a URL path but must not appear raw in an XML attribute,
+    // and `$&` must not be expanded by the replace()
+    const amp = await (await authed("/api/definitions/petservice.wsdl?server=https%3A%2F%2Fgw.example.com%2Fp%24%26q")).text();
+    expect(amp).toContain('location="https://gw.example.com/p$&amp;q/soap/petservice"');
+    expect(amp).not.toContain("__SERVICE_LOCATION__");
+  });
+
+  it("probes a gateway server-side, since the dashboard CSP forbids cross-origin fetch", async () => {
+    const probe = async (cfg: Record<string, unknown>) =>
+      authed("/api/config/gateway/test", { method: "POST", body: JSON.stringify(cfg) });
+
+    // reachable: point it at ourselves, whose /health is public
+    const ok = (await (await probe({ baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
+      ok: boolean; status: number; url: string; latencyMs: number;
+    };
+    expect(ok.ok).toBe(true);
+    expect(ok.status).toBe(200);
+    expect(ok.url).toBe(`${base}/health`);
+    expect(typeof ok.latencyMs).toBe("number");
+
+    // the probe walks the same base+prefix path the driver will use
+    const prefixed = (await (await probe({ baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "/v1" })).json()) as {
+      url: string;
+    };
+    expect(prefixed.url).toBe(`${base}/v1/health`);
+
+    // unreachable reports a reason instead of throwing
+    const dead = (await (await probe({ baseUrl: "http://127.0.0.1:1", apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
+      ok: boolean; error: string;
+    };
+    expect(dead.ok).toBe(false);
+    expect(typeof dead.error).toBe("string");
+
+    // and an unusable config is a 400, not a probe
+    expect((await probe({ baseUrl: "ftp://x/y" })).status).toBe(400);
+  }, 20_000);
 
   it("run start/stop transitions", async () => {
     const s = await (await authed("/api/run/status")).json();

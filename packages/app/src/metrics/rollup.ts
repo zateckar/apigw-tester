@@ -31,6 +31,11 @@ export function totalInHistogram(h: Histogram): number {
   return h.reduce((a, b) => a + (b ?? 0), 0);
 }
 
+/** Notional upper edge of the overflow bucket. Anything slower than the top
+ *  edge is reported as roughly this, rather than interpolating out to
+ *  Number.MAX_SAFE_INTEGER and rendering an absurd p99. */
+const OVERFLOW_EDGE_MS = (HISTOGRAM_EDGES_MS[HISTOGRAM_EDGES_MS.length - 1] as number) * 2;
+
 /** Percentile estimate from bucket counts. Interpolates linearly inside the bucket. */
 export function percentile(h: Histogram, p: number): number {
   const total = totalInHistogram(h);
@@ -41,7 +46,7 @@ export function percentile(h: Histogram, p: number): number {
   let lower = 0;
   for (let i = 0; i < h.length; i++) {
     const count = h[i] ?? 0;
-    const upper = edges[i] ?? Number.MAX_SAFE_INTEGER;
+    const upper = edges[i] ?? OVERFLOW_EDGE_MS;
     if (count === 0) {
       lower = upper;
       continue;
@@ -53,7 +58,7 @@ export function percentile(h: Histogram, p: number): number {
     }
     lower = upper;
   }
-  return edges[edges.length - 1] ?? Number.MAX_SAFE_INTEGER;
+  return edges[edges.length - 1] ?? OVERFLOW_EDGE_MS;
 }
 
 export function meanFromRollup(latencySumMs: number, count: number): number {

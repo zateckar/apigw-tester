@@ -1,34 +1,34 @@
 import type { LoadMode, LoadProfile } from "@apigw/shared";
+import { LIMITS } from "@apigw/shared";
 
-export type LoadModeEx = LoadMode | "real";
+export type LoadModeEx = LoadMode;
 
 export interface TickResult {
   due: number;
   targetRps: number;
-  /** instantaneous fuzz multiplier applied for this tick (for mode=real) */
-  fuzz?: number;
 }
 
 /**
  * Token-bucket RPS scheduler. Open model: arrivals follow the profile even if
  * completions lag. Mode "real" layers a 24h workload curve, a noisy multiplier
- * with slow-moving trend, plus a Poisson-mixture inter-request jitter.
+ * with slow-moving trend, plus inter-request jitter.
  */
 
-/* Slow state for mode=real. Kept outside the TokenBucket because we need a
- * persistent running-noise field across ticks, not per-tick snapshots. */
-class RealTrafficShaper {
+/* Slow state for mode=real. Owned by the TokenBucket (not stashed on the
+ * profile object) so that read-only callers — /api/run/status, the UI poll —
+ * can never advance the drift model just by looking at it. */
+export class RealTrafficShaper {
   private phase: number;           // slowly-evolving [0..2π) cycle fraction (0=start of day)
   private noiseLevel = 1;          // slow trend, mean-reverting to 1
   private lastTickMs: number | null = null;
 
-  constructor() {
+  constructor(phase = Math.random() * 2 * Math.PI) {
     // randomize the day-cycle so multiple runs don't all hit "9am"
-    this.phase = Math.random() * 2 * Math.PI;
+    this.phase = phase;
   }
 
   targetRps(nowMs: number, p: LoadProfile): number {
-    // --- Day-of-week + time-of-day curve (local time) ---
+    // --- Time-of-day curve (local time) ---
     const dayMs = 24 * 60 * 60 * 1000;
     const dayFrac = ((nowMs % dayMs) / dayMs + this.phase / (2 * Math.PI)) % 1;
 
@@ -41,41 +41,47 @@ class RealTrafficShaper {
     // interpolate between night (0.08) and peak (1.0) based on work function
     const curveRps = baseUserRps * (night + (1 - night) * Math.min(1.15, work));
 
-    // --- Slow drift: mean-reverting noise with period ~2-15 minutes ---
+    // --- Slow drift: mean-reverting noise with timescale ~3 minutes ---
     if (this.lastTickMs !== null) {
       const dtMin = (nowMs - this.lastTickMs) / 60_000;
-      const drift = (1 - this.noiseLevel) * Math.min(1, dtMin / 3);     // mean-revert with timescale ~3min
+      const drift = (1 - this.noiseLevel) * Math.min(1, dtMin / 3);
       const jump = (Math.random() - 0.5) * 0.12 * Math.sqrt(Math.max(dtMin, 0.01));
       this.noiseLevel = Math.max(0.6, Math.min(1.8, this.noiseLevel + drift + jump));
     }
     this.lastTickMs = nowMs;
 
-    // --- Poisson mixture jitter: ±20% within 1-5s windows ---
+    // --- Per-tick jitter: ±20% ---
     const jitter = 1 + (Math.random() - 0.5) * 0.4;
 
     return Math.max(0, curveRps * this.noiseLevel * jitter);
   }
 }
 
-const REAL_SHAPER_KEY = Symbol.for("apigw.realShaper");
-interface ShaperHolder { [REAL_SHAPER_KEY]?: RealTrafficShaper }
-function shaperFor(profile: LoadProfile): RealTrafficShaper {
-  const h = profile as unknown as ShaperHolder;
-  return h[REAL_SHAPER_KEY] ??= new RealTrafficShaper();
-}
-
-export function targetRpsAt(profile: LoadProfile, nowMs: number, startedAtMs: number): number {
+/**
+ * Target RPS for a profile at a point in time.
+ *
+ * `shaper` is only consulted for mode "real"; pass one from a component that
+ * owns the run (the TokenBucket). Callers that merely want to display a number
+ * must omit it — without a shaper this function is pure.
+ */
+export function targetRpsAt(
+  profile: LoadProfile,
+  nowMs: number,
+  startedAtMs: number,
+  shaper?: RealTrafficShaper
+): number {
   const mode = (profile.mode as LoadModeEx) ?? "constant";
+  const cap = (n: number): number => (Number.isFinite(n) ? Math.min(LIMITS.rps, Math.max(0, n)) : 0);
   switch (mode) {
     case "constant":
-      return Math.max(0, profile.rps ?? 0);
+      return cap(profile.rps ?? 0);
     case "ramp": {
       const from = profile.rampFrom ?? 1;
       const to = profile.rampTo ?? 100;
       const mins = Math.max(0.1, profile.rampMinutes ?? 10);
       const elapsed = (nowMs - startedAtMs) / 60_000;
       const t = Math.min(1, Math.max(0, elapsed / mins));
-      return from + (to - from) * t;
+      return cap(from + (to - from) * t);
     }
     case "spike": {
       const base = profile.spikeBase ?? 5;
@@ -84,7 +90,7 @@ export function targetRpsAt(profile: LoadProfile, nowMs: number, startedAtMs: nu
       const dur = Math.max(1, profile.spikeDurationSeconds ?? 30) / 60; // minutes
       const elapsedMin = (nowMs - startedAtMs) / 60_000;
       const pos = elapsedMin % every;
-      return pos < dur ? peak : base;
+      return cap(pos < dur ? peak : base);
     }
     case "sine-daily": {
       const min = profile.sineMin ?? 2;
@@ -93,23 +99,26 @@ export function targetRpsAt(profile: LoadProfile, nowMs: number, startedAtMs: nu
       const phase = ((nowMs % periodMs) / periodMs) * 2 * Math.PI;
       const amp = (max - min) / 2;
       const center = min + amp;
-      return Math.max(0, center + amp * Math.sin(phase - Math.PI / 2 + Math.PI / 2));
+      // -π/2 puts the trough at midnight UTC and the peak at midday
+      return cap(center + amp * Math.sin(phase - Math.PI / 2));
     }
     case "real":
-      return shaperFor(profile).targetRps(nowMs, profile);
+      // without a shaper, report the curve without advancing the drift state
+      return cap(shaper ? shaper.targetRps(nowMs, profile) : (profile.rps ?? 25));
     default:
       // unknown mode treated as constant
-      return Math.max(0, profile.rps ?? 0);
+      return cap(profile.rps ?? 0);
   }
 }
 
 export class TokenBucket {
   private tokens = 0;
   private lastMs: number | null = null;
+  private shaper = new RealTrafficShaper();
 
   /** Call at a fixed cadence. Returns how many requests should be issued now. */
   tick(nowMs: number, profile: LoadProfile, startedAtMs: number): TickResult {
-    const targetRps = targetRpsAt(profile, nowMs, startedAtMs);
+    const targetRps = targetRpsAt(profile, nowMs, startedAtMs, this.shaper);
     if (this.lastMs === null) {
       this.lastMs = nowMs;
       return { due: 0, targetRps };

@@ -1,48 +1,74 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, Panel
 } from "./Panel";
-import { api, fmtBytes, fmtDuration, fmtMs, DEFAULT_GW, DEFAULT_PROFILE } from "./api";
+import {
+  api, downloadDefinition, fmtBytes, fmtDuration, fmtMs,
+  DEFAULT_GW, DEFAULT_PROFILE, type SummaryWindow
+} from "./api";
 import type { GwConfig, LoadProfile, RunEvent } from "./api";
 import ConfigDrawer from "./ConfigDrawer";
 
-const RANGES = [
-  { label: "15m", hours: 0.25, summary: "5m" },
-  { label: "1h", hours: 1, summary: "1h" },
-  { label: "6h", hours: 6, summary: "1h" },
-  { label: "24h", hours: 24, summary: "24h" },
-  { label: "7d", hours: 24 * 7, summary: "24h" }
-] as const;
+/** label and summary window are the same value on purpose: the KPI tiles used
+ *  to be captioned with one range while showing numbers from another. */
+const RANGES: { label: SummaryWindow; hours: number }[] = [
+  { label: "15m", hours: 0.25 },
+  { label: "1h", hours: 1 },
+  { label: "6h", hours: 6 },
+  { label: "24h", hours: 24 },
+  { label: "7d", hours: 24 * 7 }
+];
+
+/** long windows are much more expensive to compute — poll them less often */
+const pollFor = (w: SummaryWindow): number => (w === "24h" || w === "7d" ? 30_000 : 5_000);
+
+function errorOf(...queries: UseQueryResult<unknown, Error>[]): string | null {
+  for (const q of queries) if (q.isError && q.error) return q.error.message;
+  return null;
+}
+
+/** Render a number, or an em-dash when the data genuinely isn't there — so a
+ *  failed fetch never renders as a healthy-looking zero. */
+function stat(value: number | undefined, render: (n: number) => string): string {
+  return value === undefined || !Number.isFinite(value) ? "—" : render(value);
+}
 
 export default function App() {
   const qc = useQueryClient();
-  const [range, setRange] = useState<(typeof RANGES)[number]>(RANGES[1]);
+  const [range, setRange] = useState<(typeof RANGES)[number]>(RANGES[1] as (typeof RANGES)[number]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [recentProto, setRecentProto] = useState<"" | "rest" | "soap">("");
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [downloadNote, setDownloadNote] = useState<string | null>(null);
 
-  const statusQ = useQuery({ queryKey: ["status"], queryFn: api.status });
-  const gwQ = useQuery({ queryKey: ["gw"], queryFn: api.gateway });
-  const profileQ = useQuery({ queryKey: ["profile"], queryFn: api.profile });
+  const statusQ = useQuery({ queryKey: ["status"], queryFn: api.status, refetchInterval: 5_000 });
+  const gwQ = useQuery({ queryKey: ["gw"], queryFn: api.gateway, refetchInterval: 30_000 });
+  const profileQ = useQuery({ queryKey: ["profile"], queryFn: api.profile, refetchInterval: 30_000 });
   const summaryQ = useQuery({
-    queryKey: ["summary", range.summary],
-    queryFn: () => api.summary(range.summary)
+    queryKey: ["summary", range.label],
+    queryFn: () => api.summary(range.label),
+    refetchInterval: pollFor(range.label)
   });
   const seriesQ = useQuery({
     queryKey: ["series", range.hours],
-    queryFn: () => api.timeseries(range.hours)
+    queryFn: () => api.timeseries(range.hours),
+    refetchInterval: pollFor(range.label)
   });
-  const recentQ = useQuery({ queryKey: ["recent"], queryFn: () => api.recent(150) });
-  const runsQ = useQuery({ queryKey: ["runs"], queryFn: api.runs });
+  const recentQ = useQuery({ queryKey: ["recent"], queryFn: () => api.recent(150), refetchInterval: 5_000 });
+  const runsQ = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 30_000 });
+  const defsQ = useQuery({ queryKey: ["definitions"], queryFn: api.definitions, refetchInterval: false });
 
   const startMut = useMutation({
     mutationFn: api.startRun,
-    onSuccess: () => void qc.invalidateQueries()
+    onSuccess: () => { setActionError(null); void qc.invalidateQueries(); },
+    onError: (e: Error) => setActionError(e.message)
   });
   const stopMut = useMutation({
     mutationFn: api.stopRun,
-    onSuccess: () => void qc.invalidateQueries()
+    onSuccess: () => { setActionError(null); void qc.invalidateQueries(); },
+    onError: (e: Error) => setActionError(e.message)
   });
 
   const status = statusQ.data;
@@ -50,13 +76,18 @@ export default function App() {
   const running = status?.state === "running";
   const gw = gwQ.data ?? status?.gateway ?? DEFAULT_GW;
   const profile = profileQ.data ?? status?.profile ?? DEFAULT_PROFILE;
+  const loadError = errorOf(statusQ, summaryQ, seriesQ, recentQ, runsQ, gwQ, profileQ);
 
   // memoized chart data so every poll produces a stable reference
   const points = useMemo(() => {
     const bucket = seriesQ.data?.bucketSec ?? 60;
+    // hourly buckets need the date, or a week of data shows 24 repeating labels
+    const fmt: Intl.DateTimeFormatOptions = bucket >= 3600
+      ? { month: "short", day: "numeric", hour: "2-digit" }
+      : { hour: "2-digit", minute: "2-digit" };
     return (seriesQ.data?.points ?? []).map((p) => ({
       ...p,
-      t: new Date(p.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      t: new Date(p.ts).toLocaleString([], fmt),
       restRps: p.restTotal / bucket,
       soapRps: p.soapTotal / bucket,
       bytesKb: p.bytesResp / 1024
@@ -67,6 +98,18 @@ export default function App() {
     (r) => !recentProto || r.protocol === recentProto
   ).slice(0, 80);
 
+  const contract = summary?.contract;
+
+  async function grab(path: string, filename: string) {
+    setDownloadNote(null);
+    try {
+      await downloadDefinition(path, filename);
+      setDownloadNote(`Downloaded ${filename}`);
+    } catch (e) {
+      setDownloadNote((e as Error).message);
+    }
+  }
+
   return (
     <div className="app">
       {/* ---------- Top bar ---------- */}
@@ -75,7 +118,7 @@ export default function App() {
           <h1>API GW Tester</h1>
           <span className="state">
             <span className={`dot ${running ? "running" : status?.state ?? "idle"}`} />
-            {status?.state ?? "loading"}
+            {status?.state ?? (statusQ.isError ? "unreachable" : "loading")}
             {status?.runId ? ` · ${status.runId}` : ""}
             {status?.uptimeSec != null ? ` · up ${fmtDuration(status.uptimeSec)}` : ""}
           </span>
@@ -97,43 +140,61 @@ export default function App() {
         </div>
       </div>
 
+      {(loadError || actionError) && (
+        <div className="banner err" role="alert">
+          {actionError ?? `Cannot reach the API: ${loadError}`}
+        </div>
+      )}
+
       {/* ---------- KPIs ---------- */}
       <div className="kpis">
         <div className="kpi" style={{ borderColor: "var(--accent)" }}>
-          <div className="label">GW overhead (window)</div>
+          <div className="label">GW overhead ({range.label})</div>
           <div className="value" style={{ color: "var(--accent)" }}>
-            {fmtMs(summary?.overheadMs.p95 ?? 0)}
+            {stat(summary?.overheadMs.p95, fmtMs)}
           </div>
-          <div className="sub">p95 · p50 {fmtMs(summary?.overheadMs.p50 ?? 0)} · p99 {fmtMs(summary?.overheadMs.p99 ?? 0)}</div>
+          <div className="sub">
+            p95 · p50 {stat(summary?.overheadMs.p50, fmtMs)} · p99 {stat(summary?.overheadMs.p99, fmtMs)}
+          </div>
         </div>
         <div className="kpi">
           <div className="label">Live RPS</div>
-          <div className="value">{(status?.targetRps ?? 0).toFixed(1)}</div>
+          <div className="value">{stat(status?.targetRps, (n) => n.toFixed(1))}</div>
           <div className="sub">target · {profile.mode}</div>
         </div>
         <div className="kpi">
           <div className="label">Requests ({range.label})</div>
-          <div className="value">{(summary?.total ?? 0).toLocaleString()}</div>
-          <div className="sub">{(summary?.rps ?? 0).toFixed(2)} avg rps</div>
+          <div className="value">{stat(summary?.total, (n) => n.toLocaleString())}</div>
+          <div className="sub">{stat(summary?.rps, (n) => n.toFixed(2))} avg rps</div>
         </div>
         <div className="kpi">
-          <div className="label">Error rate</div>
-          <div className={`value ${(summary?.errorPct ?? 0) > 2 ? "err" : "ok"}`}>
-            {(summary?.errorPct ?? 0).toFixed(2)}%
+          <div className="label">Error rate ({range.label})</div>
+          <div className={`value ${summary === undefined ? "" : summary.errorPct > 2 ? "err" : "ok"}`}>
+            {stat(summary?.errorPct, (n) => `${n.toFixed(2)}%`)}
           </div>
-          <div className="sub">{(summary?.errors ?? 0).toLocaleString()} errors</div>
+          <div className="sub">{stat(summary?.errors, (n) => n.toLocaleString())} errors</div>
         </div>
         <div className="kpi">
-          <div className="label">Total latency p50/p95/p99</div>
+          <div className="label">Latency p50/p95/p99 ({range.label})</div>
           <div className="value" style={{ fontSize: 15 }}>
-            {fmtMs(summary?.latencyMs.p50 ?? 0)} / {fmtMs(summary?.latencyMs.p95 ?? 0)} / {fmtMs(summary?.latencyMs.p99 ?? 0)}
+            {stat(summary?.latencyMs.p50, fmtMs)} / {stat(summary?.latencyMs.p95, fmtMs)} / {stat(summary?.latencyMs.p99, fmtMs)}
           </div>
-          <div className="sub">max {fmtMs(summary?.latencyMs.max ?? 0)}</div>
+          <div className="sub">max {stat(summary?.latencyMs.max, fmtMs)}</div>
         </div>
-        <div className="kpi">
-          <div className="label">Resp throughput</div>
-          <div className="value">{fmtBytes(summary?.bytes.respPerSec ?? 0)}/s</div>
-          <div className="sub">total {fmtBytes(summary?.bytes.resp ?? 0)}</div>
+        <div className="kpi" title="Requests deliberately violating the published OpenAPI/WSDL contract, and whether the gateway rejected them">
+          <div className="label">Contract validation</div>
+          <div className={`value ${contract === undefined ? "" : contract.wronglyAccepted > 0 ? "err" : "ok"}`}>
+            {contract === undefined
+              ? "—"
+              : contract.invalidSent === 0
+                ? "no probes"
+                : `${((100 * contract.rejected4xx) / Math.max(1, contract.invalidSent)).toFixed(0)}% blocked`}
+          </div>
+          <div className="sub">
+            {contract === undefined
+              ? "—"
+              : `${contract.invalidSent.toLocaleString()} invalid sent · ${contract.wronglyAccepted.toLocaleString()} wrongly accepted`}
+          </div>
         </div>
       </div>
 
@@ -145,6 +206,7 @@ export default function App() {
           </button>
         ))}
         <div className="spacer" />
+        {seriesQ.data?.truncated && <span className="hint">range clipped to the retained window</span>}
         {seriesQ.isFetching && <span className="hint">updating…</span>}
       </div>
 
@@ -220,9 +282,30 @@ export default function App() {
         </div>
       </div>
 
+      {/* ---------- API definitions ---------- */}
+      <div className="section">
+        <h2>API definitions — import these into your gateway</h2>
+        <p className="hint">
+          The load driver generates traffic that conforms to these documents, so you can switch request
+          and response validation on. Advertised server: <span className="mono">{defsQ.data?.serverUrl ?? gw.baseUrl}</span>
+        </p>
+        <div className="form-row">
+          <button onClick={() => void grab("/api/definitions/openapi.json", "apigw-tester-openapi.json")}>
+            Download OpenAPI (JSON)
+          </button>
+          <button onClick={() => void grab("/api/definitions/openapi.yaml", "apigw-tester-openapi.yaml")}>
+            Download OpenAPI (YAML)
+          </button>
+          <button onClick={() => void grab("/api/definitions/petservice.wsdl", "petservice.wsdl")}>
+            Download WSDL
+          </button>
+          {downloadNote && <span className="hint" style={{ alignSelf: "center" }}>{downloadNote}</span>}
+        </div>
+      </div>
+
       {/* ---------- Per stress-class ---------- */}
       <div className="section">
-        <h2>Per stress class — how the GW handles each traffic pattern ({range.summary} window)</h2>
+        <h2>Per stress class — how the GW handles each traffic pattern ({range.label} window)</h2>
         <table>
           <thead>
             <tr>
@@ -258,7 +341,7 @@ export default function App() {
 
       {/* ---------- Per-endpoint ---------- */}
       <div className="section">
-        <h2>Per endpoint — {range.summary} window</h2>
+        <h2>Per endpoint — {range.label} window</h2>
         <table>
           <thead>
             <tr><th>Protocol</th><th>Endpoint</th><th>Requests</th><th>Errors</th><th>Err %</th><th>rps</th><th>p50</th><th>p95</th><th>avg bytes</th></tr>
@@ -289,11 +372,13 @@ export default function App() {
         <h2>
           Recent requests{" "}
           <span className="hint">
-            [ {["", "rest", "soap"].map((p) => (
-              <a key={p} onClick={() => setRecentProto(p as typeof recentProto)}
-                 style={{ cursor: "pointer", color: recentProto === p ? "var(--accent)" : "inherit", marginLeft: 8 }}>
+            [ {(["", "rest", "soap"] as const).map((p) => (
+              <button key={p} type="button" className="linklike"
+                      aria-pressed={recentProto === p}
+                      onClick={() => setRecentProto(p)}
+                      style={{ color: recentProto === p ? "var(--accent)" : "inherit", marginLeft: 8 }}>
                 {p || "all"}
-              </a>
+              </button>
             ))} ]
           </span>
         </h2>
@@ -328,7 +413,7 @@ export default function App() {
         <h2>Run history</h2>
         <table>
           <thead>
-            <tr><th>Run</th><th>Started</th><th>Stopped</th><th>Duration</th><th>Mode</th><th>Concurrency</th><th>SOAP %</th></tr>
+            <tr><th>Run</th><th>Started</th><th>Stopped</th><th>Duration</th><th>Mode</th><th>Concurrency</th><th>SOAP %</th><th>Invalid %</th></tr>
           </thead>
           <tbody>
             {(runsQ.data ?? []).map((r: RunEvent) => (
@@ -340,9 +425,10 @@ export default function App() {
                 <td>{r.profile?.mode ?? "—"}</td>
                 <td>{r.profile?.maxConcurrency ?? "—"}</td>
                 <td>{r.profile ? `${r.profile.soapRatioPct}%` : "—"}</td>
+                <td>{r.profile?.invalidRatioPct != null ? `${r.profile.invalidRatioPct}%` : "—"}</td>
               </tr>
             ))}
-            {(runsQ.data?.length ?? 0) === 0 && <tr><td colSpan={7} className="hint">No runs recorded yet.</td></tr>}
+            {(runsQ.data?.length ?? 0) === 0 && <tr><td colSpan={8} className="hint">No runs recorded yet.</td></tr>}
           </tbody>
         </table>
       </div>

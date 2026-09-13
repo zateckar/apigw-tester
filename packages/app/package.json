@@ -5,6 +5,8 @@
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prebuild": "npm run clean",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.typecheck.json --noEmit",
     "start": "node dist/index.js",

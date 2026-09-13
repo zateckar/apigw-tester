@@ -1,4 +1,4 @@
-import { HISTOGRAM_EDGES_MS } from "@apigw/shared";
+import { HISTOGRAM_EDGES_MS, LIMITS } from "@apigw/shared";
 import type {
   ClassStat,
   EndpointStat,
@@ -12,7 +12,7 @@ import type {
   TimePoint,
   TimeSeries
 } from "@apigw/shared";
-import { openDb } from "./db.js";
+import { openDb, ensureColumn, type DbHandle } from "./db.js";
 import {
   Histogram,
   emptyHistogram,
@@ -50,6 +50,8 @@ interface RollupRow {
   cls: string;
   count: number;
   errors: number;
+  ok2xx: number;
+  rejected4xx: number;
   latency_sum_ms: number;
   max_latency_ms: number;
   overhead_sum_ms: number;
@@ -66,6 +68,8 @@ interface Combined {
   cls: string;
   count: number;
   errors: number;
+  ok2xx: number;
+  rejected4xx: number;
   latencySumMs: number;
   maxLatencyMs: number;
   overheadSumMs: number;
@@ -76,26 +80,34 @@ interface Combined {
   overheadHist: Histogram;
 }
 
-function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class" | "all"): Map<string, Combined> {
+function newCombined(r: RollupRow): Combined {
+  return {
+    protocol: r.protocol, endpoint: r.endpoint, cls: r.cls,
+    count: 0, errors: 0, ok2xx: 0, rejected4xx: 0,
+    latencySumMs: 0, maxLatencyMs: 0,
+    overheadSumMs: 0, overheadMaxMs: 0, bytesReq: 0, bytesResp: 0,
+    hist: emptyHistogram(), overheadHist: emptyHistogram()
+  };
+}
+
+function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class"): Map<string, Combined> {
+  // endpoint scope deliberately folds the class away: the same path is hit by
+  // more than one class (e.g. GET /api/pets as both small-rest and concurrency)
+  // and two identically-labelled rows in the table read as a bug
   const keyOf = (r: RollupRow) =>
-    scope === "endpoint" ? `${r.protocol}|${r.endpoint}|${r.cls}` :
-    scope === "class" ? `|${r.cls}` :
-    "all";
+    scope === "endpoint" ? `${r.protocol}|${r.endpoint}` : r.cls;
   const map = new Map<string, Combined>();
   for (const r of rows) {
     const key = keyOf(r);
     let c = map.get(key);
     if (!c) {
-      c = {
-        protocol: r.protocol, endpoint: r.endpoint, cls: r.cls,
-        count: 0, errors: 0, latencySumMs: 0, maxLatencyMs: 0,
-        overheadSumMs: 0, overheadMaxMs: 0, bytesReq: 0, bytesResp: 0,
-        hist: emptyHistogram(), overheadHist: emptyHistogram()
-      };
+      c = newCombined(r);
       map.set(key, c);
     }
     c.count += r.count;
     c.errors += r.errors;
+    c.ok2xx += r.ok2xx ?? 0;
+    c.rejected4xx += r.rejected4xx ?? 0;
     c.latencySumMs += r.latency_sum_ms;
     c.maxLatencyMs = Math.max(c.maxLatencyMs, r.max_latency_ms);
     c.overheadSumMs += r.overhead_sum_ms;
@@ -109,11 +121,18 @@ function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class" | "all"):
 }
 
 function parseHist(s: string): Histogram {
-  try { return JSON.parse(s) as Histogram; } catch { return emptyHistogram(); }
+  try {
+    const parsed = JSON.parse(s) as unknown;
+    if (!Array.isArray(parsed)) return emptyHistogram();
+    return parsed as Histogram;
+  } catch {
+    return emptyHistogram();
+  }
 }
 
 export function createMetricsStore(dbPath: string): MetricsStore {
   const db = openDb(dbPath);
+  migrate(db);
 
   const insertRaw = db.prepare(
     `INSERT INTO requests_raw (ts, run_id, protocol, endpoint, class, method, status, latency_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, error)
@@ -123,11 +142,13 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   const upsertHour = db.prepare(layer("rollup_hour"));
   function layer(table: string): string {
     return `
-     INSERT INTO ${table} (bucket_ts, protocol, endpoint, cls, count, errors, latency_sum_ms, max_latency_ms, overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     INSERT INTO ${table} (bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, latency_sum_ms, max_latency_ms, overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(bucket_ts, protocol, endpoint, cls) DO UPDATE SET
        count = count + excluded.count,
        errors = errors + excluded.errors,
+       ok2xx = ok2xx + excluded.ok2xx,
+       rejected4xx = rejected4xx + excluded.rejected4xx,
        latency_sum_ms = latency_sum_ms + excluded.latency_sum_ms,
        max_latency_ms = MAX(max_latency_ms, excluded.max_latency_ms),
        overhead_sum_ms = overhead_sum_ms + excluded.overhead_sum_ms,
@@ -169,38 +190,48 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 
   const readRows = (table: "rollup_minute" | "rollup_hour", fromBucket: number, toBucket: number): RollupRow[] =>
     db.prepare(
-      `SELECT bucket_ts, protocol, endpoint, cls, count, errors, latency_sum_ms, max_latency_ms,
+      `SELECT bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, latency_sum_ms, max_latency_ms,
               overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist
        FROM ${table} WHERE bucket_ts >= ? AND bucket_ts <= ?`
     ).all(fromBucket, toBucket) as unknown as RollupRow[];
 
-  const readRawRecent = (limit: number): RequestResult[] =>
-    db.prepare(
+  const readRawRecent = (limit: number): RequestResult[] => {
+    const n = Number(limit);
+    // guard both NaN and negatives: SQLite reads LIMIT -1 as "no limit"
+    const safe = Number.isFinite(n) ? Math.min(LIMITS.recentLimit, Math.max(1, Math.trunc(n))) : 100;
+    return db.prepare(
       `SELECT ts, run_id AS runId, protocol, endpoint, class, method, status,
               latency_ms AS latencyMs, baseline_ms AS baselineMs, overhead_ms AS overheadMs,
               bytes_req AS bytesReq, bytes_resp AS bytesResp, error
        FROM requests_raw ORDER BY ts DESC LIMIT ?`
-    ).all(limit) as unknown as RequestResult[];
+    ).all(safe) as unknown as RequestResult[];
+  };
+
+  /** Above this window length the hour roll-up is used instead of the minute
+   *  one. Both layers receive every request during ingest, so the totals are
+   *  identical either way — but a 7d window over minute buckets means ~10k
+   *  buckets x endpoint combos of JSON histogram parsing on the event loop. */
+  const MINUTE_LAYER_MAX_MS = 6 * HOUR_BUCKETS;
 
   function windowRows(windowMs: number): RollupRow[] {
     const now = Date.now();
     const from = now - windowMs;
-    if (windowMs <= MINUTE_RETENTION_MS) {
+    if (windowMs <= MINUTE_LAYER_MAX_MS) {
       return readRows("rollup_minute", Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS, Math.floor(now / MINUTE_BUCKETS) * MINUTE_BUCKETS);
     }
     return readRows("rollup_hour", Math.floor(from / HOUR_BUCKETS) * HOUR_BUCKETS, Math.floor(now / HOUR_BUCKETS) * HOUR_BUCKETS);
   }
 
   function ingestBatch(batch: IngestBatch): { ingested: number; duplicate?: boolean } {
-    if (!Array.isArray(batch.results) || typeof batch.batchId !== "string") {
+    if (!batch || !Array.isArray(batch.results) || typeof batch.batchId !== "string" || batch.batchId === "") {
       throw new Error("batchId and results[] required");
     }
     if (seenBatch.get(batch.batchId)) return { ingested: 0, duplicate: true };
-    markBatch.run(batch.batchId, Date.now());
 
     interface Bucket {
       bucket_ts: number; protocol: string; endpoint: string; cls: string;
-      count: number; errors: number; latency_sum_ms: number; max_latency_ms: number;
+      count: number; errors: number; ok2xx: number; rejected4xx: number;
+      latency_sum_ms: number; max_latency_ms: number;
       overhead_sum_ms: number; overhead_max_ms: number;
       bytes_req: number; bytes_resp: number;
       hist: Histogram; overhead_hist: Histogram;
@@ -208,61 +239,74 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const minute = new Map<string, Bucket>();
     const hour = new Map<string, Bucket>();
 
-    for (const r of batch.results) {
-      const mB = Math.floor(r.ts / MINUTE_BUCKETS) * MINUTE_BUCKETS;
-      const hB = Math.floor(r.ts / HOUR_BUCKETS) * HOUR_BUCKETS;
-      const isErr = r.status === 0 || r.status >= 500;
-      insertRaw.run(r.ts, r.runId, r.protocol, r.endpoint, r.class, r.method, r.status, r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp, r.error ?? null);
-
-      for (const [bucketTs, table] of [[mB, minute], [hB, hour]] as const) {
-        const key = `${bucketTs}|${r.protocol}|${r.endpoint}|${r.class}`;
-        let b = table.get(key);
-        if (!b) {
-          b = {
-            bucket_ts: bucketTs, protocol: r.protocol, endpoint: r.endpoint, cls: r.class,
-            count: 0, errors: 0, latency_sum_ms: 0, max_latency_ms: 0,
-            overhead_sum_ms: 0, overhead_max_ms: 0,
-            bytes_req: 0, bytes_resp: 0,
-            hist: emptyHistogram(), overhead_hist: emptyHistogram()
-          };
-          table.set(key, b);
+    // One transaction for the whole batch: raw rows, both roll-up layers and the
+    // idempotency marker commit together or not at all. Marking the batch inside
+    // the transaction means a rolled-back batch can be retried rather than being
+    // silently swallowed as a duplicate.
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const r of batch.results) {
+        if (!r || typeof r.runId !== "string" || r.runId === "" || !Number.isFinite(r.ts)) {
+          throw new Error("each result needs a runId and a numeric ts");
         }
-        b.count++;
-        b.errors += isErr ? 1 : 0;
-        b.latency_sum_ms += r.latencyMs;
-        b.max_latency_ms = Math.max(b.max_latency_ms, r.latencyMs);
-        b.overhead_sum_ms += r.overheadMs;
-        b.overhead_max_ms = Math.max(b.overhead_max_ms, r.overheadMs);
-        b.bytes_req += r.bytesReq;
-        b.bytes_resp += r.bytesResp;
-        addToHistogram(b.hist, r.latencyMs);
-        addToHistogram(b.overhead_hist, r.overheadMs);
+        const mB = Math.floor(r.ts / MINUTE_BUCKETS) * MINUTE_BUCKETS;
+        const hB = Math.floor(r.ts / HOUR_BUCKETS) * HOUR_BUCKETS;
+        const isErr = r.status === 0 || r.status >= 500;
+        const is2xx = r.status >= 200 && r.status < 300;
+        const is4xx = r.status >= 400 && r.status < 500;
+        insertRaw.run(r.ts, r.runId, r.protocol, r.endpoint, r.class, r.method, r.status, r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp, r.error ?? null);
+
+        for (const [bucketTs, table] of [[mB, minute], [hB, hour]] as const) {
+          const key = `${bucketTs}|${r.protocol}|${r.endpoint}|${r.class}`;
+          let b = table.get(key);
+          if (!b) {
+            b = {
+              bucket_ts: bucketTs, protocol: r.protocol, endpoint: r.endpoint, cls: r.class,
+              count: 0, errors: 0, ok2xx: 0, rejected4xx: 0,
+              latency_sum_ms: 0, max_latency_ms: 0,
+              overhead_sum_ms: 0, overhead_max_ms: 0,
+              bytes_req: 0, bytes_resp: 0,
+              hist: emptyHistogram(), overhead_hist: emptyHistogram()
+            };
+            table.set(key, b);
+          }
+          b.count++;
+          b.errors += isErr ? 1 : 0;
+          b.ok2xx += is2xx ? 1 : 0;
+          b.rejected4xx += is4xx ? 1 : 0;
+          b.latency_sum_ms += r.latencyMs;
+          b.max_latency_ms = Math.max(b.max_latency_ms, r.latencyMs);
+          b.overhead_sum_ms += r.overheadMs;
+          b.overhead_max_ms = Math.max(b.overhead_max_ms, r.overheadMs);
+          b.bytes_req += r.bytesReq;
+          b.bytes_resp += r.bytesResp;
+          addToHistogram(b.hist, r.latencyMs);
+          addToHistogram(b.overhead_hist, r.overheadMs);
+        }
       }
-    }
-    for (const b of minute.values()) {
-      upsertMinute.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
-    }
-    for (const b of hour.values()) {
-      upsertHour.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
+      for (const b of minute.values()) {
+        upsertMinute.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
+      }
+      for (const b of hour.values()) {
+        upsertHour.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
+      }
+      markBatch.run(batch.batchId, Date.now());
+      db.exec("COMMIT");
+    } catch (e) {
+      try { db.exec("ROLLBACK"); } catch { /* already unwound */ }
+      throw e;
     }
     return { ingested: batch.results.length };
   }
 
   function summary(windowMs: number): MetricSummary {
+    // Roll-ups are written synchronously during ingest, so they already include
+    // the in-progress minute. There is deliberately no separate "live tail" pass
+    // here — adding one double-counted every request in the current bucket.
     const rows = windowRows(windowMs);
     const byEndpointCls = rowsToCombined(rows, "endpoint");
     const byClass = rowsToCombined(rows, "class");
 
-    const rollEdge = Math.floor(Date.now() / MINUTE_BUCKETS) * MINUTE_BUCKETS;
-    const tailRows = db.prepare(
-      `SELECT ts, protocol, endpoint, class, latency_ms, overhead_ms, bytes_req, bytes_resp, status
-       FROM requests_raw WHERE ts >= ?`
-    ).all(rollEdge) as unknown as {
-      ts: number; protocol: string; endpoint: string; class: ScenarioClass;
-      latency_ms: number; overhead_ms: number; bytes_req: number; bytes_resp: number; status: number;
-    }[];
-
-    const isErrStatus = (s: number) => s === 0 || s >= 500;
     let total = 0;
     let errors = 0;
     let bytesReq = 0;
@@ -274,6 +318,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const perEndpoint: EndpointStat[] = [];
     const perClass: ClassStat[] = [];
     const protoAcc = new Map<string, { total: number; errors: number }>();
+    const windowSec = windowMs / 1000;
+    const perSec = (n: number): number => (windowSec > 0 ? n / windowSec : 0);
 
     for (const c of byEndpointCls.values()) {
       total += c.count;
@@ -285,12 +331,12 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       mergeHistograms(totalHist, c.hist);
       mergeHistograms(totalOverheadHist, c.overheadHist);
       perEndpoint.push({
-        protocol: c.protocol as "rest" | "soap",
+        protocol: c.protocol === "soap" ? "soap" : "rest",
         endpoint: c.endpoint,
         total: c.count,
         errors: c.errors,
         errorPct: c.count === 0 ? 0 : (100 * c.errors) / c.count,
-        rps: windowMs === 0 ? 0 : c.count / (windowMs / 1000),
+        rps: perSec(c.count),
         p50: percentile(c.hist, 50),
         p95: percentile(c.hist, 95),
         avgLatencyMs: meanFromRollup(c.latencySumMs, c.count),
@@ -308,8 +354,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         cls: cls as ScenarioClass,
         total: c.count,
         errors: c.errors,
-        errorPct: c.count === 0 ? 0 : (100 * c.errors) / c.count,
-        rps: windowMs === 0 ? 0 : c.count / (windowMs / 1000),
+        errorPct: (100 * c.errors) / c.count,
+        rps: perSec(c.count),
         latencyMs: {
           p50: percentile(c.hist, 50),
           p95: percentile(c.hist, 95),
@@ -322,75 +368,18 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           p99: percentile(c.overheadHist, 99),
           avg: meanFromRollup(c.overheadSumMs, c.count)
         },
-        avgBytesReq: c.count === 0 ? 0 : c.bytesReq / c.count,
-        avgBytesResp: c.count === 0 ? 0 : c.bytesResp / c.count
-      });
-    }
-
-    // live tail (last minute, not yet rolled up)
-    for (const t of tailRows) {
-      if (t.ts < rollEdge) continue;
-      total++;
-      bytesReq += t.bytes_req;
-      bytesResp += t.bytes_resp;
-      latencySum += t.latency_ms;
-      overheadSum += t.overhead_ms;
-      const err = isErrStatus(t.status);
-      if (err) errors++;
-      addToHistogram(totalHist, t.latency_ms);
-      addToHistogram(totalOverheadHist, t.overhead_ms);
-      const proto = t.protocol === "soap" ? "soap" : "rest";
-      const acc = protoAcc.get(proto) ?? { total: 0, errors: 0 };
-      acc.total++;
-      if (err) acc.errors++;
-      protoAcc.set(proto, acc);
-      // merge into the per-class rollup for the most recent row
-      const existing = byClass.get(`|${t.class}`);
-      if (existing) {
-        existing.count++;
-        existing.errors += err ? 1 : 0;
-        existing.latencySumMs += t.latency_ms;
-        existing.overheadSumMs += t.overhead_ms;
-        existing.bytesReq += t.bytes_req;
-        existing.bytesResp += t.bytes_resp;
-        addToHistogram(existing.hist, t.latency_ms);
-        addToHistogram(existing.overheadHist, t.overhead_ms);
-      }
-    }
-    // rebuild per-class from refolded map
-    perClass.length = 0;
-    for (const [cls, c] of byClass.entries()) {
-      if (c.count === 0) continue;
-      perClass.push({
-        cls: cls.replace(/^\|/, "") as ScenarioClass,
-        total: c.count,
-        errors: c.errors,
-        errorPct: (100 * c.errors) / c.count,
-        rps: c.count / (windowMs / 1000),
-        latencyMs: {
-          p50: percentile(c.hist, 50),
-          p95: percentile(c.hist, 95),
-          p99: percentile(c.hist, 99),
-          avg: c.latencySumMs / c.count
-        },
-        overheadMs: {
-          p50: percentile(c.overheadHist, 50),
-          p95: percentile(c.overheadHist, 95),
-          p99: percentile(c.overheadHist, 99),
-          avg: c.overheadSumMs / c.count
-        },
         avgBytesReq: c.bytesReq / c.count,
         avgBytesResp: c.bytesResp / c.count
       });
     }
 
-    const windowSec = windowMs / 1000;
+    const invalid = byClass.get("invalid");
     return {
       windowSec,
       total,
       errors,
       errorPct: total === 0 ? 0 : (100 * errors) / total,
-      rps: total / windowSec,
+      rps: perSec(total),
       latencyMs: {
         p50: percentile(totalHist, 50),
         p90: percentile(totalHist, 90),
@@ -406,23 +395,42 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         p99: percentile(totalOverheadHist, 99),
         avg: overheadSum / Math.max(total, 1)
       },
-      bytes: { req: bytesReq, resp: bytesResp, respPerSec: bytesResp / windowSec },
+      bytes: { req: bytesReq, resp: bytesResp, respPerSec: perSec(bytesResp) },
       perProtocol: [...protoAcc.entries()].map(([protocol, a]) => ({
-        protocol: protocol as "rest" | "soap",
+        protocol: protocol === "soap" ? "soap" as const : "rest" as const,
         total: a.total,
         errors: a.errors
       })),
       perEndpoint: perEndpoint.sort((a, b) => b.total - a.total),
-      perClass: perClass.sort((a, b) => b.total - a.total)
+      perClass: perClass.sort((a, b) => b.total - a.total),
+      contract: {
+        invalidSent: invalid?.count ?? 0,
+        rejected4xx: invalid?.rejected4xx ?? 0,
+        wronglyAccepted: invalid?.ok2xx ?? 0
+      }
     };
   }
 
   function timeseries(bucketSec: 60 | 3600, from: number, to: number): TimeSeries {
-    const table = bucketSec === 60 ? "rollup_minute" : "rollup_hour";
     const sizeMs = bucketSec * 1000;
-    const fromB = Math.floor(from / sizeMs) * sizeMs;
-    const toB = Math.floor(to / sizeMs) * sizeMs;
-    const rows = readRows(table, fromB, toB);
+    const now = Date.now();
+    // Unvalidated from/to used to let one request allocate tens of millions of
+    // points and OOM the process, so both ends are normalised and the span is
+    // capped before a single object is built.
+    const safeTo = Number.isFinite(to) ? Math.min(to, now + sizeMs) : now;
+    const retention = bucketSec === 60 ? MINUTE_RETENTION_MS : HOUR_RETENTION_MS;
+    const earliest = safeTo - retention;
+    let safeFrom = Number.isFinite(from) ? Math.max(from, earliest) : safeTo - 3_600_000;
+    if (safeFrom > safeTo) safeFrom = safeTo;
+
+    const fromB = Math.floor(safeFrom / sizeMs) * sizeMs;
+    const toB = Math.floor(safeTo / sizeMs) * sizeMs;
+    const requested = Math.floor((toB - fromB) / sizeMs) + 1;
+    const truncated = requested > LIMITS.timeseriesPoints;
+    const startB = truncated ? toB - (LIMITS.timeseriesPoints - 1) * sizeMs : fromB;
+
+    const table = bucketSec === 60 ? "rollup_minute" : "rollup_hour";
+    const rows = readRows(table, startB, toB);
 
     interface Acc {
       ts: number; total: number; errors: number; bytesResp: number;
@@ -454,7 +462,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       }
     }
     const out: TimePoint[] = [];
-    for (let t = fromB; t <= toB; t += sizeMs) {
+    for (let t = startB; t <= toB; t += sizeMs) {
       const p = points.get(t);
       if (!p) {
         out.push({ ts: t, total: 0, errors: 0, rps: 0, p50: 0, p90: 0, p99: 0, overheadP50: 0, overheadP95: 0, overheadP99: 0, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 });
@@ -474,17 +482,24 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         restErrors: p.restErrors, soapErrors: p.soapErrors
       });
     }
-    return { bucketSec, points: out };
+    return truncated ? { bucketSec, points: out, truncated } : { bucketSec, points: out };
   }
 
   const rawCleaner = setInterval(() => {
-    const cutoff = Date.now() - RAW_RETENTION_MS;
-    db.prepare(`DELETE FROM requests_raw WHERE ts < ?`).run(cutoff);
-    const minuteCutoff = Math.floor((Date.now() - MINUTE_RETENTION_MS) / MINUTE_BUCKETS) * MINUTE_BUCKETS;
-    db.prepare(`DELETE FROM rollup_minute WHERE bucket_ts < ?`).run(minuteCutoff);
-    const hourCutoff = Math.floor((Date.now() - HOUR_RETENTION_MS) / HOUR_BUCKETS) * HOUR_BUCKETS;
-    db.prepare(`DELETE FROM rollup_hour WHERE bucket_ts < ?`).run(hourCutoff);
-    cleanupSeen.run(Date.now() - 6 * HOUR_BUCKETS);
+    try {
+      const cutoff = Date.now() - RAW_RETENTION_MS;
+      db.prepare(`DELETE FROM requests_raw WHERE ts < ?`).run(cutoff);
+      const minuteCutoff = Math.floor((Date.now() - MINUTE_RETENTION_MS) / MINUTE_BUCKETS) * MINUTE_BUCKETS;
+      db.prepare(`DELETE FROM rollup_minute WHERE bucket_ts < ?`).run(minuteCutoff);
+      const hourCutoff = Math.floor((Date.now() - HOUR_RETENTION_MS) / HOUR_BUCKETS) * HOUR_BUCKETS;
+      db.prepare(`DELETE FROM rollup_hour WHERE bucket_ts < ?`).run(hourCutoff);
+      cleanupSeen.run(Date.now() - 6 * HOUR_BUCKETS);
+      // WAL would otherwise grow without bound across a multi-week run
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch (e) {
+      // a throw inside a timer callback would take the whole process down
+      console.error("[metrics] retention sweep failed:", (e as Error).message);
+    }
   }, 10 * 60_000);
   rawCleaner.unref();
 
@@ -495,12 +510,14 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     recent: readRawRecent,
     readGateway: () => {
       const row = getConfig.get("gateway") as { value: string } | undefined;
-      return row ? (JSON.parse(row.value) as GwConfig) : null;
+      if (!row) return null;
+      try { return JSON.parse(row.value) as GwConfig; } catch { return null; }
     },
     writeGateway: (cfg) => setConfig.run("gateway", JSON.stringify(cfg)),
     readProfile: () => {
       const row = getConfig.get("profile") as { value: string } | undefined;
-      return row ? (JSON.parse(row.value) as LoadProfile) : null;
+      if (!row) return null;
+      try { return JSON.parse(row.value) as LoadProfile; } catch { return null; }
     },
     writeProfile: (p) => setConfig.run("profile", JSON.stringify(p)),
     recordRunStart: (runId, profile) => insertRun.run(runId, Date.now(), JSON.stringify(profile)),
@@ -510,10 +527,26 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         `SELECT id, run_id AS runId, started_at AS startedAt, stopped_at AS stoppedAt, profile
          FROM runs ORDER BY started_at DESC LIMIT 50`
       ).all() as unknown as (Omit<RunEvent, "profile"> & { profile: string })[];
-      return rows.map((r) => ({ ...r, profile: JSON.parse(r.profile) as LoadProfile }));
+      return rows.map((r) => {
+        let profile: LoadProfile;
+        try { profile = JSON.parse(r.profile) as LoadProfile; } catch { profile = {} as LoadProfile; }
+        return { ...r, profile };
+      });
     },
-    close: () => db.close()
+    close: () => {
+      clearInterval(rawCleaner);
+      try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* closing anyway */ }
+      db.close();
+    }
   };
+}
+
+/** Additive migrations for databases created by an older build. */
+function migrate(db: DbHandle): void {
+  for (const table of ["rollup_minute", "rollup_hour"]) {
+    ensureColumn(db, table, "ok2xx", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, table, "rejected4xx", "INTEGER NOT NULL DEFAULT 0");
+  }
 }
 
 export const HISTOGRAM_EDGES = HISTOGRAM_EDGES_MS;

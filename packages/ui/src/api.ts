@@ -1,145 +1,39 @@
 import { getCreds, setCreds } from "./main";
 
-export type Protocol = "rest" | "soap";
+// Types come from the same package the server uses — the UI used to re-declare
+// all of them, which let the two drift apart silently.
+export type {
+  ClassStat,
+  EndpointStat,
+  GwConfig,
+  LoadMode,
+  LoadProfile,
+  MetricSummary,
+  Protocol,
+  RequestResult,
+  RunEvent,
+  RunStatus,
+  ScenarioClass,
+  ScenarioWeights,
+  TimePoint,
+  TimeSeries
+} from "@apigw/shared";
 
-export type ScenarioClass =
-  | "small-rest" | "big-response" | "big-request" | "slow-upstream" | "concurrency" | "soap";
+import type { GwConfig, LoadProfile, MetricSummary, RequestResult, RunEvent, RunStatus, TimeSeries } from "@apigw/shared";
+import { DEFAULT_GW_CONFIG, DEFAULT_LOAD_PROFILE, LIMITS } from "@apigw/shared";
 
-export interface ClassStat {
-  cls: ScenarioClass;
-  total: number;
-  errors: number;
-  errorPct: number;
-  rps: number;
-  latencyMs: { p50: number; p95: number; p99: number; avg: number };
-  overheadMs: { p50: number; p95: number; p99: number; avg: number };
-  avgBytesReq: number;
-  avgBytesResp: number;
-}
+/** Windows GET /api/summary accepts. Keep in sync with SUMMARY_WINDOWS in app.ts. */
+export const SUMMARY_WINDOWS = ["5m", "15m", "1h", "6h", "24h", "7d"] as const;
+export type SummaryWindow = (typeof SUMMARY_WINDOWS)[number];
 
-export interface MetricSummary {
-  windowSec: number;
-  total: number;
-  errors: number;
-  errorPct: number;
-  rps: number;
-  latencyMs: { p50: number; p90: number; p95: number; p99: number; avg: number; max: number };
-  overheadMs: { p50: number; p90: number; p95: number; p99: number; avg: number };
-  bytes: { req: number; resp: number; respPerSec: number };
-  perProtocol: { protocol: Protocol; total: number; errors: number }[];
-  perEndpoint: EndpointStat[];
-  perClass: ClassStat[];
-}
-
-export interface EndpointStat {
-  protocol: Protocol;
-  endpoint: string;
-  total: number;
-  errors: number;
-  errorPct: number;
-  rps: number;
-  p50: number;
-  p95: number;
-  avgLatencyMs: number;
-  avgRespBytes: number;
-}
-
-export interface TimePoint {
-  ts: number;
-  total: number;
-  errors: number;
-  rps: number;
-  p50: number;
-  p90: number;
-  p99: number;
-  overheadP50: number;
-  overheadP95: number;
-  overheadP99: number;
-  bytesResp: number;
-  restTotal: number;
-  soapTotal: number;
-  restErrors: number;
-  soapErrors: number;
-}
-
-export interface TimeSeries {
-  bucketSec: number;
-  points: TimePoint[];
-}
-
-export interface RequestResult {
-  runId: string;
-  ts: number;
-  protocol: Protocol;
-  endpoint: string;
-  class: ScenarioClass;
-  method: string;
-  status: number;
-  latencyMs: number;
-  baselineMs: number;
-  overheadMs: number;
-  bytesReq: number;
-  bytesResp: number;
-  error: string | null;
-}
-
-export interface GwConfig {
-  baseUrl: string;
-  apiKey: string;
-  apiKeyHeader: string;
-  pathPrefix: string;
-}
-
-export type LoadMode = "constant" | "ramp" | "spike" | "sine-daily" | "real";
-
-export interface ScenarioWeights {
-  listPets: number;
-  getPet: number;
-  createPet: number;
-  updatePet: number;
-  deletePet: number;
-  placeOrder: number;
-}
-
-export interface LoadProfile {
-  mode: LoadMode;
-  rps?: number;
-  rampFrom?: number;
-  rampTo?: number;
-  rampMinutes?: number;
-  spikeBase?: number;
-  spikePeak?: number;
-  spikeEveryMinutes?: number;
-  spikeDurationSeconds?: number;
-  sineMin?: number;
-  sineMax?: number;
-  maxConcurrency: number;
-  soapRatioPct: number;
-  scenarioWeights: ScenarioWeights;
-}
-
-export interface RunStatus {
-  state: "idle" | "running" | "stopping";
-  runId: string | null;
-  startedAt: number | null;
-  uptimeSec: number | null;
-  profile: LoadProfile | null;
-  targetRps: number;
-  counters: { sent: number; ok: number; errors: number; timeouts: number };
-  gateway?: GwConfig;
-}
-
-export interface RunEvent {
-  id: number;
-  runId: string;
-  startedAt: number;
-  stoppedAt: number | null;
-  profile: LoadProfile;
+export class ApiError extends Error {
+  constructor(readonly status: number, readonly path: string, message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  // Basic auth for every request. Browsers will also do a native prompt when the
-  // fetch itself lacks credentials, which lets us keep this minimal.
   const creds = getCreds();
   const res = await fetch(path, {
     ...init,
@@ -148,65 +42,104 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
       ...(creds ? { authorization: creds } : {})
     }
   });
-  if (res.status === 401 && !path.endsWith("/auth-check")) {
-    // trigger the native Basic prompt once, then let the UI render it
+  if (res.status === 401) {
+    // drop the credential and let <Root> swap in the login gate. Reloading here
+    // turned a persistent 401 into a reload loop against a failing server.
     setCreds(null);
-    window.location.reload();
-    throw new Error("unauthorized");
+    throw new ApiError(401, path, "Unauthorized — sign in again.");
   }
-  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      const body = (await res.json()) as { error?: string };
+      if (body?.error) detail = `${res.status} — ${body.error}`;
+    } catch { /* not JSON */ }
+    throw new ApiError(res.status, path, `${path} failed: ${detail}`);
+  }
   return res.json() as Promise<T>;
 }
 
+/** Fetch an API definition with auth and hand it to the browser as a download. */
+export async function downloadDefinition(path: string, filename: string): Promise<void> {
+  const creds = getCreds();
+  const res = await fetch(path, { headers: creds ? { authorization: creds } : {} });
+  if (!res.ok) throw new ApiError(res.status, path, `${path} failed: ${res.status}`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    // give the click a tick before revoking
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+}
+
+export interface DefinitionIndex {
+  openapiJson: string;
+  openapiYaml: string;
+  wsdl: string;
+  serverUrl: string;
+  note: string;
+}
+
+/** Result of POST /api/config/gateway/test. */
+export interface GatewayProbe {
+  ok: boolean;
+  url: string;
+  latencyMs: number;
+  status?: number;
+  error?: string;
+}
 
 export const api = {
-  summary: (window: string) => req<MetricSummary>(`/api/summary?window=${window}`),
+  summary: (window: SummaryWindow) => req<MetricSummary>(`/api/summary?window=${window}`),
   timeseries: (hours: number) => {
     const to = Date.now();
     const from = to - hours * 3600_000;
     const bucket = hours <= 2 ? 60 : 3600;
     return req<TimeSeries>(`/api/timeseries?bucket=${bucket}&from=${from}&to=${to}`);
   },
-  recent: (limit = 100) => req<{ items: RequestResult[] }>(`/api/recent?limit=${limit}`),
+  recent: (limit = 100) =>
+    req<{ items: RequestResult[] }>(`/api/recent?limit=${Math.min(limit, LIMITS.recentLimit)}`),
   status: () => req<RunStatus>("/api/run/status"),
   runs: () => req<RunEvent[]>("/api/runs"),
-  gateway: () => req<GwConfig | null>("/api/config/gateway"),
-  profile: () => req<LoadProfile | null>("/api/config/profile"),
+  gateway: () => req<GwConfig>("/api/config/gateway"),
+  profile: () => req<LoadProfile>("/api/config/profile"),
+  definitions: () => req<DefinitionIndex>("/api/definitions"),
   saveGateway: (cfg: GwConfig) =>
-    req<{ saved: true }>("/api/config/gateway", {
+    req<{ saved: true; gateway: GwConfig }>("/api/config/gateway", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg)
     }),
   saveProfile: (p: LoadProfile) =>
-    req<{ saved: true }>("/api/config/profile", {
+    req<{ saved: true; profile: LoadProfile }>("/api/config/profile", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(p)
     }),
-  startRun: () =>
-    req<{ ok: true; runId: string }>("/api/run/start", { method: "POST" }),
+  // probed by the server, not the browser: the dashboard's `connect-src 'self'`
+  // CSP blocks any cross-origin fetch, and the gateway is always another origin
+  testGateway: (cfg: GwConfig) =>
+    req<GatewayProbe>("/api/config/gateway/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg)
+    }),
+  startRun: () => req<{ ok: true; runId: string }>("/api/run/start", { method: "POST" }),
   stopRun: () => req<{ stopped: true }>("/api/run/stop", { method: "POST" })
 };
 
-export const DEFAULT_PROFILE: LoadProfile = {
-  mode: "constant",
-  rps: 10,
-  maxConcurrency: 25,
-  soapRatioPct: 25,
-  scenarioWeights: {
-    listPets: 50, getPet: 20, createPet: 10, updatePet: 5, deletePet: 5, placeOrder: 10
-  }
-};
-
-export const DEFAULT_GW: GwConfig = {
-  baseUrl: "http://petstore:8081",
-  apiKey: "",
-  apiKeyHeader: "X-API-Key",
-  pathPrefix: ""
-};
+export const DEFAULT_PROFILE: LoadProfile = DEFAULT_LOAD_PROFILE;
+export const DEFAULT_GW: GwConfig = DEFAULT_GW_CONFIG;
 
 export function fmtBytes(n: number): string {
+  if (!Number.isFinite(n)) return "—";
   if (n < 1024) return `${n.toFixed(0)} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
@@ -214,12 +147,14 @@ export function fmtBytes(n: number): string {
 }
 
 export function fmtMs(n: number): string {
+  if (!Number.isFinite(n)) return "—";
   if (n < 1) return `${(n * 1000).toFixed(0)} µs`;
   if (n < 1000) return `${n.toFixed(0)} ms`;
   return `${(n / 1000).toFixed(2)} s`;
 }
 
 export function fmtDuration(sec: number): string {
+  if (!Number.isFinite(sec)) return "—";
   const d = Math.floor(sec / 86400);
   const h = Math.floor((sec % 86400) / 3600);
   const m = Math.floor((sec % 3600) / 60);

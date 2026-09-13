@@ -6,8 +6,8 @@ import {
 
 /**
  * Panel: measures its own box with ResizeObserver once, then renders a Recharts
- * SVG with explicit pixel width/height. Complately avoids ResponsiveContainer's
- * measurement loop (the class .doubling-per-poll bug that grows the page).
+ * SVG with explicit pixel width/height. Completely avoids ResponsiveContainer's
+ * measurement loop (the classic doubling-per-poll bug that grows the page).
  */
 export function Panel({ children, height = 240 }: {
   children: (dims: { width: number; height: number }) => ReactNode;

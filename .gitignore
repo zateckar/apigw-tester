@@ -2,6 +2,11 @@ node_modules/
 dist/
 data/
 *.log
-.env
 coverage/
 .vite/
+.tmp-review/
+
+# local secrets — .env.example is the tracked template
+.env
+.env.*
+!.env.example

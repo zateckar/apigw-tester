@@ -1,0 +1,9 @@
+# Normalize to LF in the repository. The image is built on Linux and CI runs bash
+# heredocs, so CRLF sneaking in from a Windows checkout breaks the build rather
+# than just looking untidy.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary

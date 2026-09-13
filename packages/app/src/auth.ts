@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
 
 // Single-file auth gate: `APP_BASIC_AUTH="name:password"` protects everything.
@@ -21,6 +22,20 @@ function credentials(): Creds | null {
 
 export function isConfigured(): boolean {
   return credentials() !== null;
+}
+
+/** Length-independent comparison, so neither the length nor the position of the
+ *  first differing byte is observable in the response time. */
+function constantTimeEquals(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf-8");
+  const bb = Buffer.from(b, "utf-8");
+  // hash to a fixed width first: timingSafeEqual throws on length mismatch
+  const pad = Buffer.alloc(Math.max(ab.length, bb.length));
+  const abp = Buffer.alloc(pad.length);
+  const bbp = Buffer.alloc(pad.length);
+  ab.copy(abp);
+  bb.copy(bbp);
+  return timingSafeEqual(abp, bbp) && ab.length === bb.length;
 }
 
 function unauthorized(res: Response, realm: string): void {
@@ -50,7 +65,7 @@ export function requireAuth(realm = "apigw-tester") {
       return;
     }
     const i = decoded.indexOf(":");
-    if (i < 0 || decoded.slice(0, i) !== want.user || decoded.slice(i + 1) !== want.pass) {
+    if (i < 0 || !constantTimeEquals(decoded.slice(0, i), want.user) || !constantTimeEquals(decoded.slice(i + 1), want.pass)) {
       unauthorized(res, realm);
       return;
     }

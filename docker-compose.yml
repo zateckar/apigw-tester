@@ -5,22 +5,41 @@ services:
     image: ${IMAGE:-apigw-tester:latest}
     build:
       context: .
-      dockerfile: ops/Dockerfile.app
+      dockerfile: Dockerfile
     ports:
       - "${PORT:-8080}:8080"
     environment:
       # Mandatory. The container refuses to start if APP_BASIC_AUTH is missing.
       APP_BASIC_AUTH: ${APP_BASIC_AUTH:?set APP_BASIC_AUTH=name:password before running}
+      NODE_ENV: production
       DB_PATH: /app/data/metrics.db
       PETSTORE_SELF_URL: http://127.0.0.1:8080
+      # Point the driver at a real gateway without editing any config.
+      # Empty means "target my own built-in petstore".
+      GW_BASE_URL: ${GW_BASE_URL:-}
+      GW_API_KEY: ${GW_API_KEY:-}
+      GW_API_KEY_HEADER: ${GW_API_KEY_HEADER:-X-API-Key}
+      GW_PATH_PREFIX: ${GW_PATH_PREFIX:-}
     volumes:
       - app-data:/app/data
     restart: unless-stopped
+    # give the process time to flush metrics and checkpoint SQLite on SIGTERM
+    stop_grace_period: 15s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 15s
       timeout: 3s
       retries: 5
+      start_period: 10s
+    # an always-on load generator is chatty; cap the logs so a long run cannot
+    # fill the host disk
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   app-data:

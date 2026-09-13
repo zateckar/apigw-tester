@@ -7,13 +7,16 @@
     "packages/*"
   ],
   "scripts": {
+    "clean": "npm run clean --workspaces --if-present",
     "build": "npm run build -w @apigw/shared && npm run build -w @apigw/app && npm run build -w @apigw/ui",
     "test": "npm run test --workspaces --if-present",
     "lint": "eslint .",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "verify": "npm run lint && npm run typecheck && npm test",
     "start": "npm start -w @apigw/app",
     "compose:up": "docker compose up --build -d",
-    "compose:down": "docker compose down -v",
+    "compose:down": "docker compose down",
+    "compose:reset": "docker compose down -v",
     "logs": "docker compose logs -f"
   },
   "devDependencies": {

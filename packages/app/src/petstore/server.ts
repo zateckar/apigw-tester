@@ -1,14 +1,16 @@
 import { Router } from "express";
 import type { NextFunction, Request, Response } from "express";
 import type { ChaosConfig, EndpointLatencyProfile, PetStatus } from "@apigw/shared";
+import { LIMITS, PET_STATUSES, isPetStatus } from "@apigw/shared";
 import {
   DEFAULT_CHAOS,
   DEFAULT_LATENCY_PROFILE,
   decideChaos,
-  sampleLatency
+  sampleLatency,
+  validateLatencyPatch
 } from "./latency.js";
-import { PetStore, padPayload } from "./store.js";
-import { WSDL, detectOperation, executeOperation, soapFault, padEnvelope } from "./soap.js";
+import { PetStore, padPayload, validateNewPet, validateUpdatePet } from "./store.js";
+import { WSDL, detectOperation, executeOperation, soapFault, padEnvelope, isWellFormedXml } from "./soap.js";
 
 const DEFAULT_SIZES: Record<string, number> = {
   "list-pets": 8000,
@@ -16,6 +18,27 @@ const DEFAULT_SIZES: Record<string, number> = {
   "pet-photo": 50000,
   "soap-ops": 3000
 };
+
+/** Chaos "timeout": long enough to blow past any sane client budget, but still
+ *  bounded so the socket and its timer are always released. */
+const CHAOS_TIMEOUT_MS = LIMITS.delayMs;
+
+/** Parse a path parameter that must be a positive integer. */
+export function pathInt(raw: string | undefined): number | null {
+  if (raw === undefined || !/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 1 ? n : null;
+}
+
+/** Parse a header that must be a non-negative integer, clamped to `max`. */
+export function headerInt(raw: string | undefined, max: number): number | null {
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.min(n, max);
+}
 
 export function createApp() {
   const app = Router(); // mounted inside the host app; parsing is done upstream
@@ -25,95 +48,97 @@ export function createApp() {
 
   // Per-request simulated latency + size + chaos. Runs on /api/* and /soap/* only.
   const variability = (
-    endpointKey?: string
+    endpointKey: string
   ): ((req: Request, res: Response, next: NextFunction) => void) =>
     (req, res, next) => {
-      const key =
-        endpointKey ??
-        ({
-          "GET /api/pets": "list-pets",
-          "POST /api/pets": "create-pet",
-          "PUT /api/pets/:petId": "update-pet",
-          "DELETE /api/pets/:petId": "delete-pet"
-        }[req.method + " " + req.path] ?? "unmapped");
+      // explicit overrides take precedence, both hard-clamped
+      const delayHdr = headerInt(req.header("X-Test-Delay-Ms"), LIMITS.delayMs);
+      let delayMs =
+        delayHdr ??
+        sampleLatency(
+          latencyProfile[endpointKey] ?? DEFAULT_LATENCY_PROFILE["unmapped"] ?? { kind: "fixed", ms: 50 },
+          Math.random
+        );
 
-      // explicit overrides take precedence
-      const delayHdr = Number(req.header("X-Test-Delay-Ms"));
-      let delayMs = Number.isFinite(delayHdr) && delayHdr > 0
-        ? delayHdr
-        : sampleLatency(
-            latencyProfile[key] ?? DEFAULT_LATENCY_PROFILE["unmapped"] ?? { kind: "fixed", ms: 50 },
-            Math.random
-          );
-
-      const sizeHdr = Number(req.header("X-Test-Size-B"));
-      if (Number.isFinite(sizeHdr) && sizeHdr > 0) {
+      const sizeHdr = headerInt(req.header("X-Test-Size-B"), LIMITS.padBytes);
+      if (sizeHdr !== null) {
         res.locals["padBytes"] = sizeHdr;
-      } else if (DEFAULT_SIZES[key]) {
-        res.locals["padBytes"] = DEFAULT_SIZES[key] * (0.8 + Math.random() * 0.4);
+      } else if (DEFAULT_SIZES[endpointKey]) {
+        res.locals["padBytes"] = (DEFAULT_SIZES[endpointKey] as number) * (0.8 + Math.random() * 0.4);
       }
 
       switch (decideChaos(chaos, Math.random)) {
         case "error":
           return res.status(500).json({ error: "chaos monkey says 500" });
         case "timeout":
-          // abuse hard-timeout: exceed any sane client timeout
-          delayMs = 60_000;
+          delayMs = CHAOS_TIMEOUT_MS;
       }
-      setTimeout(next, delayMs);
+      const timer = setTimeout(next, delayMs);
+      // if the client walks away, stop holding the timer
+      res.once("close", () => clearTimeout(timer));
     };
 
   const send = (res: Response, status: number, body: Record<string, unknown>) => {
     const pad = res.locals["padBytes"] as number | undefined;
-    const payload = pad ? padPayload(body as Record<string, unknown>, Math.round(pad)) : body;
+    const payload = pad ? padPayload(body, Math.round(pad)) : body;
     res.status(status).json(payload);
   };
 
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", pets: store.count(), chaos });
-  });
+  const bad = (res: Response, message: string) => send(res, 400, { error: message });
 
   // ---------- REST: pets ----------
   app.get("/api/pets", variability("list-pets"), (req, res) => {
-    const status = req.query["status"] as string | undefined;
-    if (status && !["available", "pending", "sold"].includes(status)) {
-      return send(res, 400, { error: "status must be available|pending|sold" });
+    const status = req.query["status"];
+    if (status !== undefined) {
+      if (!isPetStatus(status)) return bad(res, `status must be one of ${PET_STATUSES.join("|")}`);
     }
-    const page = Number(req.query["page"] ?? 0);
-    const size = Number(req.query["size"] ?? 20);
+    const pageRaw = req.query["page"] ?? "0";
+    const sizeRaw = req.query["size"] ?? "20";
+    const page = Number(pageRaw);
+    const size = Number(sizeRaw);
+    if (!Number.isInteger(page) || page < 0) return bad(res, "page must be a non-negative integer");
+    if (!Number.isInteger(size) || size < 1 || size > 100) return bad(res, "size must be an integer between 1 and 100");
+
     const { items, total } = store.list(status as PetStatus | undefined, page, size);
     send(res, 200, { items, total, page, size } as unknown as Record<string, unknown>);
   });
 
   app.get("/api/pets/:petId", variability("get-pet"), (req, res) => {
-    const pet = store.get(Number(req.params["petId"]));
+    const id = pathInt(req.params["petId"]);
+    if (id === null) return bad(res, "petId must be a positive integer");
+    const pet = store.get(id);
     if (!pet) return send(res, 404, { error: "Pet not found" });
     send(res, 200, pet as unknown as Record<string, unknown>);
   });
 
   app.post("/api/pets", variability("create-pet"), (req, res) => {
-    const body = (req.body ?? {}) as Record<string, unknown>;
-    if (typeof body["name"] !== "string" || body["name"].length === 0) {
-      return send(res, 400, { error: "name is required" });
-    }
-    const pet = store.create(body);
+    const parsed = validateNewPet(req.body);
+    if (!parsed.ok) return bad(res, parsed.error);
+    const pet = store.create(parsed.value);
     send(res, 201, pet as unknown as Record<string, unknown>);
   });
 
   app.put("/api/pets/:petId", variability("update-pet"), (req, res) => {
-    const pet = store.update(Number(req.params["petId"]), (req.body ?? {}) as Record<string, unknown>);
+    const id = pathInt(req.params["petId"]);
+    if (id === null) return bad(res, "petId must be a positive integer");
+    const parsed = validateUpdatePet(req.body);
+    if (!parsed.ok) return bad(res, parsed.error);
+    const pet = store.update(id, parsed.value);
     if (!pet) return send(res, 404, { error: "Pet not found" });
     send(res, 200, pet as unknown as Record<string, unknown>);
   });
 
   app.delete("/api/pets/:petId", variability("delete-pet"), (req, res) => {
-    const ok = store.delete(Number(req.params["petId"]));
-    if (!ok) return send(res, 404, { error: "Pet not found" });
-    send(res, 200, { deleted: true, id: Number(req.params["petId"]) });
+    const id = pathInt(req.params["petId"]);
+    if (id === null) return bad(res, "petId must be a positive integer");
+    if (!store.delete(id)) return send(res, 404, { error: "Pet not found" });
+    send(res, 200, { deleted: true, id });
   });
 
   app.get("/api/pets/:petId/photo", variability("pet-photo"), (req, res) => {
-    const pet = store.get(Number(req.params["petId"]));
+    const id = pathInt(req.params["petId"]);
+    if (id === null) return bad(res, "petId must be a positive integer");
+    const pet = store.get(id);
     if (!pet) return send(res, 404, { error: "Pet not found" });
     const pad = res.locals["padBytes"] as number | undefined;
     const padded = padPayload({ petId: pet.id, photo: pet.photoUrls, contentType: "image/jpeg" }, Math.round(pad ?? 50000));
@@ -126,33 +151,50 @@ export function createApp() {
   // ---------- REST: store ----------
   app.post("/api/store/order", variability("place-order"), (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const petId = Number(body["petId"]);
-    if (!Number.isInteger(petId) || !store.get(petId)) {
-      return send(res, 400, { error: "valid petId is required" });
+    const petId = body["petId"];
+    if (typeof petId !== "number" || !Number.isSafeInteger(petId) || petId < 1) {
+      return bad(res, "petId is required and must be a positive integer");
     }
-    const order = store.placeOrder({ petId, quantity: Number(body["quantity"] ?? 1) });
+    let quantity = 1;
+    if (body["quantity"] !== undefined) {
+      const q = body["quantity"];
+      if (typeof q !== "number" || !Number.isInteger(q) || q < 1 || q > 100) {
+        return bad(res, "quantity must be an integer between 1 and 100");
+      }
+      quantity = q;
+    }
+    if (!store.get(petId)) return bad(res, `Pet ${petId} not found`);
+    const order = store.placeOrder({ petId, quantity });
     send(res, 201, order as unknown as Record<string, unknown>);
   });
 
   app.get("/api/store/order/:orderId", variability("get-order"), (req, res) => {
-    const order = store.getOrder(Number(req.params["orderId"]));
+    const id = pathInt(req.params["orderId"]);
+    if (id === null) return bad(res, "orderId must be a positive integer");
+    const order = store.getOrder(id);
     if (!order) return send(res, 404, { error: "Order not found" });
     send(res, 200, order as unknown as Record<string, unknown>);
   });
 
   // ---------- Synthetic stress endpoints (used by the load driver's classes) ----------
-  // /api/slow/:ms — sleep before responding; stress GW's slow-response handling.
-  // No additional variability put on top: this is a raw path — measured.
+  // No variability on top: these are raw paths, so what you measure is the GW.
   app.get("/api/slow/:ms", (req, res) => {
-    const ms = Math.max(0, Math.min(10_000, Number(req.params["ms"] ?? 500)));
+    const raw = req.params["ms"];
+    if (raw === undefined || !/^\d+$/.test(raw)) return bad(res, "ms must be a non-negative integer");
+    const ms = Number(raw);
+    if (!Number.isFinite(ms) || ms > LIMITS.slowMs) return bad(res, `ms must be between 0 and ${LIMITS.slowMs}`);
     res.setHeader("X-Direct", "1");
-    setTimeout(() => { send(res, 200, { sleptMs: ms, ts: Date.now() }); }, ms);
+    const timer = setTimeout(() => { send(res, 200, { sleptMs: ms, ts: Date.now() }); }, ms);
+    res.once("close", () => clearTimeout(timer));
   });
 
-  // /api/big/:size — return a body of exactly that many bytes, streamed without
-  // extra application-side latency, so the overhead is the GW's proxy buffer.
   app.get("/api/big/:size", (req, res) => {
-    const size = Math.max(0, Math.min(10 * 1024 * 1024, Number(req.params["size"] ?? 100_000)));
+    const raw = req.params["size"];
+    if (raw === undefined || !/^\d+$/.test(raw)) return bad(res, "size must be a non-negative integer");
+    const size = Number(raw);
+    if (!Number.isFinite(size) || size > LIMITS.bigBytes) {
+      return bad(res, `size must be between 0 and ${LIMITS.bigBytes}`);
+    }
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("Content-Length", size);
     res.setHeader("X-Direct", "1");
@@ -160,7 +202,10 @@ export function createApp() {
     const CHUNK = 64 * 1024;
     const buf = Buffer.alloc(Math.min(size, CHUNK), "Z".charCodeAt(0));
     let written = 0;
+    let aborted = false;
+    res.once("close", () => { aborted = true; });
     const write = () => {
+      if (aborted) return;
       while (written < size) {
         const n = Math.min(buf.length, size - written);
         if (!res.write(buf.subarray(0, n))) { written += n; res.once("drain", write); return; }
@@ -171,7 +216,6 @@ export function createApp() {
     write();
   });
 
-  // /api/echo — echo the request body back; stress GW's big-request handling.
   app.post("/api/echo", (req, res) => {
     const raw = req.body as unknown;
     const bytes = Buffer.isBuffer(raw) ? raw.byteLength
@@ -199,7 +243,7 @@ export function createApp() {
       res.type("text/xml").status(400).send(soapFault("Empty body (missing text/xml parser?)"));
       return;
     }
-    if (!body.includes("soap:Envelope") && !body.includes("Envelope")) {
+    if (!body.includes("Envelope") || !isWellFormedXml(body)) {
       res.type("text/xml").status(400).send(soapFault("Malformed SOAP envelope"));
       return;
     }
@@ -208,29 +252,44 @@ export function createApp() {
       res.type("text/xml").status(400).send(soapFault("Unknown operation; set SOAPAction header"));
       return;
     }
-    const { ok, xml } = executeOperation(op, body, store);
+    let result: { ok: boolean; xml: string };
+    try {
+      result = executeOperation(op, body, store);
+    } catch (e) {
+      // never let an internal throw escape as an HTML stack trace
+      res.type("text/xml").status(500).send(soapFault(`Internal error handling ${op}`));
+      console.error(`[petstore] SOAP ${op} failed:`, e);
+      return;
+    }
     const pad = res.locals["padBytes"] as number | undefined;
-    const out = pad ? padEnvelope(xml, Math.round(pad)) : xml;
-    res.type("text/xml").status(ok ? 200 : 400).send(out);
+    const out = pad ? padEnvelope(result.xml, Math.round(pad)) : result.xml;
+    res.type("text/xml").status(result.ok ? 200 : 400).send(out);
   });
 
   // ---------- Admin: latency profile & chaos ----------
   app.get("/admin/latency-profile", (_req, res) => res.json(latencyProfile));
   app.patch("/admin/latency-profile", (req, res) => {
-    const patch = (req.body ?? {}) as EndpointLatencyProfile;
-    Object.assign(latencyProfile, patch);
+    const parsed = validateLatencyPatch(req.body ?? {});
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    Object.assign(latencyProfile, parsed.value);
     res.json(latencyProfile);
   });
 
   app.get("/admin/chaos", (_req, res) => res.json(chaos));
   app.put("/admin/chaos", (req, res) => {
     const b = (req.body ?? {}) as Partial<ChaosConfig>;
-    chaos = {
-      errorRatePct: Math.max(0, Math.min(100, Number(b.errorRatePct ?? 0))),
-      timeoutRatePct: Math.max(0, Math.min(100, Number(b.timeoutRatePct ?? 0)))
+    const pct = (v: unknown): number => {
+      const n = Number(v ?? 0);
+      return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0;
     };
+    chaos = { errorRatePct: pct(b.errorRatePct), timeoutRatePct: pct(b.timeoutRatePct) };
     res.json(chaos);
   });
+
+  /** Petstore-internal stats — the public /health in app.ts stays minimal. */
+  app.get("/admin/petstore", (_req, res) =>
+    res.json({ pets: store.count(), orders: store.orderCount(), chaos, capacity: LIMITS.petStoreSize })
+  );
 
   return { app, store, latencyProfile };
 }

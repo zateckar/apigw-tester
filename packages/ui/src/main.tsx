@@ -7,7 +7,8 @@ import "./styles.css";
 const qc = new QueryClient({
   defaultOptions: {
     queries: {
-      refetchInterval: 5000,
+      // each query picks its own cadence in App.tsx — a single global interval
+      // polled the expensive long-window summaries as hard as the cheap ones
       retry: 1,
       staleTime: 3000
     }
@@ -47,8 +48,11 @@ function LoginGate() {
         return;
       }
       setCreds(tok);
-      // reload once so every query hooks starts authorized
+      // reload once so every query hook starts authorized
       window.location.reload();
+    } catch {
+      // a network failure used to fall through the try/finally with no message
+      setErr("Cannot reach the server. Check that it is running and try again.");
     } finally {
       setBusy(false);
     }
@@ -59,11 +63,11 @@ function LoginGate() {
       <form className="login-card" onSubmit={(e) => void tryAuth(e)}>
         <h1>API GW Tester</h1>
         <p className="hint">Sign in to continue</p>
-        <label>Name</label>
-        <input value={user} onChange={(e) => setUser(e.target.value)} required autoFocus autoComplete="username" />
-        <label>Password</label>
-        <input value={pass} type="password" onChange={(e) => setPass(e.target.value)} required autoComplete="current-password" />
-        {err && <div className="login-err">{err}</div>}
+        <label htmlFor="login-user">Name</label>
+        <input id="login-user" value={user} onChange={(e) => setUser(e.target.value)} required autoFocus autoComplete="username" />
+        <label htmlFor="login-pass">Password</label>
+        <input id="login-pass" value={pass} type="password" onChange={(e) => setPass(e.target.value)} required autoComplete="current-password" />
+        {err && <div className="login-err" role="alert">{err}</div>}
         <button type="submit" className="primary" disabled={busy}>{busy ? "Signing in…" : "Sign in"}</button>
         <p className="hint" style={{ marginTop: 12 }}>
           Credentials are stored in this browser tab only (sessionStorage) and sent as `Authorization: Basic …`.

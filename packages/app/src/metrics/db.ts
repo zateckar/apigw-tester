@@ -46,6 +46,8 @@ export function openDb(path: string): DbHandle {
       cls TEXT NOT NULL DEFAULT 'small-rest',
       count INTEGER NOT NULL,
       errors INTEGER NOT NULL,
+      ok2xx INTEGER NOT NULL DEFAULT 0,
+      rejected4xx INTEGER NOT NULL DEFAULT 0,
       latency_sum_ms REAL NOT NULL,
       max_latency_ms REAL NOT NULL,
       overhead_sum_ms REAL NOT NULL DEFAULT 0,
@@ -64,6 +66,8 @@ export function openDb(path: string): DbHandle {
       cls TEXT NOT NULL DEFAULT 'small-rest',
       count INTEGER NOT NULL,
       errors INTEGER NOT NULL,
+      ok2xx INTEGER NOT NULL DEFAULT 0,
+      rejected4xx INTEGER NOT NULL DEFAULT 0,
       latency_sum_ms REAL NOT NULL,
       max_latency_ms REAL NOT NULL,
       overhead_sum_ms REAL NOT NULL DEFAULT 0,
@@ -79,6 +83,7 @@ export function openDb(path: string): DbHandle {
       batch_id TEXT PRIMARY KEY,
       received_at INTEGER NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_seen_received ON ingest_seen(received_at);
 
     CREATE TABLE IF NOT EXISTS config (
       key TEXT PRIMARY KEY,
@@ -92,6 +97,14 @@ export function openDb(path: string): DbHandle {
       stopped_at INTEGER,
       profile TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
   `);
   return db;
+}
+
+/** Add a column if an older database predates it. Safe to call on every boot. */
+export function ensureColumn(db: DbHandle, table: string, column: string, ddl: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
+  if (cols.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
 }
