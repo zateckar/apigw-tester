@@ -1,6 +1,6 @@
 import { startServer } from "./app.js";
 
-const { server, store, driver } = startServer();
+const { server, store, driver, sampler } = startServer();
 
 process.on("uncaughtException", (e) => {
   console.error("[apigw-tester] uncaught", e);
@@ -29,6 +29,7 @@ async function shutdown(sig: string): Promise<void> {
     // metrics are lost and the WAL is left un-checkpointed on every restart
     driver.stop();
     await driver.shutdown();
+    sampler.stop(); // pure timers — sampling can stop as soon as traffic does
     store.close();
   } catch (e) {
     console.error("[apigw-tester] error while draining:", e);

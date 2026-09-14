@@ -16,11 +16,13 @@ export type {
   RunStatus,
   ScenarioClass,
   ScenarioWeights,
+  SystemMetrics,
+  SystemSample,
   TimePoint,
   TimeSeries
 } from "@apigw/shared";
 
-import type { GwConfig, GwTargets, LoadProfile, MetricSummary, RequestResult, RunEvent, RunStatus, TimeSeries } from "@apigw/shared";
+import type { GwConfig, GwTargets, LoadProfile, MetricSummary, RequestResult, RunEvent, RunStatus, SystemMetrics, TimeSeries } from "@apigw/shared";
 import { DEFAULT_GW_TARGETS, DEFAULT_LOAD_PROFILE, LIMITS } from "@apigw/shared";
 
 /** Windows GET /api/summary accepts. Keep in sync with SUMMARY_WINDOWS in app.ts. */
@@ -109,6 +111,7 @@ export const api = {
   recent: (limit = 100) =>
     req<{ items: RequestResult[] }>(`/api/recent?limit=${Math.min(limit, LIMITS.recentLimit)}`),
   status: () => req<RunStatus>("/api/run/status"),
+  system: () => req<SystemMetrics>("/api/system"),
   runs: () => req<RunEvent[]>("/api/runs"),
   gateway: () => req<GwTargets>("/api/config/gateway"),
   profile: () => req<LoadProfile>("/api/config/profile"),

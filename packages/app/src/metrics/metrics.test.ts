@@ -167,6 +167,93 @@ describe("long-window summaries", () => {
   });
 });
 
+describe("timeseries partial buckets", () => {
+  const MIN = 60_000;
+
+  it("marks the current bucket partial when it has data", () => {
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    s.ingestBatch({ batchId: "cur", results: [mk({ ts: now })] });
+    const ts = s.timeseries(60, now - 5 * MIN, now);
+    const cur = ts.points[ts.points.length - 1];
+    expect(cur?.total).toBe(1);
+    expect(cur?.partial).toBe(true);
+    s.close();
+  });
+
+  it("marks the current bucket and the zero tail partial only while traffic is live", () => {
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    // data 2 minutes ago, nothing since: the tail is empty but the store saw
+    // a batch just now, so those zeros are still "no data yet", not silence
+    s.ingestBatch({ batchId: "tail", results: [mk({ ts: now - 2 * MIN })] });
+    const ts = s.timeseries(60, now - 5 * MIN, now);
+    const curB = Math.floor(now / MIN) * MIN;
+    for (const p of ts.points) {
+      if (p.ts === now - 2 * MIN - (now % MIN)) {
+        expect(p.total).toBe(1);
+        expect(p.partial).toBeUndefined();
+      }
+      if (p.ts > now - 2 * MIN && p.ts < curB) {
+        expect(p.total).toBe(0);
+        expect(p.partial).toBe(true);
+      }
+    }
+    expect(ts.points[ts.points.length - 1]?.partial).toBe(true);
+    s.close();
+  });
+
+  it("treats the tail as honest zeros once a run has ended", () => {
+    // no batch ever ingested -> store has no notion of live traffic
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    const ts = s.timeseries(60, now - 5 * MIN, now);
+    expect(ts.points.some((p) => p.partial)).toBe(false);
+    s.close();
+  });
+
+  it("never marks partial for a historical window", () => {
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    s.ingestBatch({ batchId: "hist", results: [mk({ ts: now - 30 * MIN })] });
+    const ts = s.timeseries(60, now - 35 * MIN, now - 20 * MIN);
+    expect(ts.points.some((p) => p.partial)).toBe(false);
+    s.close();
+  });
+});
+
+describe("recent-tail sampling", () => {
+  it("keeps every row below the sampling threshold", () => {
+    // 100 rows over a 5s flush = 20 rps — sampling must be a no-op here
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    s.ingestBatch({ batchId: "small", results: Array.from({ length: 100 }, (_, i) => mk({ ts: now - i })) });
+    expect(s.recent(500).length).toBe(100);
+    s.close();
+  });
+
+  it("downsamples crud at high rates while errors and non-crud classes survive", () => {
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    // 5000 rows / 5s flush = 1000 rps → k = 10 for crud classes
+    const results: ReturnType<typeof mk>[] = [
+      ...Array.from({ length: 4990 }, (_, i) => mk({ ts: now - i })),
+      ...Array.from({ length: 5 }, (_, i) => mk({ ts: now - i, status: 500, error: "boom" })),
+      ...Array.from({ length: 5 }, (_, i) => mk({ ts: now - i, class: "soap", endpoint: "SOAP getPetById" }))
+    ];
+    s.ingestBatch({ batchId: "huge", results });
+
+    const tail = s.recent(500);
+    expect(tail.length).toBeGreaterThanOrEqual(400);
+    expect(tail.length).toBeLessThan(600);
+    expect(tail.filter((r) => r.status >= 500).length).toBe(5);
+    expect(tail.filter((r) => r.class === "soap").length).toBe(5);
+    // roll-ups are exact regardless of the raw sampling
+    expect(s.summary(300_000).total).toBe(5000);
+    s.close();
+  });
+});
+
 describe("reset and prune", () => {
   it("resetAll wipes metrics and runs but keeps config rows", () => {
     const s = createMetricsStore(":memory:");

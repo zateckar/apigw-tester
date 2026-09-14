@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { HISTOGRAM_EDGES } from "./metrics/server.js";
 import { createMetricsStore, type MetricsStore } from "./metrics/server.js";
+import { createSystemSampler, type SystemSampler } from "./metrics/system.js";
 import { createApp as createPetstoreApp } from "./petstore/server.js";
 import { buildOpenApiDocument, toYaml } from "./petstore/openapi.js";
 import { WSDL } from "./petstore/soap.js";
@@ -16,6 +17,7 @@ export interface BuiltApp {
   app: Express;
   store: MetricsStore;
   driver: DriverType;
+  sampler: SystemSampler;
 }
 
 /**
@@ -136,9 +138,18 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   // ---------------- metrics store (in-process) ----------------
   const store = createMetricsStore(cfg.dbPath);
 
+  // host/process sampler for /api/system — memory-only, no DB writes
+  const sampler = createSystemSampler();
+
   // ---------------- load driver (in-process) ----------------
   const driver = new Driver();
-  driver.setIngest(store.ingestBatch); // driver flushes straight into the store
+  // driver flushes straight into the store; the sampler taps the same batches
+  // to derive app traffic bytes/s without touching driver or store internals
+  sampler.start();
+  driver.setIngest((batch) => {
+    sampler.noteBatch(batch);
+    return store.ingestBatch(batch);
+  });
   driver.setBaselineUrl(cfg.selfUrl);  // probe the SUT directly (bypasses GW)
 
   // seed from persisted config so a restart keeps your settings
@@ -335,6 +346,11 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     res.json({ ...s, gateway: driver.currentGw });
   });
 
+  // host-level "are WE the bottleneck?" view; 120 samples ≈ last 4 minutes
+  app.get("/api/system", (_req, res) => {
+    res.json({ current: sampler.latest(), history: sampler.history(120) });
+  });
+
   app.get("/api/runs", (_req, res) => res.json(store.listRuns()));
 
   /**
@@ -383,13 +399,14 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     res.status(500).json({ error: "internal error" });
   });
 
-  return { app, store, driver };
+  return { app, store, driver, sampler };
 }
 
 export interface RunningServer {
   server: ReturnType<Express["listen"]>;
   store: MetricsStore;
   driver: DriverType;
+  sampler: SystemSampler;
 }
 
 export function startServer(): RunningServer {
@@ -398,10 +415,10 @@ export function startServer(): RunningServer {
     process.exit(1);
   }
   const cfg = readConfig();
-  const { app, store, driver } = buildApp(cfg);
+  const { app, store, driver, sampler } = buildApp(cfg);
   const server = app.listen(cfg.port, () => {
     console.log(`[apigw-tester] http://localhost:${cfg.port}  (dashboard, petstore, load driver + metrics) — auth enabled`);
     console.log(`[apigw-tester] API definitions: /api/definitions/openapi.json · /api/definitions/petservice.wsdl`);
   });
-  return { server, store, driver };
+  return { server, store, driver, sampler };
 }

@@ -136,3 +136,9 @@ button.linklike:focus-visible,
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* --- host strip (slim sibling of .kpi cards, for the app's own resource use) --- */
+.strip { display: flex; flex-wrap: wrap; gap: 8px 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 7px 14px; margin-bottom: 14px; }
+.sitem { display: flex; align-items: baseline; gap: 6px; font-size: 12px; }
+.sitem span { color: var(--muted); text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.5px; }
+.sitem b { font-variant-numeric: tabular-nums; font-weight: 600; }

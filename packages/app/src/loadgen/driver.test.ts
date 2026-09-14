@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ScenarioClass } from "@apigw/shared";
+import { LIMITS, type ScenarioClass } from "@apigw/shared";
 import { Driver } from "./driver.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -224,6 +224,47 @@ describe("GW-overhead pairing (X-Server-Ms)", () => {
   });
 });
 
+describe("Driver fire() response byte accounting", () => {
+  const drive = async (makeRes: () => Response): Promise<number[]> => {
+    const sizes: number[] = [];
+    const d = new Driver();
+    d.setIngest((batch) => {
+      for (const r of batch.results) sizes.push(r.bytesResp);
+      return { ingested: batch.results.length };
+    });
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => makeRes());
+    try {
+      d.start("run-bytes");
+      await priv(d).fire();
+      d.stop();
+      await sleep(400);
+      await priv(d).flush();
+    } finally {
+      spy.mockRestore();
+      await d.shutdown();
+    }
+    return sizes;
+  };
+
+  it("trusts Content-Length instead of buffering the body", async () => {
+    const body = "z".repeat(12345);
+    const sizes = await drive(() => new Response(body, { status: 200 }));
+    expect(sizes.length).toBe(1);
+    // a string Response always carries content-length; the count must match
+    // its declared value without having buffered the body
+    expect(sizes[0]).toBe(12345);
+  });
+
+  it("counts streamed chunks when Content-Length is absent", async () => {
+    const chunk = new TextEncoder().encode("xy".repeat(5000));
+    const sizes = await drive(
+      () => new Response(new ReadableStream({ start(c) { c.enqueue(chunk); c.close(); } }), { status: 200 })
+    );
+    expect(sizes.length).toBe(1);
+    expect(sizes[0]).toBe(10_000);
+  });
+});
+
 describe("Driver.status()", () => {
   it("is side-effect free for mode=real", () => {
     // regression: status() called targetRpsAt(), which advanced the drift model,
@@ -235,6 +276,60 @@ describe("Driver.status()", () => {
     for (let i = 0; i < 50; i++) d.status();
     expect(JSON.stringify(priv(d).bucket)).toBe(before);
     void d.shutdown();
+  });
+});
+
+describe("Driver concurrency ceiling", () => {
+  it("auto-raises maxConcurrency to hold 5s of the target rate", async () => {
+    const d = new Driver();
+    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 25 });
+    d.start("run-scale");
+    expect(priv(d).effectiveMaxConcurrency).toBe(2500);
+    const s = d.status();
+    expect(s.effectiveMaxConcurrency).toBe(2500);
+    expect(s.throttledSinceMs).toBeNull();
+    await d.shutdown();
+  });
+
+  it("keeps an explicit ceiling when it already covers the rate", async () => {
+    const d = new Driver();
+    d.setProfile({ mode: "constant", rps: 10, maxConcurrency: 800 });
+    d.start("run-big");
+    expect(priv(d).effectiveMaxConcurrency).toBe(800);
+    await d.shutdown();
+  });
+
+  it("never exceeds LIMITS.maxConcurrency", async () => {
+    const d = new Driver();
+    d.setProfile({ mode: "constant", rps: 10_000, maxConcurrency: 25 });
+    d.start("run-huge");
+    expect(priv(d).effectiveMaxConcurrency).toBe(LIMITS.maxConcurrency);
+    await d.shutdown();
+  });
+
+  it("flags sustained saturation as throttled and counts the dropped load", async () => {
+    const d = new Driver();
+    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 25 });
+    d.start("run-throttle");
+    const bucket = priv(d).bucket as { tick: (nowMs: number, p: unknown, s: number) => { due: number; targetRps: number } };
+    const origTick = bucket.tick.bind(bucket);
+    // simulate a fully saturated cap: every tick wants 50 but nothing completes
+    priv(d).inFlight = 2500;
+    bucket.tick = () => ({ due: 50, targetRps: 500 });
+    const tick = priv(d).tick.bind(d) as () => void;
+    for (let i = 0; i < 9; i++) {
+      tick();
+      expect(d.status().throttledSinceMs).toBeNull();
+    }
+    tick(); // 10th capped tick ≈ 1s of throttling
+    expect(d.status().throttledSinceMs).not.toBeNull();
+    expect(priv(d).droppedTokens as number).toBe(500);
+    // recovery: a tick with headroom clears the flag immediately
+    priv(d).inFlight = 0;
+    tick();
+    expect(d.status().throttledSinceMs).toBeNull();
+    bucket.tick = origTick;
+    await d.shutdown();
   });
 });
 

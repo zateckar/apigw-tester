@@ -2,7 +2,7 @@ import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { type AddressInfo } from "node:net";
 import { buildApp } from "./app.js";
 import { readConfig } from "./config.js";
-import type { RequestResult } from "@apigw/shared";
+import type { RequestResult, SystemMetrics } from "@apigw/shared";
 
 // Auth: tests run with a fixed known credential
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
@@ -63,6 +63,24 @@ describe("apigw-tester app (auth protected)", () => {
   it("health endpoint is public (for load balancers)", async () => {
     const r = await fetch(`${base}/health`);
     expect(r.status).toBe(200);
+  });
+
+  it("GET /api/system is behind auth and reports current + history", async () => {
+    expect((await fetch(`${base}/api/system`)).status).toBe(401);
+
+    const r = await authed("/api/system");
+    expect(r.status).toBe(200);
+    const m = (await r.json()) as SystemMetrics;
+    expect(m.current.memTotalBytes).toBeGreaterThan(0);
+    expect(m.current.memUsedBytes).toBeGreaterThan(0);
+    expect(m.current.procRssBytes).toBeGreaterThan(0);
+    // CPU is a capacity share or null before the second tick — never garbage
+    if (m.current.cpuProcessPct !== null) {
+      expect(m.current.cpuProcessPct).toBeGreaterThanOrEqual(0);
+      expect(m.current.cpuProcessPct).toBeLessThanOrEqual(100);
+    }
+    expect(Array.isArray(m.history)).toBe(true);
+    for (const s of m.history) expect(s.ts).toBeGreaterThan(0);
   });
 
   it("health identifies the build without leaking anything else", async () => {

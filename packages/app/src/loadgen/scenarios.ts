@@ -206,12 +206,41 @@ export function buildBigResponseSpec(rand: () => number = Math.random): ReqSpec 
 
 export function buildBigRequestSpec(rand: () => number = Math.random): ReqSpec {
   const size = pick([64 * 1024, 256 * 1024, 1024 * 1024], rand);
-  const body = JSON.stringify({ _pad: "x".repeat(size - 20) });
+  const body = bigRequestBody(size);
   return {
     protocol: "rest", endpoint: "POST /api/echo", class: "big-request",
     method: "POST", path: "/api/echo",
     headers: { "Content-Type": "application/json" }, body, expectBytes: 200
   };
+}
+
+// The padded bodies repeat verbatim across thousands of requests — building
+// "x".repeat(1MB) per request at high rps is pure allocation churn, so the
+// three sizes are built once and shared. They are only ever passed to fetch();
+// nothing mutates them.
+const bigRequestBodies = new Map<number, string>();
+
+function bigRequestBody(size: number): string {
+  let body = bigRequestBodies.get(size);
+  if (body === undefined) {
+    body = JSON.stringify({ _pad: "x".repeat(size - 20) });
+    bigRequestBodies.set(size, body);
+  }
+  return body;
+}
+
+const SMALL_BYTES = 1024;
+
+/**
+ * Cheap byte length of a spec body. `Buffer.byteLength` walks and encodes the
+ * whole string — at high rps it spends real time on buffered 1MB pads. The
+ * pad bodies are pure ASCII, so char length IS byte length; and a small body
+ * (name/status JSON, SOAP envelope) is cheap to walk, so it's measured anew.
+ */
+export function bigRequestBytes(body: string | null): number {
+  if (body === null) return 0;
+  if (body.length > SMALL_BYTES) return body.length; // big-request pads are ASCII
+  return Buffer.byteLength(body);
 }
 
 export function buildSlowSpec(rand: () => number = Math.random): ReqSpec {

@@ -28,6 +28,15 @@ const RAW_RETENTION_MS = 24 * HOUR_BUCKETS;
 const MINUTE_RETENTION_MS = 7 * 24 * HOUR_BUCKETS;
 const HOUR_RETENTION_MS = 90 * 24 * HOUR_BUCKETS;
 
+/** the loadgen driver's flush cadence; batch size ÷ this is the ingest rate */
+const FLUSH_MS = 5_000;
+const FLUSH_SEC = FLUSH_MS / 1000;
+/** rows per multi-row VALUES insert — 200 × 13 params stays far under
+ *  SQLite's ~32766 bind-parameter ceiling */
+const RAW_CHUNK_ROWS = 200;
+/** ceiling on the sampling factor so the raw tail never thins out completely */
+const MAX_SAMPLE_K = 100;
+
 export interface MetricsStore {
   ingestBatch: (batch: IngestBatch) => { ingested: number; duplicate?: boolean };
   summary: (windowMs: number) => MetricSummary;
@@ -136,14 +145,62 @@ function parseHist(s: string): Histogram {
   }
 }
 
+// ---- requests_raw downsampling --------------------------------------------
+// requests_raw is only ever read by the recent tail (GET /api/recent, capped
+// at LIMITS.recentLimit rows) — every aggregate chart comes from the roll-ups,
+// which stay exact. At high rps, one insert per request saturates the loop,
+// so above ~500 rps the crud (small-rest/concurrency) tail is kept 1-in-k and
+// everything "interesting" is kept whole. Below that, k = 1 and nothing is
+// dropped.
+
+function keepEveryK(batchLen: number): number {
+  // rate is in requests/sec; k=1 until batchRate reaches ~500 rps, then
+  // batchRate/100 rounded up, capped so the tail still has something to show
+  const rate = batchLen / FLUSH_SEC;
+  return Math.min(MAX_SAMPLE_K, Math.max(1, Math.ceil(rate / 100)));
+}
+
+/** crud classes are sampled; errors and the rarer classes always survive */
+function alwaysKeep(r: RequestResult): boolean {
+  if (r.error !== null || r.status === 0 || r.status >= 400) return true;
+  return r.class !== "small-rest" && r.class !== "concurrency";
+}
+
+/**
+ * Pick the rows that go into requests_raw for this batch. Index-based, so a
+ * sampled run still has a spread of rows across the window, and deterministic
+ * enough to reason about in tests.
+ */
+function selectRawRows(batchLen: number, results: RequestResult[]): RequestResult[] {
+  if (batchLen <= LIMITS.recentLimit) return results;
+  const k = keepEveryK(batchLen);
+  if (k <= 1) return results;
+  const kept: RequestResult[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i] as RequestResult;
+    if (alwaysKeep(r) || i % k === 0) kept.push(r);
+  }
+  return kept;
+}
+
+const RAW_COLS = `(ts, run_id, protocol, endpoint, class, method, status, latency_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, error)`;
+const RAW_NCOLS = 13;
+
+/** build one multi-row INSERT for `rows` raw results */
+function rawInsertSql(rows: number): string {
+  const tuple = `(${Array(RAW_NCOLS).fill("?").join(", ")})`;
+  return `INSERT INTO requests_raw ${RAW_COLS} VALUES ${Array(rows).fill(tuple).join(", ")}`;
+}
+
+function rawInsertParams(r: RequestResult): (string | number | null)[] {
+  return [r.ts, r.runId, r.protocol, r.endpoint, r.class, r.method, r.status,
+    r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp, r.error ?? null];
+}
+
 export function createMetricsStore(dbPath: string): MetricsStore {
   const db = openDb(dbPath);
   migrate(db);
 
-  const insertRaw = db.prepare(
-    `INSERT INTO requests_raw (ts, run_id, protocol, endpoint, class, method, status, latency_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, error)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
   const upsertMinute = db.prepare(layer("rollup_minute"));
   const upsertHour = db.prepare(layer("rollup_hour"));
   function layer(table: string): string {
@@ -219,6 +276,13 @@ export function createMetricsStore(dbPath: string): MetricsStore {
    *  buckets x endpoint combos of JSON histogram parsing on the event loop. */
   const MINUTE_LAYER_MAX_MS = 6 * HOUR_BUCKETS;
 
+  /** Consider traffic live if a batch was ingested within this span — ~2x the
+   *  loadgen flush interval plus the UI poll, so a run's end is recognised
+   *  promptly without flickering between polls. */
+  const LIVE_WINDOW_MS = 30_000;
+  /** Wall-clock time of the most recent successfully ingested batch. */
+  let lastIngestAt: number | null = null;
+
   function windowRows(windowMs: number): RollupRow[] {
     const now = Date.now();
     const from = now - windowMs;
@@ -244,6 +308,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     }
     const minute = new Map<string, Bucket>();
     const hour = new Map<string, Bucket>();
+    const results = batch.results;
 
     // One transaction for the whole batch: raw rows, both roll-up layers and the
     // idempotency marker commit together or not at all. Marking the batch inside
@@ -251,7 +316,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     // silently swallowed as a duplicate.
     db.exec("BEGIN IMMEDIATE");
     try {
-      for (const r of batch.results) {
+      for (const r of results) {
         if (!r || typeof r.runId !== "string" || r.runId === "" || !Number.isFinite(r.ts)) {
           throw new Error("each result needs a runId and a numeric ts");
         }
@@ -260,7 +325,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         const isErr = r.status === 0 || r.status >= 500;
         const is2xx = r.status >= 200 && r.status < 300;
         const is4xx = r.status >= 400 && r.status < 500;
-        insertRaw.run(r.ts, r.runId, r.protocol, r.endpoint, r.class, r.method, r.status, r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp, r.error ?? null);
 
         for (const [bucketTs, table] of [[mB, minute], [hB, hour]] as const) {
           const key = `${bucketTs}|${r.protocol}|${r.endpoint}|${r.class}`;
@@ -290,6 +354,18 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           addToHistogram(b.overhead_hist, r.overheadMs);
         }
       }
+      // requests_raw is only ever read by the recent tail (GET /api/recent,
+      // capped at LIMITS.recentLimit rows) — every aggregate chart comes from
+      // the roll-ups above, which stay exact. At high rps one insert per
+      // request saturates the loop, so the raw tail is downsampled (crud
+      // classes 1-in-k, errors and rarer classes whole) and written as chunked
+      // multi-row INSERTs instead of one statement per row.
+      const rawKept = selectRawRows(results.length, results);
+      for (let off = 0; off < rawKept.length; off += RAW_CHUNK_ROWS) {
+        const slice = rawKept.slice(off, off + RAW_CHUNK_ROWS);
+        const params = slice.flatMap(rawInsertParams);
+        db.prepare(rawInsertSql(slice.length)).run(...params);
+      }
       for (const b of minute.values()) {
         upsertMinute.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
       }
@@ -302,6 +378,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       try { db.exec("ROLLBACK"); } catch { /* already unwound */ }
       throw e;
     }
+    lastIngestAt = Date.now();
     return { ingested: batch.results.length };
   }
 
@@ -467,14 +544,31 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         p.restErrors += r.errors;
       }
     }
+    // A bucket is still accumulating — "partial" — when it contains the
+    // current time, or when it sits past the latest written data while a run is
+    // still feeding the store. Partial marking only applies to windows that
+    // reach now: trailing zeros of a historical window are real.
+    const live = lastIngestAt !== null && now - lastIngestAt < LIVE_WINDOW_MS;
+    // Math.max(...spread) copies the whole array onto the call stack and
+    // throws RangeError on large ones; a loop costs the same and scales
+    let lastDataTs: number | null = null;
+    for (const r of rows) {
+      if (lastDataTs === null || r.bucket_ts > lastDataTs) lastDataTs = r.bucket_ts;
+    }
+    const windowIsCurrent = safeTo > now - sizeMs;
+
     const out: TimePoint[] = [];
     for (let t = startB; t <= toB; t += sizeMs) {
       const p = points.get(t);
       if (!p) {
-        out.push({ ts: t, total: 0, errors: 0, rps: 0, p50: 0, p90: 0, p99: 0, overheadP50: 0, overheadP95: 0, overheadP99: 0, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 });
+        const zero: TimePoint = { ts: t, total: 0, errors: 0, rps: 0, p50: 0, p90: 0, p99: 0, overheadP50: 0, overheadP95: 0, overheadP99: 0, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 };
+        if (windowIsCurrent && live && (t === toB || (lastDataTs !== null && t > lastDataTs))) {
+          zero.partial = true;
+        }
+        out.push(zero);
         continue;
       }
-      out.push({
+      const point: TimePoint = {
         ts: p.ts, total: p.total, errors: p.errors,
         rps: p.total / bucketSec,
         p50: percentile(p.hist, 50),
@@ -486,7 +580,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         bytesResp: p.bytesResp,
         restTotal: p.restTotal, soapTotal: p.soapTotal,
         restErrors: p.restErrors, soapErrors: p.soapErrors
-      });
+      };
+      if (windowIsCurrent && t === toB) {
+        point.partial = true;
+      }
+      out.push(point);
     }
     return truncated ? { bucketSec, points: out, truncated } : { bucketSec, points: out };
   }

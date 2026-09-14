@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { targetRpsAt, TokenBucket } from "./scheduler.js";
+import { peakTargetRps, targetRpsAt, TokenBucket } from "./scheduler.js";
 import type { LoadProfile } from "@apigw/shared";
 import { DEFAULT_LOAD_PROFILE } from "@apigw/shared";
 
@@ -64,5 +64,22 @@ describe("TokenBucket", () => {
     expect(due).toBe(0);
     const next = tb.tick(t0 + 10_000, { ...base, rps: 10 }, t0);
     expect(next.due).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("peakTargetRps", () => {
+  it("constant and spike modes return their top rate", () => {
+    expect(peakTargetRps({ ...base, rps: 500 })).toBe(500);
+    expect(peakTargetRps({ ...base, mode: "spike", spikeBase: 5, spikePeak: 800 })).toBe(800);
+  });
+
+  it("ramp returns the highest end of the ramp", () => {
+    expect(peakTargetRps({ ...base, mode: "ramp", rampFrom: 900, rampTo: 100 })).toBe(900);
+    expect(peakTargetRps({ ...base, mode: "ramp", rampFrom: 100, rampTo: 900 })).toBe(900);
+  });
+
+  it("sine-daily returns sineMax, real leaves room for curve, drift and jitter", () => {
+    expect(peakTargetRps({ ...base, mode: "sine-daily", sineMin: 2, sineMax: 300 })).toBe(300);
+    expect(peakTargetRps({ ...base, mode: "real", rps: 10 })).toBeCloseTo(10 * 1.8 * 1.2);
   });
 });

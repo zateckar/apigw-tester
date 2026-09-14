@@ -58,6 +58,7 @@ export default function App() {
   });
   const recentQ = useQuery({ queryKey: ["recent"], queryFn: () => api.recent(150), refetchInterval: 5_000 });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 30_000 });
+  const systemQ = useQuery({ queryKey: ["system"], queryFn: api.system, refetchInterval: 2_000 });
   const defsQ = useQuery({ queryKey: ["definitions"], queryFn: api.definitions, refetchInterval: false });
 
   const startMut = useMutation({
@@ -96,6 +97,7 @@ export default function App() {
     : `REST ${gw.rest.baseUrl}${gw.rest.pathPrefix || ""} · SOAP ${gw.soap.baseUrl}${gw.soap.pathPrefix || ""}`;
   const profile = profileQ.data ?? status?.profile ?? DEFAULT_PROFILE;
   const loadError = errorOf(statusQ, summaryQ, seriesQ, recentQ, runsQ, gwQ, profileQ);
+  const sys = systemQ.data;
 
   // memoized chart data so every poll produces a stable reference
   const points = useMemo(() => {
@@ -104,7 +106,12 @@ export default function App() {
     const fmt: Intl.DateTimeFormatOptions = bucket >= 3600
       ? { month: "short", day: "numeric", hour: "2-digit" }
       : { hour: "2-digit", minute: "2-digit" };
-    return (seriesQ.data?.points ?? []).map((p) => ({
+    const pts = seriesQ.data?.points ?? [];
+    // drop still-accumulating tail buckets — they render as a false dive to
+    // zero on latency charts and a sagging last bar on rps/bytes
+    let end = pts.length;
+    while (end > 0 && pts[end - 1]?.partial) end--;
+    return pts.slice(0, end).map((p) => ({
       ...p,
       t: new Date(p.ts).toLocaleString([], fmt),
       restRps: p.restTotal / bucket,
@@ -112,6 +119,23 @@ export default function App() {
       bytesKb: p.bytesResp / 1024
     }));
   }, [seriesQ.data]);
+
+  // host-metric history: unit conversions (bytes → GB, ns-sourced B/s stay B/s)
+  // happen here so the recharts fields match what the axes and tooltips claim
+  const sysPoints = useMemo(() => {
+    const fmt: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit" };
+    return (sys?.history ?? []).map((s) => ({
+      t: new Date(s.ts).toLocaleString([], fmt),
+      cpuProcessPct: s.cpuProcessPct,
+      cpuSystemPct: s.cpuSystemPct,
+      memUsedGb: s.memUsedBytes / 1024 ** 3,
+      memTotalGb: s.memTotalBytes / 1024 ** 3,
+      appInBps: s.appInBps,
+      appOutBps: s.appOutBps,
+      procReadBps: s.procReadBps,
+      procWriteBps: s.procWriteBps
+    }));
+  }, [sys]);
 
   const recent = (recentQ.data?.items ?? []).filter(
     (r) => !recentProto || r.protocol === recentProto
@@ -179,7 +203,17 @@ export default function App() {
         <div className="kpi">
           <div className="label">Live RPS</div>
           <div className="value">{stat(status?.targetRps, (n) => n.toFixed(1))}</div>
-          <div className="sub">target · {profile.mode}</div>
+          <div
+            className="sub"
+            title={
+              status?.throttledSinceMs != null
+                ? `Concurrency cap ${status.effectiveMaxConcurrency ?? "?"} is saturated since ${fmtDuration(Math.max(0, Math.floor((Date.now() - status.throttledSinceMs) / 1000)))} — delivering less than the target rate (target latency too high?)`
+                : undefined
+            }
+          >
+            target · {profile.mode} · conc {status?.effectiveMaxConcurrency ?? profile.maxConcurrency}
+            {status?.throttledSinceMs != null && <span style={{ color: "var(--err)" }}> · throttled</span>}
+          </div>
         </div>
         <div className="kpi">
           <div className="label">Requests ({range.label})</div>
@@ -216,6 +250,32 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* ---------- Host strip: is the app itself the bottleneck? ---------- */}
+      {sys && (
+        <div className="strip" title="Resources of the machine this tester runs on — high CPU or loop delay here means the app, not the gateway, is throttling the run">
+          <div className="sitem">
+            <span>CPU (app)</span>
+            <b style={{ color: (sys.current.cpuProcessPct ?? 0) > 85 ? "var(--err)" : undefined }}>
+              {stat(sys.current.cpuProcessPct ?? undefined, (n) => `${n.toFixed(0)}%`)}
+            </b>
+          </div>
+          <div className="sitem">
+            <span>Memory (host)</span>
+            <b>{fmtBytes(sys.current.memUsedBytes)} / {fmtBytes(sys.current.memTotalBytes)}</b>
+          </div>
+          <div className="sitem">
+            <span>Loop p99</span>
+            <b style={{ color: (sys.current.eventLoopP99ms ?? 0) > 100 ? "var(--err)" : undefined }}>
+              {stat(sys.current.eventLoopP99ms ?? undefined, (n) => `${n.toFixed(1)} ms`)}
+            </b>
+          </div>
+          <div className="sitem">
+            <span>App ⇅</span>
+            <b>{fmtBytes(sys.current.appInBps)}/s in · {fmtBytes(sys.current.appOutBps)}/s out</b>
+          </div>
+        </div>
+      )}
 
       {/* ---------- Range tabs ---------- */}
       <div className="range-tabs">
@@ -296,6 +356,46 @@ export default function App() {
                 <Tooltip contentStyle={{ background: "#161b22", border: "1px solid #2d333b" }} formatter={(v: number) => `${v.toFixed(1)} KB`} />
                 <Bar dataKey="bytesKb" fill="#3fb950" radius={[3, 3, 0, 0]} name="resp KB" />
               </BarChart>
+            )}
+          </Panel>
+        </div>
+      </div>
+
+      {/* ---------- Host load ---------- */}
+      <div className="grid-2">
+        <div className="section">
+          <h2>Host CPU (% of machine capacity)</h2>
+          <Panel height={180}>
+            {({ width, height }) => (
+              <AreaChart width={width} height={height} data={sysPoints}>
+                <CartesianGrid stroke="#2d333b" strokeDasharray="3 3" />
+                <XAxis dataKey="t" stroke="#8b949e" fontSize={11} minTickGap={40} />
+                <YAxis stroke="#8b949e" fontSize={11} domain={[0, 100]} unit="%" />
+                <Tooltip contentStyle={{ background: "#161b22", border: "1px solid #2d333b" }} formatter={(v: number) => `${v.toFixed(1)}%`} />
+                <Legend />
+                <Area type="monotone" dataKey="cpuProcessPct" stroke="#58a6ff" fillOpacity={0.12} fill="#58a6ff" name="app process" />
+                <Area type="monotone" dataKey="cpuSystemPct" stroke="#8b949e" fillOpacity={0.08} fill="#8b949e" name="whole host" />
+              </AreaChart>
+            )}
+          </Panel>
+        </div>
+
+        <div className="section">
+          <h2>Host memory (GB) · app traffic (B/s)</h2>
+          <Panel height={180}>
+            {({ width, height }) => (
+              <AreaChart width={width} height={height} data={sysPoints}>
+                <CartesianGrid stroke="#2d333b" strokeDasharray="3 3" />
+                <XAxis dataKey="t" stroke="#8b949e" fontSize={11} minTickGap={40} />
+                <YAxis yAxisId="l" stroke="#8b949e" fontSize={11} />
+                <YAxis yAxisId="r" orientation="right" stroke="#8b949e" fontSize={11} tickFormatter={(v: number) => fmtBytes(v)} />
+                <Tooltip contentStyle={{ background: "#161b22", border: "1px solid #2d333b" }}
+                         formatter={(v: number, name: string) => (name.includes("GB") ? `${v.toFixed(2)} GB` : `${fmtBytes(v)}/s`)} />
+                <Legend />
+                <Area yAxisId="l" type="monotone" dataKey="memUsedGb" stroke="#d29922" fillOpacity={0.12} fill="#d29922" name="mem used (GB)" />
+                <Area yAxisId="r" type="monotone" dataKey="appOutBps" stroke="#3fb950" fillOpacity={0.08} fill="#3fb950" name="app out" />
+                <Area yAxisId="r" type="monotone" dataKey="appInBps" stroke="#58a6ff" fillOpacity={0.08} fill="#58a6ff" name="app in" />
+              </AreaChart>
             )}
           </Panel>
         </div>

@@ -111,6 +111,31 @@ export function targetRpsAt(
   }
 }
 
+/**
+ * Highest rate a profile can plausibly target at any moment of a run —
+ * constant: rps; ramp: rampTo; spike: spikePeak; sine-daily: sineMax;
+ * real: rps with headroom for the daytime curve (×~1.06), the drift
+ * ceiling (×1.8) and the ±20% jitter (×1.2).
+ * Used to size the driver's concurrency ceiling, not to schedule traffic.
+ */
+export function peakTargetRps(profile: LoadProfile): number {
+  const cap = (n: number): number => (Number.isFinite(n) ? Math.min(LIMITS.rps, Math.max(0, n)) : 0);
+  switch (profile.mode ?? "constant") {
+    case "constant":
+      return cap(profile.rps ?? 0);
+    case "ramp":
+      return cap(Math.max(profile.rampFrom ?? 1, profile.rampTo ?? 100));
+    case "spike":
+      return cap(Math.max(profile.spikeBase ?? 5, profile.spikePeak ?? 100));
+    case "sine-daily":
+      return cap(Math.max(profile.sineMin ?? 2, profile.sineMax ?? 50));
+    case "real":
+      return cap((profile.rps ?? 25) * 1.8 * 1.2);
+    default:
+      return cap(profile.rps ?? 0);
+  }
+}
+
 export class TokenBucket {
   private tokens = 0;
   private lastMs: number | null = null;

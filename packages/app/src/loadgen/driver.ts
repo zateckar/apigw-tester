@@ -12,12 +12,15 @@ import type {
 import {
   DEFAULT_GW_TARGETS as defaultGwTargets,
   DEFAULT_LOAD_PROFILE as defaultProfile,
+  LIMITS,
   sanitizeGwTargets,
   sanitizeLoadProfile
 } from "@apigw/shared";
-import { TokenBucket } from "./scheduler.js";
-import { buildSpec, buildBaselineProbe, type ReqSpec, type SpecContext } from "./scenarios.js";
-import { readBasicAuthCreds } from "../auth.js";
+import { TokenBucket, peakTargetRps } from "./scheduler.js";
+import {
+  buildSpec, buildBaselineProbe, bigRequestBytes, type ReqSpec, type SpecContext
+} from "./scenarios.js";
+import { expectedAuthHeader } from "../auth.js";
 import { SERVER_MS_HEADER } from "../petstore/server.js";
 
 /** Parse the SUT's per-request server-time header; garbage/absent → null. */
@@ -37,6 +40,43 @@ function parseServerMs(raw: string | null): number | null {
 
 const TICK_MS = 100;
 const FLUSH_MS = 5000;
+
+/**
+ * Drain the response body chunk-by-chunk, keeping only the total size. Never
+ * buffer a big response just to know its length: a 4MB arrayBuffer per request
+ * at high rps is pure GC churn, and it skews the very latency we are
+ * measuring. Never `body.cancel()` either — an aborted body kills the
+ * connection, forcing a new handshake per request on the shared loop.
+ */
+async function readOrDrain(res: Response, wantBody: boolean): Promise<{ bytes: number; buf: ArrayBuffer | null }> {
+  if (wantBody) {
+    const buf = await res.arrayBuffer();
+    return { bytes: buf.byteLength, buf };
+  }
+  const cl = res.headers.get("content-length");
+  // the SUT always sets Content-Length, and its value is cheaper than the
+  // body itself; fall back to counting chunks for anyone who doesn't
+  const declared = cl === null ? null : Number(cl);
+  const reader = res.body?.getReader();
+  if (!reader) return { bytes: declared ?? 0, buf: null };
+  try {
+    if (declared !== null && Number.isFinite(declared) && declared >= 0) {
+      while (!(await reader.read()).done) { /* discard */ }
+      return { bytes: declared, buf: null };
+    }
+    let bytes = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+    }
+    return { bytes, buf: null };
+  } finally {
+    // a reader left open keeps the socket busy even after it is drained
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+}
+
 const BASELINE_PROBE_MS = 60_000;
 const BASELINE_SAMPLES_PER_CLASS = 8;
 const BASELINE_PROBE_TIMEOUT_MS = 15_000;
@@ -48,6 +88,14 @@ const DRAIN_POLL_MS = 250;
 const MAX_TRACKED_IDS = 2_000;
 /** give up on a batch the store keeps refusing, rather than wedging the spool */
 const MAX_INGEST_ATTEMPTS = 3;
+/** raise the concurrency ceiling to hold 5s worth of peak load: Little's law
+ *  (rate × latency) says that is how much in-flight the target rate needs at
+ *  5s mean latency — generous, most targets answer far faster */
+const LATENCY_ALLOWANCE_SEC = 5;
+/** consecutive capped ticks (~10 × 100ms = 1s) before throttling is reported */
+const THROTTLE_TICKS_TO_WARN = 10;
+/** once throttled, re-warn at most this often */
+const THROTTLE_WARN_MS = 10_000;
 
 export type IngestFn = (batch: IngestBatch) => { ingested: number } | Promise<{ ingested: number }>;
 
@@ -75,10 +123,27 @@ export class Driver {
   private counters = { sent: 0, ok: 0, errors: 0, timeouts: 0, invalidSent: 0, invalidRejected: 0 };
   private spool: RequestResult[] = [];
   private targetRps = 0;
+  private effectiveMaxConcurrency = defaultProfile.maxConcurrency;
+  private throttleTicks = 0;          // consecutive ticks capped by concurrency headroom
+  private throttledSinceMs: number | null = null;
+  private lastThrottleWarnMs = 0;
+  private droppedTokens = 0;          // load the cap kept us from issuing, per run
   private errLogBudget = 30; // log first N request errors per run
   private probing = false;   // re-entrancy guard for baseline probes
   private flushing = false;
   private ingestAttempts = 0;
+
+  // Per-target URL prefix ("base without trailing slashes" + "/prefix"), so
+  // fire() does one concat instead of four regex replaces per request. Synced
+  // whenever the gw config changes (and once at construction).
+  private urlPrefix: { rest: string; soap: string } = {
+    rest: this.urlPrefixFor(this.gw.rest),
+    soap: this.urlPrefixFor(this.gw.soap)
+  };
+  /** cached "Basic …" header string for the creds in effect when this run
+   *  started; re-reading + re-encoding env per request is a per-run constant
+   *  and was charged to a few thousand requests */
+  private authHeader: string | null = null;
 
   // baseline endpoint: which host to hit directly for class-level baselines
   private baselineUrl = "http://127.0.0.1:8080";
@@ -97,6 +162,7 @@ export class Driver {
 
   setGw(gw: unknown): void {
     this.gw = sanitizeGwTargets(gw, this.gw);
+    this.refreshUrlPrefixes();
   }
 
   setProfile(profile: Partial<LoadProfile>): void {
@@ -148,8 +214,8 @@ export class Driver {
     const t0 = Date.now();
     try {
       const headers: Record<string, string> = { ...spec.headers };
-      const creds = readBasicAuthCreds();
-      if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
+      const auth = expectedAuthHeader();
+      if (auth) headers["authorization"] = auth.toString("utf-8");
       const res = await fetch(url, { method: spec.method, headers, body: spec.body, signal: ac.signal });
       await res.arrayBuffer();
       const rtt = Date.now() - t0;
@@ -201,6 +267,28 @@ export class Driver {
     this.counters = { sent: 0, ok: 0, errors: 0, timeouts: 0, invalidSent: 0, invalidRejected: 0 };
     this.errLogBudget = 30;
     this.ingestAttempts = 0;
+    this.throttleTicks = 0;
+    this.throttledSinceMs = null;
+    this.lastThrottleWarnMs = 0;
+    this.droppedTokens = 0;
+    this.refreshUrlPrefixes();
+    // the creds are constant for the run; refresh them here instead of per request
+    this.authHeader = expectedAuthHeader()?.toString("utf-8") ?? null;
+
+    // Little's law: sustaining a rate needs rps × latency in flight, so a low
+    // maxConcurrency silently caps throughput at maxConcurrency / latency —
+    // the shipped default of 25 reaches only ~65 rps against a 385ms target.
+    // Treat the profile value as a floor and size the real ceiling for the
+    // peak rate, with 5s of latency as a generous allowance.
+    const need = Math.ceil(peakTargetRps(this.profile) * LATENCY_ALLOWANCE_SEC);
+    this.effectiveMaxConcurrency = Math.min(LIMITS.maxConcurrency, Math.max(this.profile.maxConcurrency, need));
+    if (this.effectiveMaxConcurrency > this.profile.maxConcurrency) {
+      console.log(
+        `[driver] auto-raised maxConcurrency ${this.profile.maxConcurrency} -> ${this.effectiveMaxConcurrency}` +
+        ` for rps target ${Math.round(peakTargetRps(this.profile))}`
+      );
+    }
+
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);
     this.tickTimer.unref?.();
     console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.rest.baseUrl}`);
@@ -244,7 +332,27 @@ export class Driver {
     if (this.state !== "running" || this.startedAt === null) return;
     const { due, targetRps } = this.bucket.tick(Date.now(), this.profile, this.startedAt);
     this.targetRps = targetRps;
-    const cap = Math.min(due, Math.max(0, this.profile.maxConcurrency - this.inFlight));
+    const headroom = Math.max(0, this.effectiveMaxConcurrency - this.inFlight);
+    const cap = Math.min(due, headroom);
+    const dropped = due - cap;
+    if (dropped > 0) {
+      // the target rate asks for more than the ceiling can accept: sustained
+      // saturation means real latency outgrew the allowance, so we throttle
+      // — surface it rather than silently delivering less than the target
+      this.droppedTokens += dropped;
+      this.throttleTicks++;
+      if (this.throttleTicks === THROTTLE_TICKS_TO_WARN) this.throttledSinceMs = Date.now();
+      if (this.throttleTicks >= THROTTLE_TICKS_TO_WARN && Date.now() - this.lastThrottleWarnMs >= THROTTLE_WARN_MS) {
+        this.lastThrottleWarnMs = Date.now();
+        console.warn(
+          `[driver] target ${targetRps.toFixed(1)} rps but concurrency cap ${this.effectiveMaxConcurrency} is throttling` +
+          ` (inFlight=${this.inFlight}, latency too high?); dropped ${this.droppedTokens} request(s) worth of load so far`
+        );
+      }
+    } else {
+      this.throttleTicks = 0;
+      this.throttledSinceMs = null;
+    }
     for (let i = 0; i < cap; i++) {
       void this.fire();
     }
@@ -268,7 +376,7 @@ export class Driver {
 
     // REST and SOAP may be fronted at different gateway URLs / API keys
     const target = spec.protocol === "soap" ? this.gw.soap : this.gw.rest;
-    const url = this.buildUrl(target, spec.path);
+    const url = (spec.protocol === "soap" ? this.urlPrefix.soap : this.urlPrefix.rest) + spec.path;
     const started = Date.now();
     const ac = new AbortController();
     const budgetMs =
@@ -283,8 +391,7 @@ export class Driver {
 
     try {
       const headers: Record<string, string> = { ...spec.headers };
-      const creds = readBasicAuthCreds();
-      if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
+      if (this.authHeader) headers["authorization"] = this.authHeader;
       if (target.apiKey) headers[target.apiKeyHeader || "X-API-Key"] = target.apiKey;
       const res = await fetch(url, {
         method: spec.method,
@@ -294,12 +401,15 @@ export class Driver {
       });
       status = res.status;
       serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
-      const buf = await res.arrayBuffer();
-      bytesResp = buf.byteLength;
+      // only the createPet flow needs the parsed body (to learn the new id);
+      // everything else just wants the byte count, which the length header
+      // already tells us
+      const text = await readOrDrain(res, spec.captureId === true);
+      bytesResp = text.bytes;
 
-      if (spec.captureId && status >= 200 && status < 300 && buf.byteLength < 1_000_000) {
+      if (spec.captureId && status >= 200 && status < 300 && text.buf !== null && text.buf.byteLength < 1_000_000) {
         try {
-          const parsed = JSON.parse(Buffer.from(buf).toString("utf-8")) as { id?: unknown };
+          const parsed = JSON.parse(Buffer.from(text.buf).toString("utf-8")) as { id?: unknown };
           if (typeof parsed.id === "number" && Number.isSafeInteger(parsed.id)) this.trackCreatedId(parsed.id);
         } catch { /* padded or proxied into something unparsable — ignore */ }
       }
@@ -340,16 +450,21 @@ export class Driver {
       latencyMs,
       baselineMs,
       overheadMs,
-      bytesReq: Buffer.byteLength(spec.body ?? ""),
+      bytesReq: spec.class === "big-request" ? bigRequestBytes(spec.body) : Buffer.byteLength(spec.body ?? ""),
       bytesResp,
       error
     });
   }
 
-  private buildUrl(target: GwConfig, path: string): string {
+  /** "http://host:port/prefix" per target, path added later in one concat. */
+  private urlPrefixFor(target: GwConfig): string {
     const base = target.baseUrl.replace(/\/+$/, "");
     const prefix = target.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
-    return `${base}${prefix ? "/" + prefix : ""}${path}`;
+    return prefix ? `${base}/${prefix}` : base;
+  }
+
+  private refreshUrlPrefixes(): void {
+    this.urlPrefix = { rest: this.urlPrefixFor(this.gw.rest), soap: this.urlPrefixFor(this.gw.soap) };
   }
 
   private record(r: RequestResult): void {
@@ -398,6 +513,8 @@ export class Driver {
       // reported from the last scheduler tick: reading status must never
       // advance the mode=real drift model
       targetRps: this.state === "running" ? this.targetRps : 0,
+      effectiveMaxConcurrency: this.effectiveMaxConcurrency,
+      throttledSinceMs: this.state === "running" ? this.throttledSinceMs : null,
       counters: { ...this.counters }
     };
   }

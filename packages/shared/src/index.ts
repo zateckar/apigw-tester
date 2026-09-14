@@ -388,6 +388,8 @@ export interface TimePoint {
   soapTotal: number;
   restErrors: number;
   soapErrors: number;
+  /** true when this bucket is still accumulating (current bucket or empty tail while traffic is live) */
+  partial?: boolean;
 }
 
 export interface TimeSeries {
@@ -407,6 +409,12 @@ export interface RunStatus {
   uptimeSec: number | null;
   profile: LoadProfile | null;
   targetRps: number;
+  /** Concurrency ceiling the driver actually applies: auto-raised above
+   *  profile.maxConcurrency when that value would itself throttle the
+   *  target rate. */
+  effectiveMaxConcurrency: number;
+  /** epoch ms when sustained concurrency-cap throttling began; null while healthy */
+  throttledSinceMs: number | null;
   counters: { sent: number; ok: number; errors: number; timeouts: number; invalidSent: number; invalidRejected: number };
   gateway?: GwTargets;
 }
@@ -417,4 +425,41 @@ export interface RunEvent {
   startedAt: number;
   stoppedAt: number | null;
   profile: LoadProfile;
+}
+
+// ---------- Host metrics ----------
+// A single point-in-time reading of the machine this app runs on, so the
+// dashboard can tell "the app saturated" apart from "the gateway got slow".
+export interface SystemSample {
+  ts: number; // epoch ms when the sample was taken
+  // CPU is normalised to total machine capacity (0-100), so a pegged 4-core
+  // VM reads ~100, not 400 like `top` would show
+  cpuProcessPct: number | null; // share of ALL cores this process burns
+  cpuSystemPct: number | null;  // share of ALL cores everything burns (idle excluded)
+  memUsedBytes: number;
+  memTotalBytes: number;
+  procRssBytes: number;
+  procHeapUsedBytes: number;
+  // event-loop stall percentiles over the sample interval, ms; null where
+  // perf_hooks.monitorEventLoopDelay is unavailable
+  eventLoopP50ms: number | null;
+  eventLoopP99ms: number | null;
+  // process disk I/O, bytes/s — from /proc/self/io because Node's
+  // resourceUsage() reports fsRead/fsWrite as COUNTS, not bytes
+  procReadBps: number | null;
+  procWriteBps: number | null;
+  // whole-host NIC and disk rates, Linux /proc only → null on Windows/macOS
+  netRxBps: number | null;
+  netTxBps: number | null;
+  diskReadBps: number | null;
+  diskWriteBps: number | null;
+  // request/response bytes the app itself moves (per second); always available,
+  // computed from ingested batches rather than the OS
+  appInBps: number;
+  appOutBps: number;
+}
+
+export interface SystemMetrics {
+  current: SystemSample;
+  history: SystemSample[];
 }

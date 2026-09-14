@@ -266,6 +266,11 @@ export default function ConfigDrawer({ gw, profile, onClose }: Props) {
           <NumField id="invalidPct" label="Invalid traffic %" k="invalidRatioPct" min={0} max={100} fallback={2} {...numProps} />
         </div>
         <p className="hint">
+          <strong>Max concurrency</strong> acts as a ceiling on in-flight requests: throughput can never exceed
+          it ÷ mean latency. When it would throttle the configured target rate, the driver raises it automatically
+          (to target rate × 5s, at most 5000) and warns if even the raised cap saturates.
+        </p>
+        <p className="hint">
           <strong>Invalid traffic %</strong> is the slice deliberately violating the published OpenAPI/WSDL
           contract (bad enums, wrong types, missing required fields, malformed XML). Keep it small — it exists
           so you can confirm your gateway&apos;s content validation actually rejects it. The rest of the load

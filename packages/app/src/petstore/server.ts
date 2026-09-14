@@ -161,17 +161,56 @@ export function createApp() {
     send(res, 200, { deleted: true, id });
   });
 
+  // ---------- REST: photo ----------
+
+  // The photo response is ~50KB of JSON shaped as photo data, and the only
+  // pet-specific part is the id — textually always `{ "petId": ` at the head.
+  // Stringifying + re-encoding a body that large per request was the loudest
+  // item in SUT profiles, so the invariant base and target-sized pads are
+  // cached; the per-request work is two slices and a head concat. Text shape
+  // stays exactly the old JSON.stringify object — a client that parses it as
+  // JSON (the driver does, for captureId) sees the same fields.
+  const PHOTO_HEAD = '{"petId":';
+  /** the whole base object, cached per seed id — they never change */
+  const photoBaseById = new Map<number, string>();
+  const photoBaseFor = (id: number): string => {
+    let base = photoBaseById.get(id);
+    if (base === undefined) {
+      base = PHOTO_HEAD + String(id) + ',"photo":["https://cdn.example.test/pets/' + id + '.jpg"],"contentType":"image/jpeg"}';
+      photoBaseById.set(id, base);
+    }
+    return base;
+  };
+  /** '{"pad":"<filler>"}' without its final '}' ("" empty when the target is
+   *  below the padding floor), cached per exact target size */
+  const photoTailByTarget = new Map<number, string>();
+
+  const photoTailFor = (baseLen: number, targetBytes: number): string => {
+    let tail = photoTailByTarget.get(targetBytes);
+    if (tail === undefined) {
+      tail = "";
+      if (targetBytes > baseLen + 12) {
+        tail = padPayload({ pad: "" }, targetBytes - (baseLen - 1)).pad as string;
+        tail = tail.slice(1, -1); // drop '{"pad":' off the front; '}' replaces the base's own
+      }
+      photoTailByTarget.set(targetBytes, tail);
+    }
+    return tail;
+  };
+
   app.get("/api/pets/:petId/photo", variability("pet-photo"), (req, res) => {
     const id = pathInt(req.params["petId"]);
     if (id === null) return bad(res, "petId must be a positive integer");
     const pet = store.get(id);
     if (!pet) return send(res, 404, { error: "Pet not found" });
     const pad = res.locals["padBytes"] as number | undefined;
-    const padded = padPayload({ petId: pet.id, photo: pet.photoUrls, contentType: "image/jpeg" }, Math.round(pad ?? 50000));
-    const buf = Buffer.from(JSON.stringify(padded), "utf-8");
+    const base = photoBaseFor(id);
+    // the base's closing '}' is replaced by the tail (which closes the pad
+    // then the object); no pad → the base is already the whole body
+    const body = base.slice(0, -1) + photoTailFor(base.length, Math.round(pad ?? 50000));
     res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Content-Length", buf.length);
-    res.send(buf);
+    res.setHeader("Content-Length", Buffer.byteLength(body));
+    res.send(body);
   });
 
   // ---------- REST: store ----------

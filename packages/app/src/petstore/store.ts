@@ -315,12 +315,47 @@ export class PetStore {
   }
 }
 
+/** Pad resolution: the exact target is rounded to this before looking up a
+ *  shared filler string, so the "0.8 to 1.2 × default" jitter still lands on
+ *  hundreds of distinct sizes while the pool stays tiny. */
+const PAD_RESOLUTION = 256;
+/** filler strings kept per rounded target size */
+const PAD_POOL = 4;
+
+const padPools = new Map<number, string[]>();
+
+/** Pad fibre for roughly `targetBytes` total output, from a small pool. The
+ *  %-over-fibre count varies from request to request so the emitted size
+ *  still jitters within the bucket exactly as before. Buckets are capped: an
+ *  X-Test-Size-B sweep could otherwise grow the cache without bound. */
+const MAX_PAD_BUCKETS = 64;
+
+function padFiller(targetBytes: number, rand: () => number): string {
+  const needed = Math.max(1, targetBytes);
+  const bucket = Math.round(needed / PAD_RESOLUTION) * PAD_RESOLUTION;
+  let pool = padPools.get(bucket);
+  if (!pool) {
+    if (padPools.size >= MAX_PAD_BUCKETS) {
+      return LOREM.repeat(Math.ceil(needed / LOREM.length)).slice(0, needed);
+    }
+    padPools.set(bucket, (pool = []));
+  }
+  for (let tries = 0; tries < pool.length; tries++) {
+    const i = Math.floor(rand() * pool.length);
+    const pad = pool[i] as string;
+    if (pad.length >= needed) return pad.slice(0, needed);
+  }
+  // nothing long enough in the pool yet: build the exact string and add it
+  const pad = LOREM.repeat(Math.ceil(needed / LOREM.length));
+  if (pool.length < PAD_POOL) pool.push(pad);
+  return pad.slice(0, needed);
+}
+
 /** Pad a JSON-serializable payload with filler so the serialized size reaches targetBytes. */
-export function padPayload<T extends Record<string, unknown>>(payload: T, targetBytes: number): T & { _pad?: string } {
+export function padPayload<T extends Record<string, unknown>>(payload: T, targetBytes: number, rand: () => number = Math.random): T & { _pad?: string } {
   const capped = Math.min(Math.max(0, Math.round(targetBytes) || 0), LIMITS.padBytes);
   const base = JSON.stringify(payload).length;
   if (capped <= base + 12) return payload;
   const needed = capped - base - 12;
-  const filler = LOREM.repeat(Math.ceil(needed / LOREM.length)).slice(0, needed);
-  return { ...payload, _pad: filler };
+  return { ...payload, _pad: padFiller(needed, rand) };
 }

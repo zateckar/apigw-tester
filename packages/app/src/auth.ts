@@ -8,15 +8,25 @@ interface Creds { user: string; pass: string }
 
 let cached: Creds | null = null;
 let cachedRaw: string | undefined;
+/** The exact Authorization header we accept, kept as a Buffer alongside the
+ *  creds. The driver's requests are hot enough that decoding base64 twice per
+ *  request just to re-derive a constant showed up in profiles; the whole
+ *  header ("Basic …") is one string, so the check is one fixed-time compare. */
+let expectedAuth: Buffer | null = null;
 
 function credentials(): Creds | null {
   const raw = process.env["APP_BASIC_AUTH"];
   if (raw === cachedRaw) return cached;
   cachedRaw = raw;
-  if (!raw) { cached = null; return null; }
-  const [user, ...rest] = raw.split(":");
-  const pass = rest.join(":");
-  cached = user && pass ? { user, pass } : null;
+  cached = null;
+  if (raw) {
+    const [user, ...rest] = raw.split(":");
+    const pass = rest.join(":");
+    if (user && pass) cached = { user, pass };
+  }
+  expectedAuth = cached
+    ? Buffer.from(`Basic ${Buffer.from(`${cached.user}:${cached.pass}`).toString("base64")}`, "utf-8")
+    : null;
   return cached;
 }
 
@@ -24,18 +34,11 @@ export function isConfigured(): boolean {
   return credentials() !== null;
 }
 
-/** Length-independent comparison, so neither the length nor the position of the
- *  first differing byte is observable in the response time. */
-function constantTimeEquals(a: string, b: string): boolean {
-  const ab = Buffer.from(a, "utf-8");
-  const bb = Buffer.from(b, "utf-8");
-  // hash to a fixed width first: timingSafeEqual throws on length mismatch
-  const pad = Buffer.alloc(Math.max(ab.length, bb.length));
-  const abp = Buffer.alloc(pad.length);
-  const bbp = Buffer.alloc(pad.length);
-  ab.copy(abp);
-  bb.copy(bbp);
-  return timingSafeEqual(abp, bbp) && ab.length === bb.length;
+/** The exact value of an accepted `Authorization: Basic …` header, or null
+ *  when auth is not configured. Guaranteed consistent with credentials(). */
+export function expectedAuthHeader(): Buffer | null {
+  credentials();
+  return expectedAuth;
 }
 
 function unauthorized(res: Response, realm: string): void {
@@ -46,26 +49,22 @@ function unauthorized(res: Response, realm: string): void {
 /** Middleware: 401 unless Basic Authorization matches APP_BASIC_AUTH. */
 export function requireAuth(realm = "apigw-tester") {
   return (req: Request, res: Response, next: NextFunction) => {
-    const want = credentials();
+    const want = expectedAuthHeader();
     if (!want) {
       // auth not configured → fail closed; no credential route leaks
       res.status(503).json({ error: "server not configured: set APP_BASIC_AUTH=name:password" });
       return;
     }
     const hdr = req.headers["authorization"];
-    if (typeof hdr !== "string" || !hdr.startsWith("Basic ")) {
+    if (typeof hdr !== "string") {
       unauthorized(res, realm);
       return;
     }
-    let decoded: string;
-    try {
-      decoded = Buffer.from(hdr.slice(6), "base64").toString("utf-8");
-    } catch {
-      unauthorized(res, realm);
-      return;
-    }
-    const i = decoded.indexOf(":");
-    if (i < 0 || !constantTimeEquals(decoded.slice(0, i), want.user) || !constantTimeEquals(decoded.slice(i + 1), want.pass)) {
+    // compare the whole header against the precomputed one. The length guard
+    // comes first: timingSafeEqual throws on unequal lengths, and the attacker
+    // already knows everything the guard "leaks" (they sent the length).
+    const got = Buffer.from(hdr, "utf-8");
+    if (got.length !== want.length || !timingSafeEqual(got, want)) {
       unauthorized(res, realm);
       return;
     }
