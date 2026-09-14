@@ -2,7 +2,7 @@ import { HISTOGRAM_EDGES_MS, LIMITS } from "@apigw/shared";
 import type {
   ClassStat,
   EndpointStat,
-  GwConfig,
+  GwTargets,
   IngestBatch,
   LoadProfile,
   MetricSummary,
@@ -33,13 +33,19 @@ export interface MetricsStore {
   summary: (windowMs: number) => MetricSummary;
   timeseries: (bucketSec: 60 | 3600, from: number, to: number) => TimeSeries;
   recent: (limit: number) => RequestResult[];
-  readGateway: () => GwConfig | null;
-  writeGateway: (cfg: GwConfig) => void;
+  readGateway: () => unknown | null;
+  writeGateway: (cfg: GwTargets) => void;
   readProfile: () => LoadProfile | null;
   writeProfile: (p: LoadProfile) => void;
   recordRunStart: (runId: string, profile: unknown) => void;
   recordRunStop: (runId: string) => void;
   listRuns: () => RunEvent[];
+  /** Wipe all collected metric data (raw, both roll-ups, ingest markers, run
+   *  history). The config rows — gateway, profile — survive. */
+  resetAll: () => void;
+  /** Delete stopped runs started more than `olderThanMs` ago; a running or
+   *  crashed-but-unstopped run is never removed. Returns rows deleted. */
+  pruneRuns: (olderThanMs: number) => number;
   close: () => void;
 }
 
@@ -511,9 +517,30 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     readGateway: () => {
       const row = getConfig.get("gateway") as { value: string } | undefined;
       if (!row) return null;
-      try { return JSON.parse(row.value) as GwConfig; } catch { return null; }
+      try { return JSON.parse(row.value) as unknown; } catch { return null; }
     },
     writeGateway: (cfg) => setConfig.run("gateway", JSON.stringify(cfg)),
+    resetAll: () => {
+      // config rows (gateway, profile) deliberately survive a reset
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec("DELETE FROM requests_raw");
+        db.exec("DELETE FROM rollup_minute");
+        db.exec("DELETE FROM rollup_hour");
+        db.exec("DELETE FROM ingest_seen");
+        db.exec("DELETE FROM runs");
+        db.exec("COMMIT");
+      } catch (e) {
+        try { db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw e;
+      }
+      // give the freed pages back to the file system, as the sweeper does
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    },
+    pruneRuns: (olderThanMs) => {
+      const cutoff = Date.now() - olderThanMs;
+      return Number((db.prepare(`DELETE FROM runs WHERE started_at < ? AND stopped_at IS NOT NULL`).run(cutoff) as { changes: number | bigint }).changes);
+    },
     readProfile: () => {
       const row = getConfig.get("profile") as { value: string } | undefined;
       if (!row) return null;

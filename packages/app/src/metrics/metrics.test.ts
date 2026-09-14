@@ -166,3 +166,39 @@ describe("long-window summaries", () => {
     s.close();
   });
 });
+
+describe("reset and prune", () => {
+  it("resetAll wipes metrics and runs but keeps config rows", () => {
+    const s = createMetricsStore(":memory:");
+    s.ingestBatch({ batchId: "wipe", results: [mk(), mk({ ts: Date.now() - 2 * 3600_000 })] });
+    s.recordRunStart("run-1", { mode: "constant" });
+    s.recordRunStop("run-1");
+    s.writeGateway({ rest: { baseUrl: "http://x", apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" },
+                     soap: { baseUrl: "http://y", apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" } });
+
+    s.resetAll();
+
+    expect(s.summary(7 * 86_400_000).total).toBe(0);
+    expect(s.recent(10)).toEqual([]);
+    expect(s.listRuns()).toEqual([]);
+    // a repeat of the same batch id must not be swallowed as a duplicate
+    expect(s.ingestBatch({ batchId: "wipe", results: [mk()] }).ingested).toBe(1);
+    expect(s.readGateway()).toBeTruthy();
+    s.close();
+  });
+
+  it("pruneRuns removes old stopped runs but never an unstopped one", async () => {
+    const s = createMetricsStore(":memory:");
+    s.recordRunStart("stopped-run", {});
+    s.recordRunStart("still-running", {});
+    s.recordRunStop("stopped-run");
+    // let "now" move past started_at so a zero-length horizon matches them
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect(s.pruneRuns(0)).toBe(1);
+    const remaining = s.listRuns().map((r) => r.runId);
+    expect(remaining).not.toContain("stopped-run");
+    expect(remaining).toContain("still-running");
+    s.close();
+  });
+});

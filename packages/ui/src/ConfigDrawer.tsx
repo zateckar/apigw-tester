@@ -1,11 +1,11 @@
 import { Fragment, useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api } from "./api";
-import type { GwConfig, LoadProfile, LoadMode, ScenarioWeights } from "./api";
-import { sanitizeGwConfig, sanitizeLoadProfile, validateGwConfig } from "@apigw/shared";
+import type { GwConfig, GwTargets, LoadProfile, LoadMode, Protocol, ScenarioWeights } from "./api";
+import { sanitizeGwConfig, sanitizeGwTargets, sanitizeLoadProfile, validateGwConfig, validateGwTargets } from "@apigw/shared";
 
 interface Props {
-  gw: GwConfig;
+  gw: GwTargets;
   profile: LoadProfile;
   onClose: () => void;
 }
@@ -84,11 +84,80 @@ function NumField({ id, label, k, min, max, step, fallback, profile, drafts, set
   );
 }
 
+interface GwTargetSectionProps {
+  idPrefix: Protocol;
+  label: string;
+  cfg: GwConfig;
+  fallback: GwConfig;
+  onChange: (next: GwConfig) => void;
+  testState: { ok?: boolean; note?: string; busy?: boolean };
+  setTestState: Dispatch<SetStateAction<Record<Protocol, { ok?: boolean; note?: string; busy?: boolean }>>>;
+}
+
+/**
+ * One protocol's gateway target. Module-scope for the same reason as NumField:
+ * a component re-created inside ConfigDrawer would remount its inputs on every
+ * keystroke and steal focus.
+ */
+function GwTargetSection({ idPrefix, label, cfg, fallback, onChange, testState, setTestState }: GwTargetSectionProps) {
+  /** The server does the probing — see api.testGateway for why it can't be the browser. */
+  async function handleTest() {
+    const problem = validateGwConfig(cfg);
+    if (problem) { setTestState((s) => ({ ...s, [idPrefix]: { ok: false, note: problem } })); return; }
+    setTestState((s) => ({ ...s, [idPrefix]: { busy: true, note: "probing…" } }));
+    try {
+      const r = await api.testGateway(sanitizeGwConfig(cfg, fallback), idPrefix);
+      setTestState((s) => ({
+        ...s,
+        [idPrefix]: r.ok
+          ? { ok: true, note: `${r.status} from ${r.url} in ${r.latencyMs} ms` }
+          : r.status !== undefined
+            ? { ok: false, note: `HTTP ${r.status} from ${r.url}` }
+            : { ok: false, note: `${r.url}: ${r.error ?? "unreachable"}` }
+      }));
+    } catch (e) {
+      setTestState((s) => ({ ...s, [idPrefix]: { ok: false, note: (e as Error).message } }));
+    }
+  }
+
+  return (
+    <>
+      <h3>{label}</h3>
+      <div className="form-grid">
+        <label htmlFor={`${idPrefix}-gw-base`}>Base URL</label>
+        <input id={`${idPrefix}-gw-base`} value={cfg.baseUrl} onChange={(e) => onChange({ ...cfg, baseUrl: e.target.value })}
+               placeholder="https://gw.example.com" />
+        <label htmlFor={`${idPrefix}-gw-key`}>API key</label>
+        <input id={`${idPrefix}-gw-key`} value={cfg.apiKey} type="password" autoComplete="off"
+               onChange={(e) => onChange({ ...cfg, apiKey: e.target.value })}
+               placeholder="leave empty for no-auth" />
+        <label htmlFor={`${idPrefix}-gw-key-header`}>API key header</label>
+        <input id={`${idPrefix}-gw-key-header`} value={cfg.apiKeyHeader} onChange={(e) => onChange({ ...cfg, apiKeyHeader: e.target.value })}
+               placeholder="X-API-Key" />
+        <label htmlFor={`${idPrefix}-gw-prefix`}>Path prefix</label>
+        <input id={`${idPrefix}-gw-prefix`} value={cfg.pathPrefix} onChange={(e) => onChange({ ...cfg, pathPrefix: e.target.value })}
+               placeholder="/v1" />
+      </div>
+      <div className="form-row" style={{ marginTop: 10 }}>
+        <button onClick={() => void handleTest()} disabled={testState.busy === true}>
+          {testState.busy === true ? "Testing…" : "Test connection"}
+        </button>
+        <span className={`hint ${testState.ok === false ? "err" : ""}`} style={{ alignSelf: "center" }}>
+          {testState.note ?? ""}
+        </span>
+      </div>
+    </>
+  );
+}
+
 export default function ConfigDrawer({ gw, profile, onClose }: Props) {
-  const [g, setG] = useState<GwConfig>({ ...gw });
+  const [g, setG] = useState<GwTargets>({ rest: { ...gw.rest }, soap: { ...gw.soap } });
   const [p, setP] = useState<LoadProfile>({ ...profile });
   const [drafts, setDrafts] = useState<Drafts>({});
-  const [testState, setTestState] = useState<{ ok?: boolean; note?: string; busy?: boolean }>({});
+  const [testStates, setTestStates] = useState<Record<Protocol, { ok?: boolean; note?: string; busy?: boolean }>>({
+    rest: {},
+    soap: {}
+  });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const drawerRef = useRef<HTMLDivElement | null>(null);
@@ -96,7 +165,7 @@ export default function ConfigDrawer({ gw, profile, onClose }: Props) {
   /** the four wiring props every NumField needs, so the call sites stay readable */
   const numProps = { profile: p, drafts, setProfile: setP, setDrafts };
 
-  const saveGw = useMutation({ mutationFn: (cfg: GwConfig) => api.saveGateway(cfg) });
+  const saveGw = useMutation({ mutationFn: (cfg: GwTargets) => api.saveGateway(cfg) });
   const saveProfile = useMutation({ mutationFn: (prof: LoadProfile) => api.saveProfile(prof) });
 
   // Escape closes; focus starts inside the dialog rather than behind it
@@ -111,11 +180,11 @@ export default function ConfigDrawer({ gw, profile, onClose }: Props) {
     setSaving(true);
     setSaveError(null);
     try {
-      const problem = validateGwConfig(g);
+      const problem = validateGwTargets(g);
       if (problem) { setSaveError(problem); return; }
       // clamp client-side with the same rules the server applies, so what the
       // drawer shows after saving is what actually runs
-      const cleanGw = sanitizeGwConfig(g, gw);
+      const cleanGw = sanitizeGwTargets(g, gw);
       const cleanProfile = sanitizeLoadProfile(p, profile);
       await saveGw.mutateAsync(cleanGw);
       await saveProfile.mutateAsync(cleanProfile);
@@ -127,54 +196,24 @@ export default function ConfigDrawer({ gw, profile, onClose }: Props) {
     }
   }
 
-  /** The server does the probing — see api.testGateway for why it can't be the browser. */
-  async function handleTest() {
-    const problem = validateGwConfig(g);
-    if (problem) { setTestState({ ok: false, note: problem }); return; }
-    setTestState({ busy: true, note: "probing…" });
-    try {
-      const r = await api.testGateway(sanitizeGwConfig(g, gw));
-      if (r.ok) setTestState({ ok: true, note: `${r.status} from ${r.url} in ${r.latencyMs} ms` });
-      else if (r.status !== undefined) setTestState({ ok: false, note: `HTTP ${r.status} from ${r.url}` });
-      else setTestState({ ok: false, note: `${r.url}: ${r.error ?? "unreachable"}` });
-    } catch (e) {
-      setTestState({ ok: false, note: (e as Error).message });
-    }
-  }
-
   return (
     <>
       <div className="drawer-overlay" onClick={onClose} />
       <div className="drawer" ref={drawerRef} role="dialog" aria-modal="true" aria-label="Configuration" tabIndex={-1}>
         <h2>Configuration</h2>
 
-        <h3>API Gateway</h3>
-        <div className="form-grid">
-          <label htmlFor="gw-base">Base URL</label>
-          <input id="gw-base" value={g.baseUrl} onChange={(e) => setG({ ...g, baseUrl: e.target.value })}
-                 placeholder="https://gw.example.com" />
-          <label htmlFor="gw-key">API key</label>
-          <input id="gw-key" value={g.apiKey} type="password" autoComplete="off"
-                 onChange={(e) => setG({ ...g, apiKey: e.target.value })}
-                 placeholder="leave empty for no-auth" />
-          <label htmlFor="gw-key-header">API key header</label>
-          <input id="gw-key-header" value={g.apiKeyHeader} onChange={(e) => setG({ ...g, apiKeyHeader: e.target.value })}
-                 placeholder="X-API-Key" />
-          <label htmlFor="gw-prefix">Path prefix</label>
-          <input id="gw-prefix" value={g.pathPrefix} onChange={(e) => setG({ ...g, pathPrefix: e.target.value })}
-                 placeholder="/v1" />
-        </div>
-        <div className="form-row" style={{ marginTop: 10 }}>
-          <button onClick={() => void handleTest()} disabled={testState.busy === true}>
-            {testState.busy === true ? "Testing…" : "Test connection"}
-          </button>
-          <span className={`hint ${testState.ok === false ? "err" : ""}`} style={{ alignSelf: "center" }}>
-            {testState.note ?? ""}
-          </span>
-        </div>
+        <GwTargetSection idPrefix="rest" label="API Gateway — REST"
+                         cfg={g.rest} fallback={gw.rest}
+                         onChange={(next) => setG((prev) => ({ ...prev, rest: next }))}
+                         testState={testStates.rest} setTestState={setTestStates} />
+        <GwTargetSection idPrefix="soap" label="API Gateway — SOAP"
+                         cfg={g.soap} fallback={gw.soap}
+                         onChange={(next) => setG((prev) => ({ ...prev, soap: next }))}
+                         testState={testStates.soap} setTestState={setTestStates} />
         <p className="hint">
-          The probe runs from the server against <span className="mono">{"{base URL}{path prefix}/health"}</span>,
-          using the same credentials and API-key header the load driver will send.
+          REST and SOAP traffic may be fronted at different gateway URLs and keys. The probe runs from the
+          server against <span className="mono">{"{base URL}{path prefix}/health"}</span>, using the same
+          credentials and API-key header the load driver will send.
         </p>
 
         <h3>Load profile</h3>

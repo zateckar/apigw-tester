@@ -42,7 +42,7 @@ Running it as a real service? See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
 That's the whole stack: **one container, one port**. The dashboard, the API, the Petstore SUT and the load driver all live in the same process. There is no separate nginx or UI container — the app serves the built dashboard itself, behind the same auth gate.
 
-Default gateway target is the bundled Petstore on this same process (so everything works out of the box). To test a real gateway open **Configure → API Gateway** and set the base URL + API key, or set `GW_BASE_URL` / `GW_API_KEY` in the environment.
+Default gateway target is the bundled Petstore on this same process (so everything works out of the box). To test a real gateway open **Configure → API Gateway** and set the base URL + API key for **REST and SOAP separately** — a real gateway usually fronts them at different URLs/keys. Environment equivalents are `GW_REST_*` / `GW_SOAP_*` (`GW_REST_BASE_URL`, `GW_REST_API_KEY`, …); the legacy `GW_BASE_URL` / `GW_API_KEY` / `GW_API_KEY_HEADER` / `GW_PATH_PREFIX` still work and apply to both protocols when the protocol-specific variable is unset.
 
 ## Testing a gateway with content validation
 
@@ -144,7 +144,7 @@ cp -r packages/ui/dist packages/app/dist/public
 npm start          # serves on http://localhost:8080 with auth
 ```
 
-**How the "GW overhead" metric works.** Each stress class (`small-rest`, `soap`, `big-response`, `big-request`, `slow-upstream`, `concurrency`, `invalid`) has an associated baseline profile. At startup and then once a minute, the driver calls the same class's endpoint **directly against the in-process Petstore** (bypassing any gateway), measures the latency distribution, and stores it. Every outgoing request then carries `latencyMs` (through the GW) and `overheadMs = max(0, latencyMs − baselineMs(class))`. The dashboard's top-row tile, the "GW overhead" time series, and the per-class table all read that — so the number you see is how slow your gateway makes each call class compared with raw target.
+**How the "GW overhead" metric works.** The bundled Petstore stamps every response with `X-Server-Ms` — the backend's own entry-to-response time for *that exact request*. The load driver reads it on every through-gateway call and computes `overheadMs = max(0, latencyMs − serverMs − transportMs(class))`, where `transportMs` is a per-class median of direct-to-SUT probes **minus** their own `X-Server-Ms` (i.e. pure client-stack + loopback transport, re-measured once a minute). So per-request backend variability — random sleeps on `/api/slow/:ms`, chaos injection, latency-profile changes mid-run — lands in `baselineMs` and never in the gateway's number. Two cases fall back to the class median as the backend estimate: a gateway-generated rejection (auth wall, contract 4xx) that never touched the SUT, and a real backend that doesn't emit the header.
 
 ## Load profiles
 
@@ -182,11 +182,13 @@ curl -u admin:your-strong-password -X POST http://localhost:8080/api/run/stop
 | `GET /api/summary?window=5m\|15m\|1h\|6h\|24h\|7d` | Totals, error %, p50/p90/p95/p99, bytes, per-protocol & per-endpoint & per-class, plus the `contract` block |
 | `GET /api/timeseries?bucket=60\|3600&from&to` | Bucketed chart points (span clamped to 10 000 points; `truncated: true` when clipped) |
 | `GET /api/recent?limit=N` | Latest raw requests (1 ≤ N ≤ 500) |
-| `GET/PUT /api/config/gateway`, `/api/config/profile` | Persisted config, sanitized on write |
+| `GET/PUT /api/config/gateway`, `/api/config/profile` | Persisted config, sanitized on write. The gateway body is `{ rest: {...}, soap: {...} }` — each side its own `baseUrl` / `apiKey` / `apiKeyHeader` / `pathPrefix` |
 | `GET /api/definitions` | Index of the downloadable contract documents |
-| `GET /api/definitions/openapi.json\|.yaml`, `/api/definitions/petservice.wsdl` | The contract, as attachments |
+| `GET /api/definitions/openapi.json\|.yaml`, `/api/definitions/petservice.wsdl` | The contract, as attachments (OpenAPI advertises the REST target, WSDL the SOAP one) |
 | `POST /api/run/start` · `POST /api/run/stop` · `GET /api/run/status` | Run control |
 | `GET /api/runs` | Run history |
+| `POST /api/metrics/reset` | Wipe all metrics (raw, roll-ups, run history). 409 while a run is live. Config is kept |
+| `POST /api/runs/prune` `{ "olderThanDays": N }` | Delete stopped runs older than N days (never a live/unstopped run) |
 | `GET /health` | Liveness + build version + uptime (the only unauthenticated route) |
 
 ## Petstore variability knobs

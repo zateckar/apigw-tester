@@ -9,8 +9,8 @@ import { WSDL } from "./petstore/soap.js";
 import { Driver, type Driver as DriverType } from "./loadgen/driver.js";
 import { readConfig, type AppConfig } from "./config.js";
 import { requireAuth, readBasicAuthCreds } from "./auth.js";
-import { LIMITS, sanitizeGwConfig, sanitizeLoadProfile, validateGwConfig } from "@apigw/shared";
-import { DEFAULT_GW_CONFIG, DEFAULT_LOAD_PROFILE } from "@apigw/shared";
+import { LIMITS, sanitizeGwConfig, sanitizeGwTargets, sanitizeLoadProfile, validateGwConfig, validateGwTargets } from "@apigw/shared";
+import { DEFAULT_GW_TARGETS, DEFAULT_LOAD_PROFILE } from "@apigw/shared";
 
 export interface BuiltApp {
   app: Express;
@@ -144,7 +144,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   // seed from persisted config so a restart keeps your settings
   const savedGw = store.readGateway();
   const savedProfile = store.readProfile();
-  if (savedGw) driver.setGw(sanitizeGwConfig(savedGw, cfg.defaultGateway));
+  if (savedGw) driver.setGw(sanitizeGwTargets(savedGw, cfg.defaultGateway));
   else store.writeGateway(cfg.defaultGateway);
   if (savedProfile) driver.setProfile(sanitizeLoadProfile(savedProfile, cfg.defaultProfile));
   else store.writeProfile(cfg.defaultProfile);
@@ -157,13 +157,15 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   // every path into it — the `?server=` override and the persisted gateway config
   // alike — goes through normalizeServerUrl first. An unusable override falls back
   // to the configured gateway rather than being echoed back.
-  const specServerUrl = (req: Request): string => {
-    const fallback = normalizeServerUrl(cfg.defaultGateway.baseUrl) ?? `http://127.0.0.1:${cfg.port}`;
+  const specServerUrl = (req: Request, protocol: "rest" | "soap"): string => {
+    const fallback = normalizeServerUrl(cfg.defaultGateway[protocol].baseUrl) ?? `http://127.0.0.1:${cfg.port}`;
     const override = req.query["server"];
     if (typeof override === "string" && override.trim() !== "") {
       return normalizeServerUrl(override) ?? fallback;
     }
-    const gw = sanitizeGwConfig(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+    // each protocol advertises its own target: the OpenAPI document points where
+    // REST traffic goes, the WSDL where SOAP traffic goes
+    const gw = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway)[protocol];
     const prefix = gw.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
     return normalizeServerUrl(`${gw.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}`) ?? fallback;
   };
@@ -173,23 +175,24 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       openapiJson: "/api/definitions/openapi.json",
       openapiYaml: "/api/definitions/openapi.yaml",
       wsdl: "/api/definitions/petservice.wsdl",
-      serverUrl: specServerUrl(req),
+      serverUrl: specServerUrl(req, "rest"),
+      serverUrlSoap: specServerUrl(req, "soap"),
       note: "Import these into the gateway under test to enable request/response validation. Override the advertised server with ?server=https://your-gw/base"
     });
   });
 
   app.get("/api/definitions/openapi.json", (req, res) => {
     res.setHeader("Content-Disposition", 'attachment; filename="apigw-tester-openapi.json"');
-    res.type("application/json").send(JSON.stringify(buildOpenApiDocument({ serverUrl: specServerUrl(req) }), null, 2));
+    res.type("application/json").send(JSON.stringify(buildOpenApiDocument({ serverUrl: specServerUrl(req, "rest") }), null, 2));
   });
 
   app.get("/api/definitions/openapi.yaml", (req, res) => {
     res.setHeader("Content-Disposition", 'attachment; filename="apigw-tester-openapi.yaml"');
-    res.type("application/yaml").send(toYaml(buildOpenApiDocument({ serverUrl: specServerUrl(req) })));
+    res.type("application/yaml").send(toYaml(buildOpenApiDocument({ serverUrl: specServerUrl(req, "rest") })));
   });
 
   app.get("/api/definitions/petservice.wsdl", (req, res) => {
-    const location = `${specServerUrl(req)}/soap/petservice`;
+    const location = `${specServerUrl(req, "soap")}/soap/petservice`;
     res.setHeader("Content-Disposition", 'attachment; filename="petservice.wsdl"');
     // function replacement so a `$&` in the URL stays literal instead of expanding
     res.type("text/xml").send(WSDL.replace("__SERVICE_LOCATION__", () => xmlAttr(location)));
@@ -241,11 +244,11 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     res.json({ items: store.recent(n), histogramEdges: HISTOGRAM_EDGES });
   });
 
-  app.get("/api/config/gateway", (_req, res) => res.json(store.readGateway() ?? DEFAULT_GW_CONFIG));
+  app.get("/api/config/gateway", (_req, res) => res.json(sanitizeGwTargets(store.readGateway() ?? DEFAULT_GW_TARGETS)));
   app.put("/api/config/gateway", (req: Request, res: Response) => {
-    const problem = validateGwConfig(req.body);
+    const problem = validateGwTargets(req.body);
     if (problem) return res.status(400).json({ error: problem });
-    const clean = sanitizeGwConfig(req.body, store.readGateway() ?? cfg.defaultGateway);
+    const clean = sanitizeGwTargets(req.body, sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway));
     store.writeGateway(clean);
     driver.setGw(clean);
     res.json({ saved: true, gateway: clean });
@@ -258,11 +261,17 @@ export function buildApp(cfg: AppConfig): BuiltApp {
    * so a browser-side fetch at the gateway (a different origin by definition)
    * is blocked before it leaves the page — and this is also the only probe that
    * exercises the same path the load driver will actually use.
+   *
+   * Body: one GwConfig plus an optional `protocol` ("rest" | "soap") selecting
+   * which side of the persisted config it falls back to; defaults to "rest".
    */
   app.post("/api/config/gateway/test", async (req: Request, res: Response) => {
-    const problem = validateGwConfig(req.body);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const protocol = body.protocol === "soap" ? "soap" : "rest";
+    const problem = validateGwConfig(body);
     if (problem) return res.status(400).json({ ok: false, error: problem });
-    const probe = sanitizeGwConfig(req.body, store.readGateway() ?? cfg.defaultGateway);
+    const persisted = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+    const probe = sanitizeGwConfig(body, persisted[protocol]);
     const prefix = probe.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
     const url = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}/health`;
 
@@ -307,7 +316,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       return res.json({ ok: true, runId: current.runId, alreadyRunning: true });
     }
     const profile = sanitizeLoadProfile(store.readProfile() ?? cfg.defaultProfile, cfg.defaultProfile);
-    const gateway = sanitizeGwConfig(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+    const gateway = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
     const runId = `run-${Date.now()}`;
     store.recordRunStart(runId, profile);
     driver.setGw(gateway);
@@ -327,6 +336,28 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   });
 
   app.get("/api/runs", (_req, res) => res.json(store.listRuns()));
+
+  /**
+   * Wipe all metric data. Refused while a run is live: the driver holds up to a
+   * flush interval of results in memory and would re-insert them, stamped with
+   * the old run id, after the reset.
+   */
+  app.post("/api/metrics/reset", (_req, res) => {
+    if (driver.status().state === "running") {
+      return res.status(409).json({ error: "stop the run before resetting metrics" });
+    }
+    store.resetAll();
+    res.json({ ok: true });
+  });
+
+  const DAY_MS = 86_400_000;
+  app.post("/api/runs/prune", (req: Request, res: Response) => {
+    const days = Number((req.body as Record<string, unknown> | undefined)?.olderThanDays);
+    if (!Number.isFinite(days) || days < 1 || days > 3650) {
+      return res.status(400).json({ error: "olderThanDays must be a number between 1 and 3650" });
+    }
+    res.json({ deleted: store.pruneRuns(days * DAY_MS) });
+  });
 
   // ---------------- static dashboard ----------------
   const publicDir = resolve(cfg.publicDir);

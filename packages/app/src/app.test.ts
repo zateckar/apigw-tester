@@ -157,7 +157,10 @@ describe("apigw-tester app (auth protected)", () => {
   });
 
   it("gateway config round-trip", async () => {
-    const cfg = { baseUrl: "http://example.test", apiKey: "k", apiKeyHeader: "X-Key", pathPrefix: "/gw" };
+    const cfg = {
+      rest: { baseUrl: "http://example.test", apiKey: "k", apiKeyHeader: "X-Key", pathPrefix: "/gw" },
+      soap: { baseUrl: "http://soap.example.test", apiKey: "s", apiKeyHeader: "X-Soap-Key", pathPrefix: "" }
+    };
     await authed("/api/config/gateway", { method: "PUT", body: JSON.stringify(cfg) });
     expect(await (await authed("/api/config/gateway")).json()).toEqual(cfg);
   });
@@ -198,12 +201,17 @@ describe("apigw-tester app (auth protected)", () => {
   });
 
   it("rejects a gateway config that is not an absolute http(s) URL", async () => {
+    const good = { baseUrl: "http://example.test", apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" };
     for (const baseUrl of ["", "not a url", "file:///etc/passwd", "ftp://x/y"]) {
-      const r = await authed("/api/config/gateway", {
-        method: "PUT",
-        body: JSON.stringify({ baseUrl, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })
-      });
-      expect(r.status, baseUrl).toBe(400);
+      for (const side of ["rest", "soap"] as const) {
+        const r = await authed("/api/config/gateway", {
+          method: "PUT",
+          body: JSON.stringify({ rest: { ...good }, soap: { ...good }, [side]: { ...good, baseUrl } })
+        });
+        expect(r.status, `${side} ${baseUrl}`).toBe(400);
+        const body = (await r.json()) as { error: string };
+        expect(body.error.startsWith(`${side}.`), body.error).toBe(true);
+      }
     }
   });
 
@@ -265,6 +273,27 @@ describe("apigw-tester app (auth protected)", () => {
     const xml = await soap.text();
     expect(xml).toContain("&lt;/name&gt;");   // escaped, not injected
     expect(xml).not.toContain("<injected>");
+  });
+
+  it("stamps every SUT response with its own server time (X-Server-Ms)", async () => {
+    // the driver pairs this per request to subtract backend latency from GW
+    // overhead — cover all three emission paths: variability, raw stress, SOAP
+    for (const path of ["/api/pets/1", "/api/slow/30", "/api/big/1024", "/api/echo"]) {
+      const init: RequestInit = path === "/api/echo" ? { method: "POST", body: JSON.stringify({ x: 1 }) } : {};
+      const r = await authed(path, init);
+      const v = Number(r.headers.get("x-server-ms"));
+      expect(Number.isFinite(v), path).toBe(true);
+      expect(v, path).toBeGreaterThanOrEqual(0);
+    }
+    const slow = await authed("/api/slow/120");
+    expect(Number(slow.headers.get("x-server-ms"))).toBeGreaterThanOrEqual(100);
+
+    const soap = await authed("/soap/petservice", {
+      method: "POST",
+      headers: { "Content-Type": "text/xml", SOAPAction: '"getPetById"' },
+      body: `<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><getPetByIdRequest><petId>1</petId></getPetByIdRequest></soap:Body></soap:Envelope>`
+    });
+    expect(Number.isFinite(Number(soap.headers.get("x-server-ms")))).toBe(true);
   });
 
   it("honours X-Test-Delay-Ms and caps X-Test-Size-B", async () => {
@@ -352,8 +381,9 @@ describe("apigw-tester app (auth protected)", () => {
     const probe = async (cfg: Record<string, unknown>) =>
       authed("/api/config/gateway/test", { method: "POST", body: JSON.stringify(cfg) });
 
-    // reachable: point it at ourselves, whose /health is public
-    const ok = (await (await probe({ baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
+    // reachable: point it at ourselves, whose /health is public; protocol selects
+    // which persisted side the probe falls back to and is otherwise inert here
+    const ok = (await (await probe({ protocol: "soap", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
       ok: boolean; status: number; url: string; latencyMs: number;
     };
     expect(ok.ok).toBe(true);
@@ -387,5 +417,48 @@ describe("apigw-tester app (auth protected)", () => {
     expect(running.state).toBe("running");
     const stopped = await (await authed("/api/run/stop", { method: "POST" })).json();
     expect(stopped.stopped).toBe(true);
+  });
+
+  it("resets metrics and runs but keeps config", async () => {
+    // the earlier tests have ingested data by now; make sure the primitives agree
+    const before = await (await authed("/api/summary?window=24h")).json();
+    expect(before.total).toBeGreaterThan(0);
+
+    const r = await authed("/api/metrics/reset", { method: "POST" });
+    expect(r.status).toBe(200);
+
+    const after = await (await authed("/api/summary?window=24h")).json();
+    expect(after.total).toBe(0);
+    expect(await (await authed("/api/runs")).json()).toEqual([]);
+    const recent = await (await authed("/api/recent?limit=5")).json();
+    expect(recent.items).toEqual([]);
+    // gateway/profile rows are settings, not metrics — they survive
+    const gw = await (await authed("/api/config/gateway")).json();
+    expect(gw.rest.baseUrl).toBeTruthy();
+  });
+
+  it("refuses to reset metrics while a run is live", async () => {
+    await authed("/api/run/start", { method: "POST", body: "{}" });
+    const r = await authed("/api/metrics/reset", { method: "POST" });
+    expect(r.status).toBe(409);
+    await authed("/api/run/stop", { method: "POST" });
+    expect((await authed("/api/metrics/reset", { method: "POST" })).status).toBe(200);
+  });
+
+  it("prunes old runs and rejects nonsense day counts", async () => {
+    await authed("/api/run/start", { method: "POST", body: "{}" });
+    await authed("/api/run/stop", { method: "POST" });
+    const runs = (await (await authed("/api/runs")).json()) as unknown[];
+    expect(runs.length).toBeGreaterThan(0);
+
+    for (const bad of [{ olderThanDays: "x" }, { olderThanDays: 0 }, { olderThanDays: -3 }, {}]) {
+      expect((await authed("/api/runs/prune", { method: "POST", body: JSON.stringify(bad) })).status).toBe(400);
+    }
+    // everything we recorded just now is younger than the horizon
+    const kept = (await (await authed("/api/runs/prune", {
+      method: "POST", body: JSON.stringify({ olderThanDays: 30 })
+    })).json()) as { deleted: number };
+    expect(kept.deleted).toBe(0);
+    expect(((await (await authed("/api/runs")).json()) as unknown[]).length).toBe(runs.length);
   });
 });

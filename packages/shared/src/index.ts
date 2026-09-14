@@ -79,6 +79,17 @@ export const DEFAULT_GW_CONFIG: GwConfig = {
   pathPrefix: ""
 };
 
+/** REST and SOAP traffic may be fronted by the gateway at different URLs and keys. */
+export interface GwTargets {
+  rest: GwConfig;
+  soap: GwConfig;
+}
+
+export const DEFAULT_GW_TARGETS: GwTargets = {
+  rest: { ...DEFAULT_GW_CONFIG },
+  soap: { ...DEFAULT_GW_CONFIG }
+};
+
 export type LoadMode = "constant" | "ramp" | "spike" | "sine-daily" | "real";
 
 export interface ScenarioWeights {
@@ -237,6 +248,34 @@ export function validateGwConfig(input: unknown): string | null {
   return null;
 }
 
+function cloneTargets(t: GwTargets): GwTargets {
+  return { rest: { ...t.rest }, soap: { ...t.soap } };
+}
+
+/** Coerce arbitrary JSON into per-protocol gateway targets. A legacy flat
+ *  GwConfig (with a top-level baseUrl, no rest/soap keys) upgrades its fields
+ *  onto both targets, so a row persisted by an older version keeps working. */
+export function sanitizeGwTargets(input: unknown, base: GwTargets = DEFAULT_GW_TARGETS): GwTargets {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const flat = typeof raw.baseUrl === "string" && raw.rest === undefined && raw.soap === undefined;
+  const restIn = flat ? raw : raw.rest;
+  const soapIn = flat ? raw : raw.soap;
+  const out = cloneTargets(base);
+  if (restIn !== undefined && restIn !== null) out.rest = sanitizeGwConfig(restIn, out.rest);
+  if (soapIn !== undefined && soapIn !== null) out.soap = sanitizeGwConfig(soapIn, out.soap);
+  return out;
+}
+
+/** Validate both sides; failures are prefixed so the UI can point at the block. */
+export function validateGwTargets(input: unknown): string | null {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  for (const side of ["rest", "soap"] as const) {
+    const problem = validateGwConfig(raw[side]);
+    if (problem) return `${side}.${problem}`;
+  }
+  return null;
+}
+
 // ---------- Request / metrics records ----------
 export type Protocol = "rest" | "soap";
 
@@ -369,7 +408,7 @@ export interface RunStatus {
   profile: LoadProfile | null;
   targetRps: number;
   counters: { sent: number; ok: number; errors: number; timeouts: number; invalidSent: number; invalidRejected: number };
-  gateway?: GwConfig;
+  gateway?: GwTargets;
 }
 
 export interface RunEvent {

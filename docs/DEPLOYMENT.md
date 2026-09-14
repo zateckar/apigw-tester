@@ -15,7 +15,7 @@ the tool *is* and how to use it, see the [README](../README.md).
 
 ```bash
 cp .env.example .env
-# edit .env: set APP_BASIC_AUTH, and GW_BASE_URL if you are testing a real gateway
+# edit .env: set APP_BASIC_AUTH, and GW_REST_BASE_URL / GW_SOAP_BASE_URL if you are testing a real gateway
 ```
 
 `APP_BASIC_AUTH` is **mandatory** — the process logs a FATAL and exits 1 if it is
@@ -61,11 +61,14 @@ could use — status, version, uptime.
 
 ## 5. Point it at the gateway
 
-1. Dashboard → **Configure → API Gateway**, set the base URL and API key (or set
-   `GW_BASE_URL` / `GW_API_KEY` before first start).
+1. Dashboard → **Configure → API Gateway**. REST and SOAP are configured as two
+   separate targets — set the base URL and API key for each (or set
+   `GW_REST_BASE_URL` / `GW_REST_API_KEY` / `GW_SOAP_BASE_URL` / `GW_SOAP_API_KEY`
+   before first start; the legacy `GW_BASE_URL` / `GW_API_KEY` apply to both when
+   the protocol-specific variable is unset).
 2. **API definitions** panel → download `openapi.json` / `openapi.yaml` /
-   `petservice.wsdl`. Add `?server=https://your-gw/base` to make the documents
-   advertise the gateway's own URL.
+   `petservice.wsdl`. The OpenAPI document advertises the REST target, the WSDL
+   the SOAP one. Add `?server=https://your-gw/base` to override either.
 3. Import into the gateway, enable request/response validation.
 4. Start a run and watch the **Contract validation** tile. `wronglyAccepted` is the
    number that matters: contract violations your gateway let through.

@@ -15,7 +15,17 @@ services:
       DB_PATH: /app/data/metrics.db
       PETSTORE_SELF_URL: http://127.0.0.1:8080
       # Point the driver at a real gateway without editing any config.
-      # Empty means "target my own built-in petstore".
+      # Empty means "target my own built-in petstore". REST and SOAP have their
+      # own targets; the legacy GW_* values apply to both when the specific
+      # variable is not set.
+      GW_REST_BASE_URL: ${GW_REST_BASE_URL:-}
+      GW_REST_API_KEY: ${GW_REST_API_KEY:-}
+      GW_REST_API_KEY_HEADER: ${GW_REST_API_KEY_HEADER:-}
+      GW_REST_PATH_PREFIX: ${GW_REST_PATH_PREFIX:-}
+      GW_SOAP_BASE_URL: ${GW_SOAP_BASE_URL:-}
+      GW_SOAP_API_KEY: ${GW_SOAP_API_KEY:-}
+      GW_SOAP_API_KEY_HEADER: ${GW_SOAP_API_KEY_HEADER:-}
+      GW_SOAP_PATH_PREFIX: ${GW_SOAP_PATH_PREFIX:-}
       GW_BASE_URL: ${GW_BASE_URL:-}
       GW_API_KEY: ${GW_API_KEY:-}
       GW_API_KEY_HEADER: ${GW_API_KEY_HEADER:-X-API-Key}

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   GwConfig,
+  GwTargets,
   IngestBatch,
   LoadProfile,
   RequestResult,
@@ -9,14 +10,22 @@ import type {
   ScenarioClass
 } from "@apigw/shared";
 import {
-  DEFAULT_GW_CONFIG as defaultGw,
+  DEFAULT_GW_TARGETS as defaultGwTargets,
   DEFAULT_LOAD_PROFILE as defaultProfile,
-  sanitizeGwConfig,
+  sanitizeGwTargets,
   sanitizeLoadProfile
 } from "@apigw/shared";
 import { TokenBucket } from "./scheduler.js";
 import { buildSpec, buildBaselineProbe, type ReqSpec, type SpecContext } from "./scenarios.js";
 import { readBasicAuthCreds } from "../auth.js";
+import { SERVER_MS_HEADER } from "../petstore/server.js";
+
+/** Parse the SUT's per-request server-time header; garbage/absent → null. */
+function parseServerMs(raw: string | null): number | null {
+  if (raw === null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
 
 // NOTE on HTTP agents: I benchmarked a tuned undici Agent({ connections: 512,
 // pipelining: 10 }) against Node's built-in fetch dispatcher at 500 concurrent
@@ -47,7 +56,7 @@ export type IngestFn = (batch: IngestBatch) => { ingested: number } | Promise<{ 
  * direct-to-SUT baseline probes (for GW-overhead math), and batched ingest.
  */
 export class Driver {
-  private gw: GwConfig = { ...defaultGw };
+  private gw: GwTargets = { rest: { ...defaultGwTargets.rest }, soap: { ...defaultGwTargets.soap } };
   private profile: LoadProfile = { ...defaultProfile };
   private state: RunState = "idle";
   private runId: string | null = null;
@@ -81,11 +90,13 @@ export class Driver {
   /** Redirect baseline probing (useful in tests and custom setups). */
   setBaselineUrl(url: string): void { this.baselineUrl = url.replace(/\/+$/, ""); }
 
-  get currentGw(): GwConfig { return { ...this.gw }; }
+  get currentGw(): GwTargets {
+    return { rest: { ...this.gw.rest }, soap: { ...this.gw.soap } };
+  }
   get currentProfile(): LoadProfile { return { ...this.profile }; }
 
-  setGw(gw: Partial<GwConfig>): void {
-    this.gw = sanitizeGwConfig({ ...this.gw, ...gw }, this.gw);
+  setGw(gw: unknown): void {
+    this.gw = sanitizeGwTargets(gw, this.gw);
   }
 
   setProfile(profile: Partial<LoadProfile>): void {
@@ -141,7 +152,13 @@ export class Driver {
       if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
       const res = await fetch(url, { method: spec.method, headers, body: spec.body, signal: ac.signal });
       await res.arrayBuffer();
-      return Date.now() - t0;
+      const rtt = Date.now() - t0;
+      // subtract the SUT's own time and batch the remainder (transport + client
+      // stack) across all classes: per-request serverMs covers the class random
+      // variation at run time, so a per-class total-latency baseline would just
+      // re-import the noise we removed
+      const serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
+      return serverMs === null ? rtt : Math.max(0, rtt - serverMs);
     } catch {
       return null;
     } finally {
@@ -149,11 +166,25 @@ export class Driver {
     }
   }
 
+  /** What the SUT cannot tell us: direct-path transport for this class. */
   private baselineFor(cls: ScenarioClass): number {
     const arr = this.baselines.get(cls) ?? [];
     if (arr.length === 0) return 0; // until baseline measured, overhead is unknown → 0
     const sorted = [...arr].sort((a, b) => a - b);
     return sorted[Math.floor(sorted.length * 0.5)] ?? sorted[0] ?? 0;
+  }
+
+  /**
+   * Split a through-gateway latency into backend time and gateway time for the
+   * *same* request. With X-Server-Ms present this is exact: the backend's own
+   * variability (per-request sleeps, chaos, padding) lands in baselineMs and
+   * never in overheadMs. Without it (gateway-generated rejection, or a real SUT
+   * with no header) we fall back to the class baseline as the backend estimate.
+   */
+  private overheadFor(cls: ScenarioClass, latencyMs: number, serverMs: number | null): { baselineMs: number; overheadMs: number } {
+    const backendMs = Math.max(0, serverMs ?? this.baselineFor(cls));
+    const baselineMs = serverMs === null ? backendMs : backendMs + this.baselineFor(cls);
+    return { baselineMs, overheadMs: Math.max(0, latencyMs - baselineMs) };
   }
 
   start(runId: string): { ok: true; runId: string } {
@@ -172,7 +203,7 @@ export class Driver {
     this.ingestAttempts = 0;
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);
     this.tickTimer.unref?.();
-    console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.baseUrl}`);
+    console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.rest.baseUrl}`);
     return { ok: true, runId };
   }
 
@@ -235,7 +266,9 @@ export class Driver {
     this.counters.sent++;
     if (spec.expectInvalid) this.counters.invalidSent++;
 
-    const url = this.buildUrl(spec.path);
+    // REST and SOAP may be fronted at different gateway URLs / API keys
+    const target = spec.protocol === "soap" ? this.gw.soap : this.gw.rest;
+    const url = this.buildUrl(target, spec.path);
     const started = Date.now();
     const ac = new AbortController();
     const budgetMs =
@@ -244,12 +277,15 @@ export class Driver {
     let status = 0;
     let bytesResp = 0;
     let error: string | null = null;
+    /** SUT's own time for this request; null when the response never touched the
+     *  SUT (gateway's own rejection) or a real gateway stripped the header. */
+    let serverMs: number | null = null;
 
     try {
       const headers: Record<string, string> = { ...spec.headers };
       const creds = readBasicAuthCreds();
       if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
-      if (this.gw.apiKey) headers[this.gw.apiKeyHeader || "X-API-Key"] = this.gw.apiKey;
+      if (target.apiKey) headers[target.apiKeyHeader || "X-API-Key"] = target.apiKey;
       const res = await fetch(url, {
         method: spec.method,
         headers,
@@ -257,6 +293,7 @@ export class Driver {
         signal: ac.signal
       });
       status = res.status;
+      serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
       const buf = await res.arrayBuffer();
       bytesResp = buf.byteLength;
 
@@ -290,7 +327,7 @@ export class Driver {
 
     const finished = Date.now();
     const latencyMs = finished - started;
-    const baselineMs = this.baselineFor(spec.class);
+    const { baselineMs, overheadMs } = this.overheadFor(spec.class, latencyMs, serverMs);
 
     this.record({
       runId,
@@ -302,16 +339,16 @@ export class Driver {
       status,
       latencyMs,
       baselineMs,
-      overheadMs: Math.max(0, latencyMs - baselineMs),
+      overheadMs,
       bytesReq: Buffer.byteLength(spec.body ?? ""),
       bytesResp,
       error
     });
   }
 
-  private buildUrl(path: string): string {
-    const base = this.gw.baseUrl.replace(/\/+$/, "");
-    const prefix = this.gw.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
+  private buildUrl(target: GwConfig, path: string): string {
+    const base = target.baseUrl.replace(/\/+$/, "");
+    const prefix = target.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
     return `${base}${prefix ? "/" + prefix : ""}${path}`;
   }
 

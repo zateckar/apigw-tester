@@ -8,7 +8,7 @@ import {
   api, downloadDefinition, fmtBytes, fmtDuration, fmtMs,
   DEFAULT_GW, DEFAULT_PROFILE, type SummaryWindow
 } from "./api";
-import type { GwConfig, LoadProfile, RunEvent } from "./api";
+import type { GwTargets, LoadProfile, RunEvent } from "./api";
 import ConfigDrawer from "./ConfigDrawer";
 
 /** label and summary window are the same value on purpose: the KPI tiles used
@@ -71,10 +71,29 @@ export default function App() {
     onError: (e: Error) => setActionError(e.message)
   });
 
+  const statusMut = {
+    onSuccess: () => { setActionError(null); void qc.invalidateQueries(); },
+    onError: (e: Error) => setActionError(e.message)
+  };
+  const resetMut = useMutation({ mutationFn: api.resetMetrics, ...statusMut });
+  const [pruneDays, setPruneDays] = useState("30");
+  const pruneMut = useMutation({
+    mutationFn: (days: number) => api.pruneRuns(days),
+    onSuccess: (out) => {
+      setActionError(null);
+      setDownloadNote(`Pruned ${out.deleted} run${out.deleted === 1 ? "" : "s"}`);
+      void qc.invalidateQueries();
+    },
+    onError: (e: Error) => setActionError(e.message)
+  });
+
   const status = statusQ.data;
   const summary = summaryQ.data;
   const running = status?.state === "running";
   const gw = gwQ.data ?? status?.gateway ?? DEFAULT_GW;
+  const gwLabel = gw.rest.baseUrl === gw.soap.baseUrl
+    ? `${gw.rest.baseUrl}${gw.rest.pathPrefix || ""}`
+    : `REST ${gw.rest.baseUrl}${gw.rest.pathPrefix || ""} · SOAP ${gw.soap.baseUrl}${gw.soap.pathPrefix || ""}`;
   const profile = profileQ.data ?? status?.profile ?? DEFAULT_PROFILE;
   const loadError = errorOf(statusQ, summaryQ, seriesQ, recentQ, runsQ, gwQ, profileQ);
 
@@ -122,8 +141,8 @@ export default function App() {
             {status?.runId ? ` · ${status.runId}` : ""}
             {status?.uptimeSec != null ? ` · up ${fmtDuration(status.uptimeSec)}` : ""}
           </span>
-          <span className="hint mono" title="Gateway base URL">
-            {gw.baseUrl}{gw.pathPrefix || ""}
+          <span className="hint mono" title="Gateway targets">
+            {gwLabel}
           </span>
         </div>
         <div className="controls">
@@ -287,7 +306,8 @@ export default function App() {
         <h2>API definitions — import these into your gateway</h2>
         <p className="hint">
           The load driver generates traffic that conforms to these documents, so you can switch request
-          and response validation on. Advertised server: <span className="mono">{defsQ.data?.serverUrl ?? gw.baseUrl}</span>
+          and response validation on. Advertised servers: REST <span className="mono">{defsQ.data?.serverUrl ?? gw.rest.baseUrl}</span>
+          {" · "}SOAP <span className="mono">{defsQ.data?.serverUrlSoap ?? gw.soap.baseUrl}</span>
         </p>
         <div className="form-row">
           <button onClick={() => void grab("/api/definitions/openapi.json", "apigw-tester-openapi.json")}>
@@ -431,11 +451,34 @@ export default function App() {
             {(runsQ.data?.length ?? 0) === 0 && <tr><td colSpan={8} className="hint">No runs recorded yet.</td></tr>}
           </tbody>
         </table>
+        <div className="form-row" style={{ marginTop: 12 }}>
+          <label htmlFor="prune-days" className="hint" style={{ alignSelf: "center" }}>Delete runs older than</label>
+          <input id="prune-days" type="number" min={1} max={3650} value={pruneDays}
+                 onChange={(e) => setPruneDays(e.target.value)} style={{ width: 70 }} />
+          <span className="hint" style={{ alignSelf: "center" }}>days</span>
+          <button className="danger" disabled={pruneMut.isPending}
+                  onClick={() => {
+                    const days = Number(pruneDays);
+                    if (!Number.isFinite(days) || days < 1) { setActionError("enter how many days of run history to keep"); return; }
+                    pruneMut.mutate(days);
+                  }}>
+            {pruneMut.isPending ? "Pruning…" : "Prune old runs"}
+          </button>
+          <button className="danger" disabled={running || resetMut.isPending}
+                  title={running ? "stop the run first — its buffered results would be re-inserted after the reset" : undefined}
+                  onClick={() => {
+                    if (window.confirm("Delete ALL metrics (raw requests, roll-ups and run history)? Gateway and profile settings are kept.")) {
+                      resetMut.mutate();
+                    }
+                  }}>
+            {resetMut.isPending ? "Resetting…" : "Reset all metrics"}
+          </button>
+        </div>
       </div>
 
       {drawerOpen && (
         <ConfigDrawer
-          gw={gw as GwConfig}
+          gw={gw as GwTargets}
           profile={profile as LoadProfile}
           onClose={() => {
             setDrawerOpen(false);

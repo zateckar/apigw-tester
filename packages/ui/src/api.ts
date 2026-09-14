@@ -6,6 +6,7 @@ export type {
   ClassStat,
   EndpointStat,
   GwConfig,
+  GwTargets,
   LoadMode,
   LoadProfile,
   MetricSummary,
@@ -19,8 +20,8 @@ export type {
   TimeSeries
 } from "@apigw/shared";
 
-import type { GwConfig, LoadProfile, MetricSummary, RequestResult, RunEvent, RunStatus, TimeSeries } from "@apigw/shared";
-import { DEFAULT_GW_CONFIG, DEFAULT_LOAD_PROFILE, LIMITS } from "@apigw/shared";
+import type { GwConfig, GwTargets, LoadProfile, MetricSummary, RequestResult, RunEvent, RunStatus, TimeSeries } from "@apigw/shared";
+import { DEFAULT_GW_TARGETS, DEFAULT_LOAD_PROFILE, LIMITS } from "@apigw/shared";
 
 /** Windows GET /api/summary accepts. Keep in sync with SUMMARY_WINDOWS in app.ts. */
 export const SUMMARY_WINDOWS = ["5m", "15m", "1h", "6h", "24h", "7d"] as const;
@@ -84,6 +85,7 @@ export interface DefinitionIndex {
   openapiYaml: string;
   wsdl: string;
   serverUrl: string;
+  serverUrlSoap: string;
   note: string;
 }
 
@@ -108,11 +110,11 @@ export const api = {
     req<{ items: RequestResult[] }>(`/api/recent?limit=${Math.min(limit, LIMITS.recentLimit)}`),
   status: () => req<RunStatus>("/api/run/status"),
   runs: () => req<RunEvent[]>("/api/runs"),
-  gateway: () => req<GwConfig>("/api/config/gateway"),
+  gateway: () => req<GwTargets>("/api/config/gateway"),
   profile: () => req<LoadProfile>("/api/config/profile"),
   definitions: () => req<DefinitionIndex>("/api/definitions"),
-  saveGateway: (cfg: GwConfig) =>
-    req<{ saved: true; gateway: GwConfig }>("/api/config/gateway", {
+  saveGateway: (cfg: GwTargets) =>
+    req<{ saved: true; gateway: GwTargets }>("/api/config/gateway", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(cfg)
@@ -125,18 +127,25 @@ export const api = {
     }),
   // probed by the server, not the browser: the dashboard's `connect-src 'self'`
   // CSP blocks any cross-origin fetch, and the gateway is always another origin
-  testGateway: (cfg: GwConfig) =>
+  testGateway: (cfg: GwConfig, protocol: "rest" | "soap" = "rest") =>
     req<GatewayProbe>("/api/config/gateway/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(cfg)
+      body: JSON.stringify({ ...cfg, protocol })
     }),
   startRun: () => req<{ ok: true; runId: string }>("/api/run/start", { method: "POST" }),
-  stopRun: () => req<{ stopped: true }>("/api/run/stop", { method: "POST" })
+  stopRun: () => req<{ stopped: true }>("/api/run/stop", { method: "POST" }),
+  resetMetrics: () => req<{ ok: true }>("/api/metrics/reset", { method: "POST" }),
+  pruneRuns: (olderThanDays: number) =>
+    req<{ deleted: number }>("/api/runs/prune", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ olderThanDays })
+    })
 };
 
 export const DEFAULT_PROFILE: LoadProfile = DEFAULT_LOAD_PROFILE;
-export const DEFAULT_GW: GwConfig = DEFAULT_GW_CONFIG;
+export const DEFAULT_GW: GwTargets = DEFAULT_GW_TARGETS;
 
 export function fmtBytes(n: number): string {
   if (!Number.isFinite(n)) return "—";

@@ -23,6 +23,30 @@ const DEFAULT_SIZES: Record<string, number> = {
  *  bounded so the socket and its timer are always released. */
 const CHAOS_TIMEOUT_MS = LIMITS.delayMs;
 
+/** Response header carrying the SUT's own server-side time for the request,
+ *  entry-to-first-byte. The load driver subtracts it per request, so "GW
+ *  overhead" excludes backend latency — including per-request jitter, chaos
+ *  injection and per-class sleep/size randomness — without guessing from a
+ *  class-median baseline. Absent on responses not issued by the SUT (e.g. a
+ *  gateway's own 401/404), and the driver falls back to its baseline there. */
+export const SERVER_MS_HEADER = "X-Server-Ms";
+
+/** Express middleware stamping SERVER_MS_HEADER at response time. */
+function serverMsStamp(): (req: Request, res: Response, next: NextFunction) => void {
+  return (_req, res, next) => {
+    const enteredAt = Date.now();
+    // patch writeHead so the header survives every response path (json, send,
+    // chunked writes) without touching any handler — 'finish' fires after the
+    // response is written and setHeader is illegal there
+    const writeHead = res.writeHead.bind(res);
+    res.writeHead = function (this: Response, ...args: Parameters<Response["writeHead"]>) {
+      if (!res.headersSent) res.setHeader(SERVER_MS_HEADER, String(Math.max(0, Date.now() - enteredAt)));
+      return writeHead(...args);
+    } as Response["writeHead"];
+    next();
+  };
+}
+
 /** Parse a path parameter that must be a positive integer. */
 export function pathInt(raw: string | undefined): number | null {
   if (raw === undefined || !/^\d+$/.test(raw)) return null;
@@ -51,6 +75,8 @@ export function createApp() {
     endpointKey: string
   ): ((req: Request, res: Response, next: NextFunction) => void) =>
     (req, res, next) => {
+      // stamp X-Server-Ms first, so the entry time counts the simulated delay too
+      serverMsStamp()(req, res, () => undefined);
       // explicit overrides take precedence, both hard-clamped
       const delayHdr = headerInt(req.header("X-Test-Delay-Ms"), LIMITS.delayMs);
       let delayMs =
@@ -178,7 +204,7 @@ export function createApp() {
 
   // ---------- Synthetic stress endpoints (used by the load driver's classes) ----------
   // No variability on top: these are raw paths, so what you measure is the GW.
-  app.get("/api/slow/:ms", (req, res) => {
+  app.get("/api/slow/:ms", serverMsStamp(), (req, res) => {
     const raw = req.params["ms"];
     if (raw === undefined || !/^\d+$/.test(raw)) return bad(res, "ms must be a non-negative integer");
     const ms = Number(raw);
@@ -188,7 +214,7 @@ export function createApp() {
     res.once("close", () => clearTimeout(timer));
   });
 
-  app.get("/api/big/:size", (req, res) => {
+  app.get("/api/big/:size", serverMsStamp(), (req, res) => {
     const raw = req.params["size"];
     if (raw === undefined || !/^\d+$/.test(raw)) return bad(res, "size must be a non-negative integer");
     const size = Number(raw);
@@ -216,7 +242,7 @@ export function createApp() {
     write();
   });
 
-  app.post("/api/echo", (req, res) => {
+  app.post("/api/echo", serverMsStamp(), (req, res) => {
     const raw = req.body as unknown;
     const bytes = Buffer.isBuffer(raw) ? raw.byteLength
       : typeof raw === "string" ? Buffer.byteLength(raw)
