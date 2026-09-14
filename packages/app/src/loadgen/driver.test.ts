@@ -136,7 +136,10 @@ describe("Driver config hardening", () => {
       return new Response("{}", { status: 200 });
     });
     try {
-      d.setProfile({ soapRatioPct: 100 });
+      // invalidRatioPct must be 0, not the default 2: the invalid slice is
+      // picked before the SOAP slice, so one fire() in ~70 would emit a REST
+      // contract violation instead and fail this assertion at random
+      d.setProfile({ soapRatioPct: 100, invalidRatioPct: 0 });
       d.start("run-split");
       await priv(d).fire();
       d.stop();
@@ -221,6 +224,300 @@ describe("GW-overhead pairing (X-Server-Ms)", () => {
       fetchSpy.mockRestore();
       await d.shutdown();
     }
+  });
+});
+
+describe("Driver credential containment", () => {
+  /** Fire one request at `gw` and report the headers that went on the wire. */
+  const headersSentTo = async (gw: Record<string, unknown>, selfUrl?: string): Promise<Record<string, string>> => {
+    const seen: Record<string, string>[] = [];
+    const d = new Driver();
+    d.setIngest((batch) => ({ ingested: batch.results.length }));
+    if (selfUrl) d.setBaselineUrl(selfUrl);
+    d.setGw(gw);
+    d.setProfile({ soapRatioPct: 0, invalidRatioPct: 0 });
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_i, init) => {
+      seen.push((init?.headers ?? {}) as Record<string, string>);
+      return new Response("{}", { status: 200 });
+    });
+    try {
+      d.start("run-creds");
+      await priv(d).fire();
+    } finally {
+      spy.mockRestore();
+      await d.shutdown();
+    }
+    return seen[0] ?? {};
+  };
+
+  it('"auto" withholds our Basic credential from a foreign origin', async () => {
+    // the whole point: an external gateway is a third party. Sending it the
+    // dashboard credential writes our admin password into their access log,
+    // and a gateway doing its own auth may choke on a header it never expected.
+    process.env["APP_BASIC_AUTH"] = "admin:secret";
+    const h = await headersSentTo(
+      { rest: { baseUrl: "http://gw.example.com:9000", forwardBasicAuth: "auto" } },
+      "http://127.0.0.1:8080"
+    );
+    expect(h["authorization"]).toBeUndefined();
+  });
+
+  it('"auto" still authenticates to the bundled petstore on our own origin', async () => {
+    // that target requires the header to answer at all, so out-of-the-box use
+    // must keep working without the operator configuring anything
+    process.env["APP_BASIC_AUTH"] = "admin:secret";
+    const h = await headersSentTo(
+      { rest: { baseUrl: "http://127.0.0.1:8080", forwardBasicAuth: "auto" } },
+      "http://127.0.0.1:8080"
+    );
+    expect(h["authorization"]).toMatch(/^Basic /);
+  });
+
+  it('"always" and "never" override the origin check in both directions', async () => {
+    process.env["APP_BASIC_AUTH"] = "admin:secret";
+    const forced = await headersSentTo(
+      { rest: { baseUrl: "http://gw.example.com:9000", forwardBasicAuth: "always" } },
+      "http://127.0.0.1:8080"
+    );
+    expect(forced["authorization"]).toMatch(/^Basic /);
+
+    const withheld = await headersSentTo(
+      { rest: { baseUrl: "http://127.0.0.1:8080", forwardBasicAuth: "never" } },
+      "http://127.0.0.1:8080"
+    );
+    expect(withheld["authorization"]).toBeUndefined();
+  });
+
+  it("tags every request for correlation with the gateway's own logs", async () => {
+    const h = await headersSentTo({ rest: { baseUrl: "http://gw.example.com:9000" } });
+    expect(h["x-request-id"]).toMatch(/^[0-9a-f]{32}$/);
+    // W3C trace context: version-traceid-spanid-flags, neither id all-zero
+    expect(h["traceparent"]).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    const [, traceId, spanId] = (h["traceparent"] as string).split("-");
+    expect(traceId).toBe(h["x-request-id"]);
+    expect(spanId).not.toBe("0".repeat(16));
+  });
+
+  it("issues a distinct id per request", async () => {
+    const d = new Driver();
+    const ids = new Set<string>();
+    d.setIngest((batch) => {
+      for (const r of batch.results) ids.add(r.requestId);
+      return { ingested: batch.results.length };
+    });
+    d.setProfile({ soapRatioPct: 0, invalidRatioPct: 0 });
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", { status: 200 }));
+    try {
+      d.start("run-ids");
+      for (let i = 0; i < 25; i++) await priv(d).fire();
+      await priv(d).flush();
+      expect(ids.size).toBe(25);
+    } finally {
+      spy.mockRestore();
+      await d.shutdown();
+    }
+  });
+});
+
+describe("Driver outcome accounting", () => {
+  /** Fire `n` requests against a canned response and return the run counters. */
+  const runAgainst = async (
+    res: () => Response,
+    profile: Record<string, unknown> = { soapRatioPct: 0, invalidRatioPct: 0 },
+    n = 4
+  ) => {
+    const d = new Driver();
+    const results: { status: number; reachedBackend: boolean }[] = [];
+    d.setIngest((batch) => {
+      for (const r of batch.results) results.push({ status: r.status, reachedBackend: r.reachedBackend });
+      return { ingested: batch.results.length };
+    });
+    d.setProfile(profile as never);
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => res());
+    try {
+      d.start("run-outcome");
+      for (let i = 0; i < n; i++) await priv(d).fire();
+      await priv(d).flush();
+      return { counters: d.status().counters, results };
+    } finally {
+      spy.mockRestore();
+      await d.shutdown();
+    }
+  };
+
+  it("does not count a 401 as a success", async () => {
+    // regression: `status < 500` meant ok++, so a gateway rejecting every
+    // request on a bad API key reported a flawless run with a 0% error rate
+    const { counters } = await runAgainst(() => new Response("no", { status: 401 }));
+    expect(counters.ok).toBe(0);
+    expect(counters.clientErrors).toBe(4);
+    expect(counters.unauthorized).toBe(4);
+  });
+
+  it("surfaces rate limiting on its own", async () => {
+    // a run that trips the gateway's quota has meaningless latency numbers;
+    // 429 must be visible rather than folded into a generic bucket
+    const { counters } = await runAgainst(() => new Response("slow down", { status: 429 }));
+    expect(counters.ok).toBe(0);
+    expect(counters.rateLimited).toBe(4);
+    expect(counters.clientErrors).toBe(4);
+  });
+
+  it("separates the gateway's own faults from backend errors", async () => {
+    const upstreamDown = await runAgainst(() => new Response("bad gateway", { status: 502 }));
+    expect(upstreamDown.counters.gatewayErrors).toBe(4);
+    expect(upstreamDown.counters.errors).toBe(4);
+
+    const appBroke = await runAgainst(() => new Response("boom", { status: 500 }));
+    expect(appBroke.counters.gatewayErrors).toBe(0);
+    expect(appBroke.counters.errors).toBe(4);
+  });
+
+  it("marks a response as backend-reached only when it carries X-Server-Ms", async () => {
+    const proxied = await runAgainst(
+      () => new Response("{}", { status: 200, headers: { "x-server-ms": "12" } })
+    );
+    expect(proxied.results.every((r) => r.reachedBackend)).toBe(true);
+
+    const gatewayMade = await runAgainst(() => new Response("{}", { status: 200 }));
+    expect(gatewayMade.results.every((r) => !r.reachedBackend)).toBe(true);
+  });
+
+  it("credits an invalid request's rejection to whoever actually made it", async () => {
+    // the bundled SUT validates too, so "answered 4xx" alone proves nothing
+    // about the gateway. X-Server-Ms is the tie-breaker.
+    const invalidOnly = { soapRatioPct: 0, invalidRatioPct: 100 };
+
+    const blockedByGw = await runAgainst(() => new Response("nope", { status: 400 }), invalidOnly);
+    expect(blockedByGw.counters.invalidSent).toBe(4);
+    expect(blockedByGw.counters.invalidRejectedByGateway).toBe(4);
+    expect(blockedByGw.counters.invalidLeaked).toBe(0);
+
+    // same 400 — but the backend's fingerprint proves the gateway passed it on
+    const caughtByBackend = await runAgainst(
+      () => new Response("nope", { status: 400, headers: { "x-server-ms": "3" } }),
+      invalidOnly
+    );
+    expect(caughtByBackend.counters.invalidRejectedByGateway).toBe(0);
+    expect(caughtByBackend.counters.invalidLeaked).toBe(4);
+  });
+});
+
+describe("Driver load-shed accounting", () => {
+  it("records the load the concurrency cap stopped us issuing", async () => {
+    // coordinated omission: a throttled run quietly delivers less than the
+    // target and the latency chart looks better for it. The shed has to reach
+    // the store, or a window can report health it never actually tested.
+    const d = new Driver();
+    const batches: { dropped: number; targetSum: number; ticks: number }[] = [];
+    d.setIngest((batch) => {
+      for (const s of batch.shed ?? []) batches.push({ dropped: s.dropped, targetSum: s.targetSum, ticks: s.ticks });
+      return { ingested: batch.results.length };
+    });
+    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 10 });
+    d.start("run-shed");
+    // pin in-flight at the ceiling so every due token is shed
+    priv(d).effectiveMaxConcurrency = 10;
+    priv(d).inFlight = 10;
+    priv(d).tick();        // primes the bucket's clock; nothing is due yet
+    await sleep(150);      // ~75 tokens accrue at 500 rps
+    priv(d).tick();
+
+    expect(d.status().counters.droppedRequests).toBeGreaterThan(0);
+    // a final flush drains the still-open minute too
+    await priv(d).flush(true);
+    expect(batches.length).toBeGreaterThan(0);
+    const total = batches.reduce((a, b) => a + b.dropped, 0);
+    expect(total).toBe(d.status().counters.droppedRequests);
+    // the target is recorded even on ticks that issued nothing — without the
+    // denominator the shed count is a bare number nobody can size
+    expect(batches.reduce((a, b) => a + b.ticks, 0)).toBeGreaterThan(0);
+    expect(batches.reduce((a, b) => a + b.targetSum, 0)).toBeGreaterThan(0);
+    priv(d).inFlight = 0;
+    await d.shutdown();
+  });
+
+  it("keeps the accounting when a flush fails, rather than losing it", async () => {
+    const d = new Driver();
+    let fail = true;
+    const seen: number[] = [];
+    d.setIngest((batch) => {
+      if (fail) throw new Error("store unavailable");
+      for (const s of batch.shed ?? []) seen.push(s.dropped);
+      return { ingested: batch.results.length };
+    });
+    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 10 });
+    d.start("run-shed-retry");
+    priv(d).effectiveMaxConcurrency = 10;
+    priv(d).inFlight = 10;
+    priv(d).tick();
+    await sleep(150);
+    priv(d).tick();
+    const dropped = d.status().counters.droppedRequests;
+    expect(dropped).toBeGreaterThan(0);
+
+    await priv(d).flush(true);   // rejected — must be held, not discarded
+    expect(seen).toEqual([]);
+    fail = false;
+    await priv(d).flush(true);
+    expect(seen.reduce((a, b) => a + b, 0)).toBe(dropped);
+    priv(d).inFlight = 0;
+    await d.shutdown();
+  });
+
+  it("holds the open minute back until the run ends", async () => {
+    // a mid-run flush must not publish a bucket that is still filling, or the
+    // same minute would be reported twice with different totals
+    const d = new Driver();
+    const flushed: number[] = [];
+    d.setIngest((batch) => {
+      for (const s of batch.shed ?? []) flushed.push(s.bucketTs);
+      return { ingested: batch.results.length };
+    });
+    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 10 });
+    d.start("run-open-bucket");
+    priv(d).effectiveMaxConcurrency = 10;
+    priv(d).inFlight = 10;
+    priv(d).tick();
+
+    await priv(d).flush();       // ordinary flush: open bucket stays behind
+    expect(flushed).toEqual([]);
+    await priv(d).flush(true);   // final flush: it goes
+    expect(flushed.length).toBe(1);
+    priv(d).inFlight = 0;
+    await d.shutdown();
+  });
+});
+
+describe("Driver bounded runs", () => {
+  it("stops itself once durationMinutes has elapsed", async () => {
+    const d = new Driver();
+    const stopped: (string | null)[] = [];
+    d.setIngest((batch) => ({ ingested: batch.results.length }));
+    d.onAutoStop((runId) => stopped.push(runId));
+    d.setProfile({ mode: "constant", rps: 0, durationMinutes: 10 });
+    d.start("run-bounded");
+    // rewind the clock past the limit rather than waiting ten minutes
+    priv(d).startedAt = Date.now() - 11 * 60_000;
+    priv(d).tick();
+
+    expect(stopped).toEqual(["run-bounded"]);
+    expect(priv(d).state).not.toBe("running");
+    await d.shutdown();
+  });
+
+  it("runs indefinitely when no duration is set", async () => {
+    const d = new Driver();
+    const stopped: (string | null)[] = [];
+    d.setIngest((batch) => ({ ingested: batch.results.length }));
+    d.onAutoStop((runId) => stopped.push(runId));
+    d.setProfile({ mode: "constant", rps: 0, durationMinutes: 0 });
+    d.start("run-forever");
+    priv(d).startedAt = Date.now() - 30 * 24 * 60 * 60_000;
+    priv(d).tick();
+    expect(stopped).toEqual([]);
+    expect(priv(d).state).toBe("running");
+    await d.shutdown();
   });
 });
 

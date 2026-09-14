@@ -4,25 +4,40 @@ import { getCreds, setCreds } from "./main";
 // all of them, which let the two drift apart silently.
 export type {
   ClassStat,
+  ContractStats,
   EndpointStat,
+  ForwardBasicAuth,
   GwConfig,
   GwTargets,
   LoadMode,
   LoadProfile,
   MetricSummary,
+  PolicyConfig,
+  PolicyId,
+  PolicyResult,
+  PolicyState,
   Protocol,
   RequestResult,
   RunEvent,
+  RunReport,
   RunStatus,
   ScenarioClass,
   ScenarioWeights,
+  SloThresholds,
+  StatusBreakdown,
+  StatusBucket,
   SystemMetrics,
   SystemSample,
   TimePoint,
-  TimeSeries
+  TimeSeries,
+  VerdictState,
+  WindowValidity
 } from "@apigw/shared";
 
-import type { GwConfig, GwTargets, LoadProfile, MetricSummary, RequestResult, RunEvent, RunStatus, SystemMetrics, TimeSeries } from "@apigw/shared";
+import type {
+  GwConfig, GwTargets, LoadProfile, MetricSummary, PolicyConfig, PolicyResult,
+  RequestResult, RunEvent, RunReport, RunStatus, SloThresholds, SystemMetrics, TimeSeries
+} from "@apigw/shared";
 import { DEFAULT_GW_TARGETS, DEFAULT_LOAD_PROFILE, LIMITS } from "@apigw/shared";
 
 /** Windows GET /api/summary accepts. Keep in sync with SUMMARY_WINDOWS in app.ts. */
@@ -96,6 +111,9 @@ export interface GatewayProbe {
   ok: boolean;
   url: string;
   latencyMs: number;
+  /** whether the probe carried this rig's Basic credential — without it a 401
+   *  means "we sent nothing", not "the gateway rejected your key" */
+  sentBasicAuth: boolean;
   status?: number;
   error?: string;
 }
@@ -136,6 +154,22 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...cfg, protocol })
     }),
+  policy: () => req<{ config: PolicyConfig; results: PolicyResult[] }>("/api/policy"),
+  savePolicy: (cfg: PolicyConfig) =>
+    req<{ saved: true; config: PolicyConfig }>("/api/policy", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg)
+    }),
+  runPolicy: () => req<{ started: true }>("/api/policy/run", { method: "POST" }),
+  slo: () => req<SloThresholds>("/api/config/slo"),
+  saveSlo: (slo: SloThresholds) =>
+    req<{ saved: true; slo: SloThresholds }>("/api/config/slo", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(slo)
+    }),
+  report: (runId: string) => req<RunReport>(`/api/runs/${encodeURIComponent(runId)}/report`),
   startRun: () => req<{ ok: true; runId: string }>("/api/run/start", { method: "POST" }),
   stopRun: () => req<{ stopped: true }>("/api/run/stop", { method: "POST" }),
   resetMetrics: () => req<{ ok: true }>("/api/metrics/reset", { method: "POST" }),

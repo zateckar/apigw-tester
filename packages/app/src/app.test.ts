@@ -2,7 +2,7 @@ import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { type AddressInfo } from "node:net";
 import { buildApp } from "./app.js";
 import { readConfig } from "./config.js";
-import type { RequestResult, SystemMetrics } from "@apigw/shared";
+import { POLICY_LIMITS, type RequestResult, type SystemMetrics } from "@apigw/shared";
 
 // Auth: tests run with a fixed known credential
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
@@ -176,11 +176,30 @@ describe("apigw-tester app (auth protected)", () => {
 
   it("gateway config round-trip", async () => {
     const cfg = {
-      rest: { baseUrl: "http://example.test", apiKey: "k", apiKeyHeader: "X-Key", pathPrefix: "/gw" },
-      soap: { baseUrl: "http://soap.example.test", apiKey: "s", apiKeyHeader: "X-Soap-Key", pathPrefix: "" }
+      rest: { baseUrl: "http://example.test", apiKey: "k", apiKeyHeader: "X-Key", pathPrefix: "/gw", forwardBasicAuth: "never" },
+      soap: { baseUrl: "http://soap.example.test", apiKey: "s", apiKeyHeader: "X-Soap-Key", pathPrefix: "", forwardBasicAuth: "always" }
     };
     await authed("/api/config/gateway", { method: "PUT", body: JSON.stringify(cfg) });
     expect(await (await authed("/api/config/gateway")).json()).toEqual(cfg);
+  });
+
+  it("never probes a foreign gateway with our own Basic credential", async () => {
+    // the probe box takes an arbitrary operator-supplied URL; under "auto" it
+    // must not become a way to post the dashboard credential to a third party
+    const probe = async (forwardBasicAuth: string) => {
+      const r = await authed("/api/config/gateway/test", {
+        method: "POST",
+        body: JSON.stringify({
+          baseUrl: "http://127.0.0.1:1", apiKey: "", apiKeyHeader: "X-API-Key",
+          pathPrefix: "", forwardBasicAuth
+        })
+      });
+      return (await r.json()) as { sentBasicAuth: boolean };
+    };
+    expect((await probe("auto")).sentBasicAuth).toBe(false);
+    expect((await probe("never")).sentBasicAuth).toBe(false);
+    // explicit opt-in still works, for a gateway that expects to pass it through
+    expect((await probe("always")).sentBasicAuth).toBe(true);
   });
 
   it("rejects anonymous callers before parsing their body", async () => {
@@ -461,6 +480,55 @@ describe("apigw-tester app (auth protected)", () => {
     expect(r.status).toBe(409);
     await authed("/api/run/stop", { method: "POST" });
     expect((await authed("/api/metrics/reset", { method: "POST" })).status).toBe(200);
+  });
+
+  it("refuses an on-demand policy pass while probing is disabled", async () => {
+    // otherwise the caller gets a 202 and waits for results that will never come
+    await authed("/api/policy", { method: "PUT", body: JSON.stringify({ enabled: false }) });
+    const off = await authed("/api/policy/run", { method: "POST" });
+    expect(off.status).toBe(409);
+    expect((await off.json()).error).toMatch(/disabled/);
+
+    const saved = await authed("/api/policy", {
+      method: "PUT",
+      body: JSON.stringify({ enabled: true, intervalSec: 1, required: ["rate-limit", "not-a-policy"] })
+    });
+    const cfg = (await saved.json()).config;
+    // the interval is clamped and the unknown id dropped, rather than stored raw
+    expect(cfg.intervalSec).toBe(POLICY_LIMITS.minIntervalSec);
+    expect(cfg.required).toEqual(["rate-limit"]);
+    await authed("/api/policy", { method: "PUT", body: JSON.stringify({ enabled: false }) });
+  });
+
+  it("round-trips SLO thresholds and keeps 'not asserted' distinct from zero", async () => {
+    const r = await authed("/api/config/slo", {
+      method: "PUT",
+      body: JSON.stringify({ maxOverheadP95Ms: null, maxUnexpectedFailurePct: 0, maxLeakedToBackend: 5 })
+    });
+    const slo = (await r.json()).slo;
+    expect(slo.maxOverheadP95Ms).toBeNull();
+    expect(slo.maxUnexpectedFailurePct).toBe(0);
+    expect(slo.maxLeakedToBackend).toBe(5);
+    expect((await (await authed("/api/config/slo")).json()).maxLeakedToBackend).toBe(5);
+    expect((await authed("/api/config/slo", { method: "PUT", body: "[]" })).status).toBe(400);
+  });
+
+  it("reports on a finished run and 404s an unknown one", async () => {
+    const started = (await (await authed("/api/run/start", { method: "POST", body: "{}" })).json()) as { runId: string };
+    await authed("/api/run/stop", { method: "POST" });
+
+    const report = await (await authed(`/api/runs/${started.runId}/report`)).json();
+    expect(report.runId).toBe(started.runId);
+    expect(["pass", "fail", "inconclusive"]).toContain(report.verdict.state);
+    expect(report.gateway.rest.apiKey === "" || report.gateway.rest.apiKey === "[redacted]").toBe(true);
+
+    const md = await authed(`/api/runs/${started.runId}/report.md`);
+    expect(md.headers.get("content-type")).toContain("text/markdown");
+    expect(md.headers.get("content-disposition")).toContain(`${started.runId}-report.md`);
+    expect(await md.text()).toContain("# Gateway test report");
+
+    expect((await authed("/api/runs/nope/report")).status).toBe(404);
+    expect((await authed("/api/runs/nope/report.md")).status).toBe(404);
   });
 
   it("prunes old runs and rejects nonsense day counts", async () => {

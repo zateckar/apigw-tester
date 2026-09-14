@@ -1,10 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type {
   GwConfig,
   GwTargets,
   IngestBatch,
   LoadProfile,
+  LoadShedSample,
   RequestResult,
+  RunCounters,
   RunState,
   RunStatus,
   ScenarioClass
@@ -12,7 +14,10 @@ import type {
 import {
   DEFAULT_GW_TARGETS as defaultGwTargets,
   DEFAULT_LOAD_PROFILE as defaultProfile,
+  EMPTY_RUN_COUNTERS,
   LIMITS,
+  isGatewayFault,
+  isSuccess,
   sanitizeGwTargets,
   sanitizeLoadProfile
 } from "@apigw/shared";
@@ -22,12 +27,56 @@ import {
 } from "./scenarios.js";
 import { expectedAuthHeader } from "../auth.js";
 import { SERVER_MS_HEADER } from "../petstore/server.js";
+import { probeContext, type ProbeContext } from "./policy.js";
 
 /** Parse the SUT's per-request server-time header; garbage/absent → null. */
 function parseServerMs(raw: string | null): number | null {
   if (raw === null) return null;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * Per-request correlation ids for the hot path.
+ *
+ * Every generated request carries `X-Request-Id` and a W3C `traceparent`, so a
+ * slow row in the dashboard can be looked up in the gateway's own access log or
+ * trace backend — without that, "the gateway added 800 ms to some requests" is
+ * unactionable.
+ *
+ * randomUUID() per request costs real CPU at a few thousand rps, and that CPU is
+ * charged to the very latency being measured. A run instead draws one random
+ * prefix at start and appends a counter: unique within and across runs,
+ * monotonic (so id order matches send order in a gateway log), and near-free.
+ */
+class RequestIds {
+  /** 12 hex chars, first nibble forced non-zero so derived span ids are valid */
+  private prefix = "100000000000";
+  private seq = 0;
+
+  reset(): void {
+    const hex = randomBytes(6).toString("hex");
+    this.prefix = (hex[0] === "0" ? "1" : (hex[0] as string)) + hex.slice(1);
+    this.seq = 0;
+  }
+
+  /**
+   * A 32-hex-char id usable verbatim as a W3C trace-id, plus the traceparent
+   * header built from it. The span id mixes run entropy with the counter so it
+   * is neither all-zero (which the spec forbids) nor repeated across runs.
+   */
+  next(): { requestId: string; traceparent: string } {
+    const seqHex = (++this.seq).toString(16).padStart(20, "0");
+    const traceId = this.prefix + seqHex;
+    const spanId = this.prefix.slice(0, 4) + seqHex.slice(-12);
+    return { requestId: traceId, traceparent: `00-${traceId}-${spanId}-01` };
+  }
+}
+
+/** Origin of a URL, or null when it will not parse. Used to decide whether a
+ *  target is this very process (and may therefore see our own credential). */
+function originOf(url: string): string | null {
+  try { return new URL(url).origin; } catch { return null; }
 }
 
 // NOTE on HTTP agents: I benchmarked a tuned undici Agent({ connections: 512,
@@ -88,6 +137,8 @@ const DRAIN_POLL_MS = 250;
 const MAX_TRACKED_IDS = 2_000;
 /** give up on a batch the store keeps refusing, rather than wedging the spool */
 const MAX_INGEST_ATTEMPTS = 3;
+/** per-minute scheduler buckets held before a flush; bounded like the spool */
+const MAX_SHED_BUCKETS = 2_000;
 /** raise the concurrency ceiling to hold 5s worth of peak load: Little's law
  *  (rate × latency) says that is how much in-flight the target rate needs at
  *  5s mean latency — generous, most targets answer far faster */
@@ -120,8 +171,13 @@ export class Driver {
   private inFlight = 0;
   private seedId = 120; // ids <= this are seeded by the petstore and never evicted
   private createdIds: number[] = [];
-  private counters = { sent: 0, ok: 0, errors: 0, timeouts: 0, invalidSent: 0, invalidRejected: 0 };
+  private counters: RunCounters = { ...EMPTY_RUN_COUNTERS };
+  private ids = new RequestIds();
   private spool: RequestResult[] = [];
+  /** per-minute scheduler accounting awaiting the next flush */
+  private shed = new Map<number, LoadShedSample>();
+  /** called when durationMinutes elapses, so the run can be closed out */
+  private onDurationReached: ((runId: string | null) => void) | null = null;
   private targetRps = 0;
   private effectiveMaxConcurrency = defaultProfile.maxConcurrency;
   private throttleTicks = 0;          // consecutive ticks capped by concurrency headroom
@@ -140,20 +196,33 @@ export class Driver {
     rest: this.urlPrefixFor(this.gw.rest),
     soap: this.urlPrefixFor(this.gw.soap)
   };
+  /**
+   * Whether each target may receive this rig's own `Authorization: Basic …`.
+   * Resolved from GwConfig.forwardBasicAuth whenever the config changes — see
+   * `sendsOurCredential`. Never send the dashboard credential to a third-party
+   * gateway: it lands in their access log, and a gateway doing its own auth may
+   * reject or rewrite a header it did not expect.
+   */
+  private forwardAuth: { rest: boolean; soap: boolean } = { rest: false, soap: false };
   /** cached "Basic …" header string for the creds in effect when this run
    *  started; re-reading + re-encoding env per request is a per-run constant
    *  and was charged to a few thousand requests */
   private authHeader: string | null = null;
 
-  // baseline endpoint: which host to hit directly for class-level baselines
+  // baseline endpoint: which host to hit directly for class-level baselines.
+  // Doubles as "which origin is us", for forwardBasicAuth: "auto".
   private baselineUrl = "http://127.0.0.1:8080";
   // per-class baselines from direct calls — used to compute GW overhead per request
   private baselines = new Map<ScenarioClass, number[]>();
 
   private ingestFn: IngestFn | null = null;
 
-  /** Redirect baseline probing (useful in tests and custom setups). */
-  setBaselineUrl(url: string): void { this.baselineUrl = url.replace(/\/+$/, ""); }
+  /** Redirect baseline probing (useful in tests and custom setups). Also
+   *  defines "us" for forwardBasicAuth: "auto", so it must be re-resolved. */
+  setBaselineUrl(url: string): void {
+    this.baselineUrl = url.replace(/\/+$/, "");
+    this.refreshUrlPrefixes();
+  }
 
   get currentGw(): GwTargets {
     return { rest: { ...this.gw.rest }, soap: { ...this.gw.soap } };
@@ -172,6 +241,12 @@ export class Driver {
   /** Wire the ingest function (in-process, called from the metrics module). */
   setIngest(fn: IngestFn): void {
     this.ingestFn = fn;
+  }
+
+  /** Notified when a bounded run hits its durationMinutes and stops itself, so
+   *  the caller can record the stop exactly as a manual one would. */
+  onAutoStop(fn: (runId: string | null) => void): void {
+    this.onDurationReached = fn;
   }
 
   private get ctx(): SpecContext {
@@ -264,13 +339,15 @@ export class Driver {
     this.startedAt = Date.now();
     this.stoppedAt = null;
     this.bucket = new TokenBucket();
-    this.counters = { sent: 0, ok: 0, errors: 0, timeouts: 0, invalidSent: 0, invalidRejected: 0 };
+    this.counters = { ...EMPTY_RUN_COUNTERS };
+    this.ids.reset();
     this.errLogBudget = 30;
     this.ingestAttempts = 0;
     this.throttleTicks = 0;
     this.throttledSinceMs = null;
     this.lastThrottleWarnMs = 0;
     this.droppedTokens = 0;
+    this.shed.clear();
     this.refreshUrlPrefixes();
     // the creds are constant for the run; refresh them here instead of per request
     this.authHeader = expectedAuthHeader()?.toString("utf-8") ?? null;
@@ -292,6 +369,17 @@ export class Driver {
     this.tickTimer = setInterval(() => this.tick(), TICK_MS);
     this.tickTimer.unref?.();
     console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.rest.baseUrl}`);
+    // An operator who sets "always" against an external gateway is choosing to
+    // hand it the dashboard credential. Say so once per run rather than doing
+    // it silently.
+    for (const side of ["rest", "soap"] as const) {
+      if (this.forwardAuth[side] && originOf(this.gw[side].baseUrl) !== originOf(this.baselineUrl)) {
+        console.warn(
+          `[driver] forwarding this rig's Basic credential to the external ${side.toUpperCase()} target` +
+          ` ${this.gw[side].baseUrl} (forwardBasicAuth="${this.gw[side].forwardBasicAuth}")`
+        );
+      }
+    }
     return { ok: true, runId };
   }
 
@@ -319,9 +407,14 @@ export class Driver {
       this.runId = null;
       this.startedAt = null;
       this.stoppedAt = null;
-      console.log(`[driver] run ${runId} stopped, sent=${this.counters.sent} ok=${this.counters.ok} errors=${this.counters.errors}`);
-      // hand whatever we collected to the store rather than dropping it
-      void this.flush();
+      const c = this.counters;
+      console.log(
+        `[driver] run ${runId} stopped, sent=${c.sent} ok=${c.ok} 4xx=${c.clientErrors}` +
+        ` errors=${c.errors} gwFaults=${c.gatewayErrors} 429=${c.rateLimited} 401/403=${c.unauthorized}`
+      );
+      // hand whatever we collected to the store rather than dropping it —
+      // including the partial minute's scheduler accounting
+      void this.flush(true);
     };
     this.drainTimer = setTimeout(drain, DRAIN_POLL_MS);
     this.drainTimer.unref?.();
@@ -330,12 +423,25 @@ export class Driver {
 
   private tick(): void {
     if (this.state !== "running" || this.startedAt === null) return;
-    const { due, targetRps } = this.bucket.tick(Date.now(), this.profile, this.startedAt);
+    const now = Date.now();
+    // An acceptance run is bounded: stop on time and let the caller collect a
+    // report, rather than running until somebody remembers to press stop.
+    const limitMin = this.profile.durationMinutes ?? 0;
+    if (limitMin > 0 && now - this.startedAt >= limitMin * 60_000) {
+      console.log(`[driver] run ${this.runId} reached its ${limitMin} minute limit — stopping`);
+      this.onDurationReached?.(this.runId);
+      this.stop();
+      return;
+    }
+    const { due, targetRps } = this.bucket.tick(now, this.profile, this.startedAt);
     this.targetRps = targetRps;
+    this.noteSchedulerTick(now, targetRps);
     const headroom = Math.max(0, this.effectiveMaxConcurrency - this.inFlight);
     const cap = Math.min(due, headroom);
     const dropped = due - cap;
     if (dropped > 0) {
+      this.counters.droppedRequests += dropped;
+      this.noteShed(now, dropped);
       // the target rate asks for more than the ceiling can accept: sustained
       // saturation means real latency outgrew the allowance, so we throttle
       // — surface it rather than silently delivering less than the target
@@ -358,6 +464,38 @@ export class Driver {
     }
   }
 
+  /**
+   * Per-minute scheduler accounting, flushed with the next metrics batch.
+   *
+   * Recording the *target* every tick — not just the drops — is what lets a
+   * window say "you asked for 500 rps and we delivered 340". Without the
+   * denominator, shed load is a bare number nobody can size.
+   */
+  private noteSchedulerTick(nowMs: number, targetRps: number): void {
+    const b = this.shedBucket(nowMs);
+    b.targetSum += targetRps;
+    b.ticks++;
+  }
+
+  private noteShed(nowMs: number, dropped: number): void {
+    this.shedBucket(nowMs).dropped += dropped;
+  }
+
+  private shedBucket(nowMs: number): LoadShedSample {
+    const bucketTs = Math.floor(nowMs / 60_000) * 60_000;
+    let b = this.shed.get(bucketTs);
+    if (!b) {
+      // bounded like the result spool: a store that keeps refusing batches must
+      // not let this grow without limit either
+      if (this.shed.size >= MAX_SHED_BUCKETS) {
+        const oldest = this.shed.keys().next();
+        if (!oldest.done) this.shed.delete(oldest.value);
+      }
+      this.shed.set(bucketTs, (b = { bucketTs, dropped: 0, targetSum: 0, ticks: 0 }));
+    }
+    return b;
+  }
+
   private trackCreatedId(id: number): void {
     this.createdIds.push(id);
     if (this.createdIds.length > MAX_TRACKED_IDS) this.createdIds.shift();
@@ -375,8 +513,10 @@ export class Driver {
     if (spec.expectInvalid) this.counters.invalidSent++;
 
     // REST and SOAP may be fronted at different gateway URLs / API keys
-    const target = spec.protocol === "soap" ? this.gw.soap : this.gw.rest;
-    const url = (spec.protocol === "soap" ? this.urlPrefix.soap : this.urlPrefix.rest) + spec.path;
+    const soap = spec.protocol === "soap";
+    const target = soap ? this.gw.soap : this.gw.rest;
+    const url = (soap ? this.urlPrefix.soap : this.urlPrefix.rest) + spec.path;
+    const { requestId, traceparent } = this.ids.next();
     const started = Date.now();
     const ac = new AbortController();
     const budgetMs =
@@ -391,7 +531,11 @@ export class Driver {
 
     try {
       const headers: Record<string, string> = { ...spec.headers };
-      if (this.authHeader) headers["authorization"] = this.authHeader;
+      headers["x-request-id"] = requestId;
+      headers["traceparent"] = traceparent;
+      if (this.authHeader && (soap ? this.forwardAuth.soap : this.forwardAuth.rest)) {
+        headers["authorization"] = this.authHeader;
+      }
       if (target.apiKey) headers[target.apiKeyHeader || "X-API-Key"] = target.apiKey;
       const res = await fetch(url, {
         method: spec.method,
@@ -413,18 +557,36 @@ export class Driver {
           if (typeof parsed.id === "number" && Number.isSafeInteger(parsed.id)) this.trackCreatedId(parsed.id);
         } catch { /* padded or proxied into something unparsable — ignore */ }
       }
-      if (spec.expectInvalid && status >= 400 && status < 500) this.counters.invalidRejected++;
+      // `X-Server-Ms` is the backend's fingerprint: present means the request
+      // got all the way through. For the invalid slice that is the whole
+      // question — a 4xx without it is the GATEWAY rejecting the request, a 4xx
+      // with it means the gateway let a contract violation past and only the
+      // backend caught it.
+      if (spec.expectInvalid) {
+        if (serverMs !== null) this.counters.invalidLeaked++;
+        else if (status >= 400 && status < 500) this.counters.invalidRejectedByGateway++;
+      }
 
-      if (status < 500) this.counters.ok++;
-      else this.counters.errors++;
+      // A 4xx is not a success. A gateway answering 401 on a bad key, or 429
+      // once its quota trips, used to land in `ok` and report a flawless run.
+      if (isSuccess(status)) this.counters.ok++;
+      else if (status >= 500) this.counters.errors++;
+      else this.counters.clientErrors++;
+      if (isGatewayFault(status)) this.counters.gatewayErrors++;
+      if (status === 429) this.counters.rateLimited++;
+      if (status === 401 || status === 403) this.counters.unauthorized++;
     } catch (e) {
       const err = e as Error;
+      // No response at all. Both branches are failures — a timeout used to
+      // increment only `timeouts`, so a gateway that hung on every request
+      // reported zero errors alongside zero successes.
+      this.counters.errors++;
+      this.counters.gatewayErrors++;
       if (err.name === "AbortError" || ac.signal.aborted) {
         error = "timeout/abort";
         this.counters.timeouts++;
       } else {
         error = err.message;
-        this.counters.errors++;
       }
       if (this.errLogBudget > 0) {
         this.errLogBudget--;
@@ -441,6 +603,7 @@ export class Driver {
 
     this.record({
       runId,
+      requestId,
       ts: started,
       protocol: spec.protocol,
       endpoint: spec.endpoint,
@@ -452,6 +615,7 @@ export class Driver {
       overheadMs,
       bytesReq: spec.class === "big-request" ? bigRequestBytes(spec.body) : Buffer.byteLength(spec.body ?? ""),
       bytesResp,
+      reachedBackend: serverMs !== null,
       error
     });
   }
@@ -463,8 +627,29 @@ export class Driver {
     return prefix ? `${base}/${prefix}` : base;
   }
 
+  /**
+   * Whether this target gets our `Authorization: Basic …`.
+   *
+   * "auto" — the default — forwards only to our own origin, i.e. the bundled
+   * petstore, which requires the header to answer at all. A real gateway is by
+   * definition a different origin and gets nothing: that stops the dashboard
+   * credential from being written into a third party's logs and stops a header
+   * the gateway did not ask for from confusing its own auth.
+   */
+  private sendsOurCredential(target: GwConfig): boolean {
+    switch (target.forwardBasicAuth) {
+      case "always": return true;
+      case "never": return false;
+      default: return this.isSelf(target);
+    }
+  }
+
   private refreshUrlPrefixes(): void {
     this.urlPrefix = { rest: this.urlPrefixFor(this.gw.rest), soap: this.urlPrefixFor(this.gw.soap) };
+    this.forwardAuth = {
+      rest: this.sendsOurCredential(this.gw.rest),
+      soap: this.sendsOurCredential(this.gw.soap)
+    };
   }
 
   private record(r: RequestResult): void {
@@ -475,19 +660,29 @@ export class Driver {
     this.spool.push(r);
   }
 
-  private async flush(): Promise<void> {
-    if (this.flushing || this.spool.length === 0) return;
-    if (!this.ingestFn) return; // metrics module not wired yet
+  /** `final` also drains the still-open minute — use it when stopping, where
+   *  there is no later flush to carry it. */
+  private async flush(final = false): Promise<void> {
+    if (this.flushing) return;
+    // scheduler accounting must flush even with no results: a fully throttled
+    // tick issues nothing, and that is precisely the case worth recording
+    const shed = this.takeShed(final);
+    if (this.spool.length === 0 && shed.length === 0) return;
+    if (!this.ingestFn) {
+      this.restoreShed(shed); // metrics module not wired yet
+      return;
+    }
     this.flushing = true;
     const chunk = this.spool.splice(0, this.spool.length);
-    const batch: IngestBatch = { batchId: randomUUID(), results: chunk };
+    const batch: IngestBatch = { batchId: randomUUID(), results: chunk, shed };
     try {
       await this.ingestFn(batch);
       this.ingestAttempts = 0;
     } catch (e) {
       this.ingestAttempts++;
       if (this.ingestAttempts >= MAX_INGEST_ATTEMPTS) {
-        // never let one poison batch wedge the pipeline forever
+        // never let one poison batch wedge the pipeline forever; the shed rows
+        // go with it rather than being replayed against a store that refuses them
         console.error(
           `[driver] dropping ${chunk.length} results after ${this.ingestAttempts} failed ingest attempts:`,
           (e as Error).message
@@ -497,9 +692,33 @@ export class Driver {
         // put them back at the front, newest data still wins if we overflow
         this.spool = chunk.concat(this.spool);
         if (this.spool.length > MAX_SPOOL) this.spool = this.spool.slice(this.spool.length - MAX_SPOOL);
+        this.restoreShed(shed);
       }
     } finally {
       this.flushing = false;
+    }
+  }
+
+  /** Drain completed shed buckets; the open one stays behind, still filling,
+   *  unless this is the last flush of a run. */
+  private takeShed(final: boolean): LoadShedSample[] {
+    const openBucket = Math.floor(Date.now() / 60_000) * 60_000;
+    const out: LoadShedSample[] = [];
+    for (const [ts, s] of this.shed) {
+      if (!final && ts >= openBucket) continue;
+      out.push(s);
+      this.shed.delete(ts);
+    }
+    return out;
+  }
+
+  /** Fold un-ingested buckets back in, so a failed flush loses no accounting. */
+  private restoreShed(samples: LoadShedSample[]): void {
+    for (const s of samples) {
+      const b = this.shedBucket(s.bucketTs);
+      b.dropped += s.dropped;
+      b.targetSum += s.targetSum;
+      b.ticks += s.ticks;
     }
   }
 
@@ -515,8 +734,29 @@ export class Driver {
       targetRps: this.state === "running" ? this.targetRps : 0,
       effectiveMaxConcurrency: this.effectiveMaxConcurrency,
       throttledSinceMs: this.state === "running" ? this.throttledSinceMs : null,
-      counters: { ...this.counters }
+      counters: { ...this.counters },
+      targetIsSelf: { rest: this.isSelf(this.gw.rest), soap: this.isSelf(this.gw.soap) }
     };
+  }
+
+  /**
+   * Probe context for the gateway policy checks: same targets, same URL
+   * building and the same credential rule the load driver itself applies, so a
+   * policy result describes the path the traffic actually takes.
+   */
+  policyContext(): ProbeContext {
+    return probeContext(
+      this.currentGw,
+      (t) => (this.sendsOurCredential(t) ? expectedAuthHeader()?.toString("utf-8") ?? null : null),
+      this.isSelf(this.gw.rest)
+    );
+  }
+
+  /** True when this target is our own origin — no gateway in the path. */
+  private isSelf(target: GwConfig): boolean {
+    const self = originOf(this.baselineUrl);
+    const theirs = originOf(target.baseUrl);
+    return self !== null && theirs !== null && self === theirs;
   }
 
   async shutdown(): Promise<void> {
@@ -527,6 +767,6 @@ export class Driver {
     this.tickTimer = this.flushTimer = this.baselineTimer = null;
     this.drainTimer = null;
     this.state = "idle";
-    await this.flush();
+    await this.flush(true);
   }
 }

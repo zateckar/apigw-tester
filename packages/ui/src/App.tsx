@@ -8,7 +8,8 @@ import {
   api, downloadDefinition, fmtBytes, fmtDuration, fmtMs,
   DEFAULT_GW, DEFAULT_PROFILE, type SummaryWindow
 } from "./api";
-import type { GwTargets, LoadProfile, RunEvent } from "./api";
+import type { GwTargets, LoadProfile, PolicyState, RunEvent, StatusBucket, VerdictState } from "./api";
+import { GATEWAY_FAULT_BUCKETS } from "@apigw/shared";
 import ConfigDrawer from "./ConfigDrawer";
 
 /** label and summary window are the same value on purpose: the KPI tiles used
@@ -35,6 +36,36 @@ function stat(value: number | undefined, render: (n: number) => string): string 
   return value === undefined || !Number.isFinite(value) ? "—" : render(value);
 }
 
+/** Colour a status bucket by who is at fault: red for the gateway's own
+ *  failures, amber for anything else that isn't a success. */
+function statusColor(bucket: StatusBucket): string | undefined {
+  if (GATEWAY_FAULT_BUCKETS.includes(bucket)) return "var(--err)";
+  if (bucket === "2xx" || bucket === "3xx" || bucket === "1xx") return undefined;
+  return "var(--warn, #d29922)";
+}
+
+const POLICY_LABEL: Record<PolicyState, string> = {
+  pass: "pass",
+  fail: "FAIL",
+  "not-enforced": "not enforced",
+  error: "probe error",
+  skipped: "skipped"
+};
+
+/** "not enforced" is deliberately neutral: plenty of gateways legitimately
+ *  have no cache or quota, and painting that red trains people to ignore red. */
+function policyBadge(state: PolicyState): string {
+  if (state === "pass") return "ok";
+  if (state === "fail") return "err";
+  return "warn";
+}
+
+const VERDICT_LABEL: Record<VerdictState, string> = {
+  pass: "PASS",
+  fail: "FAIL",
+  inconclusive: "INCONCLUSIVE"
+};
+
 export default function App() {
   const qc = useQueryClient();
   const [range, setRange] = useState<(typeof RANGES)[number]>(RANGES[1] as (typeof RANGES)[number]);
@@ -42,6 +73,8 @@ export default function App() {
   const [recentProto, setRecentProto] = useState<"" | "rest" | "soap">("");
   const [actionError, setActionError] = useState<string | null>(null);
   const [downloadNote, setDownloadNote] = useState<string | null>(null);
+  /** per-run verdict + why, fetched on demand; "loading" while in flight */
+  const [verdicts, setVerdicts] = useState<Record<string, { state: VerdictState; reasons: string[] } | "loading">>({});
 
   const statusQ = useQuery({ queryKey: ["status"], queryFn: api.status, refetchInterval: 5_000 });
   const gwQ = useQuery({ queryKey: ["gw"], queryFn: api.gateway, refetchInterval: 30_000 });
@@ -60,6 +93,7 @@ export default function App() {
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 30_000 });
   const systemQ = useQuery({ queryKey: ["system"], queryFn: api.system, refetchInterval: 2_000 });
   const defsQ = useQuery({ queryKey: ["definitions"], queryFn: api.definitions, refetchInterval: false });
+  const policyQ = useQuery({ queryKey: ["policy"], queryFn: api.policy, refetchInterval: 15_000 });
 
   const startMut = useMutation({
     mutationFn: api.startRun,
@@ -77,6 +111,18 @@ export default function App() {
     onError: (e: Error) => setActionError(e.message)
   };
   const resetMut = useMutation({ mutationFn: api.resetMetrics, ...statusMut });
+  const [policyNote, setPolicyNote] = useState<string | null>(null);
+  const policyMut = useMutation({
+    mutationFn: api.runPolicy,
+    onSuccess: () => {
+      setActionError(null);
+      // the pass runs server-side and takes tens of seconds (one probe waits
+      // out a 10s upstream hang); the 15s poll picks the results up
+      setPolicyNote("Probing… results appear here as they land.");
+      setTimeout(() => void qc.invalidateQueries({ queryKey: ["policy"] }), 3_000);
+    },
+    onError: (e: Error) => setActionError(e.message)
+  });
   const [pruneDays, setPruneDays] = useState("30");
   const pruneMut = useMutation({
     mutationFn: (days: number) => api.pruneRuns(days),
@@ -142,6 +188,59 @@ export default function App() {
   ).slice(0, 80);
 
   const contract = summary?.contract;
+  const st = summary?.status;
+  const validity = summary?.validity;
+  /** No gateway in the path: the rig is pointed at its own bundled petstore,
+   *  so every gateway-shaped number is vacuous and must not read as a finding. */
+  const noGateway = status?.targetIsSelf?.rest === true && status?.targetIsSelf?.soap === true;
+
+  /**
+   * The misconfiguration warning.
+   *
+   * Pointing the rig at a real gateway for the first time usually fails in one
+   * of three boring ways — wrong key, tripped quota, unreachable upstream — and
+   * every one of them used to render as a flawless run because 4xx counted as
+   * success. Call it out above the fold instead.
+   */
+  const gwWarning = useMemo(() => {
+    if (!summary || !st || summary.total < 20 || noGateway) return null;
+    const share = (n: number) => (100 * n) / summary.total;
+    if (share(st.unauthorized) > 25) {
+      return `${share(st.unauthorized).toFixed(0)}% of requests came back 401/403 — the gateway is rejecting the API key, not measuring your traffic. Check Configure → API Gateway.`;
+    }
+    if (share(st.rateLimited) > 10) {
+      return `${share(st.rateLimited).toFixed(0)}% of requests were rate-limited (429). Latency and overhead numbers for this window describe the gateway's throttle, not its proxying — lower the RPS or raise the quota.`;
+    }
+    if (share(st.gatewayErrors) > 10) {
+      return `${share(st.gatewayErrors).toFixed(0)}% of requests failed at the gateway itself (502/503/504 or no response) — it cannot reach a healthy upstream.`;
+    }
+    return null;
+  }, [summary, st, noGateway]);
+
+  /**
+   * A gateway that answers 401 or 429 to *everything* also "blocks" every
+   * invalid probe — but on the credential, not on the contract. Reporting
+   * "100% blocked" there would be true and useless, so the tile stands down
+   * until the gateway is actually passing traffic.
+   */
+  const contractMoot = gwWarning !== null;
+
+  /**
+   * Verdicts are fetched on demand, one run at a time. Each one re-aggregates
+   * that run's whole window server-side, so eagerly computing them for every
+   * row of the history would be an expensive way to fill a table nobody asked
+   * to see.
+   */
+  async function loadVerdict(runId: string) {
+    setVerdicts((v) => ({ ...v, [runId]: "loading" }));
+    try {
+      const report = await api.report(runId);
+      setVerdicts((v) => ({ ...v, [runId]: { state: report.verdict.state, reasons: report.verdict.reasons } }));
+    } catch (e) {
+      setVerdicts((v) => { const { [runId]: _drop, ...rest } = v; return rest; });
+      setActionError((e as Error).message);
+    }
+  }
 
   async function grab(path: string, filename: string) {
     setDownloadNote(null);
@@ -189,6 +288,23 @@ export default function App() {
         </div>
       )}
 
+      {gwWarning && (
+        <div className="banner err" role="alert">
+          <strong>Gateway is not proxying your traffic.</strong> {gwWarning}
+        </div>
+      )}
+
+      {/* The generator, not the gateway, may be the story. Say so before the
+          reader has drawn any conclusions from the percentiles below. */}
+      {validity && !validity.ok && (
+        <div className="banner err" role="alert">
+          <strong>These numbers are not trustworthy.</strong>
+          <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
+            {validity.reasons.map((r) => <li key={r}>{r}</li>)}
+          </ul>
+        </div>
+      )}
+
       {/* ---------- KPIs ---------- */}
       <div className="kpis">
         <div className="kpi" style={{ borderColor: "var(--accent)" }}>
@@ -197,12 +313,21 @@ export default function App() {
             {stat(summary?.overheadMs.p95, fmtMs)}
           </div>
           <div className="sub">
-            p95 · p50 {stat(summary?.overheadMs.p50, fmtMs)} · p99 {stat(summary?.overheadMs.p99, fmtMs)}
+            {noGateway
+              ? "no gateway configured — this is loopback slop"
+              : `p95 · p50 ${stat(summary?.overheadMs.p50, fmtMs)} · p99 ${stat(summary?.overheadMs.p99, fmtMs)}`}
           </div>
         </div>
-        <div className="kpi">
-          <div className="label">Live RPS</div>
-          <div className="value">{stat(status?.targetRps, (n) => n.toFixed(1))}</div>
+        <div
+          className="kpi"
+          title="Target is what the profile asks for; achieved is what was actually issued. A gap means the concurrency ceiling is shedding load — the gateway was never offered the rate the charts imply, and its latency looks better for it."
+        >
+          <div className="label">RPS target → achieved</div>
+          <div className={`value ${validity && validity.shedPct > 1 ? "err" : ""}`} style={{ fontSize: 17 }}>
+            {stat(status?.targetRps, (n) => n.toFixed(1))}
+            {" → "}
+            {stat(validity?.achievedRps, (n) => n.toFixed(1))}
+          </div>
           <div
             className="sub"
             title={
@@ -211,7 +336,12 @@ export default function App() {
                 : undefined
             }
           >
-            target · {profile.mode} · conc {status?.effectiveMaxConcurrency ?? profile.maxConcurrency}
+            {profile.mode} · conc {status?.effectiveMaxConcurrency ?? profile.maxConcurrency}
+            {validity && validity.droppedRequests > 0 && (
+              <span style={{ color: "var(--err)" }}>
+                {" "}· shed {validity.droppedRequests.toLocaleString()} ({validity.shedPct.toFixed(1)}%)
+              </span>
+            )}
             {status?.throttledSinceMs != null && <span style={{ color: "var(--err)" }}> · throttled</span>}
           </div>
         </div>
@@ -220,12 +350,33 @@ export default function App() {
           <div className="value">{stat(summary?.total, (n) => n.toLocaleString())}</div>
           <div className="sub">{stat(summary?.rps, (n) => n.toFixed(2))} avg rps</div>
         </div>
-        <div className="kpi">
-          <div className="label">Error rate ({range.label})</div>
-          <div className={`value ${summary === undefined ? "" : summary.errorPct > 2 ? "err" : "ok"}`}>
-            {stat(summary?.errorPct, (n) => `${n.toFixed(2)}%`)}
+        <div
+          className="kpi"
+          title="Every request that did not come back 2xx/3xx, minus the deliberately-invalid slice that is supposed to be rejected. A gateway answering 401 or 429 to everything shows 100% here."
+        >
+          <div className="label">Failure rate ({range.label})</div>
+          <div className={`value ${summary === undefined ? "" : summary.unexpectedFailurePct > 2 ? "err" : "ok"}`}>
+            {stat(summary?.unexpectedFailurePct, (n) => `${n.toFixed(2)}%`)}
           </div>
-          <div className="sub">{stat(summary?.errors, (n) => n.toLocaleString())} errors</div>
+          <div className="sub">
+            {st === undefined
+              ? "—"
+              : `${st.clientErrors.toLocaleString()} × 4xx · ${st.serverErrors.toLocaleString()} × 5xx · ${st.networkErrors.toLocaleString()} no-response`}
+          </div>
+        </div>
+        <div
+          className="kpi"
+          title="Failures the gateway itself produced: 502 (no healthy upstream), 503 (overloaded / circuit open), 504 (upstream timed out) and outright connection failures. Distinct from a backend 500, which the gateway merely relayed."
+        >
+          <div className="label">Gateway faults ({range.label})</div>
+          <div className={`value ${st === undefined ? "" : st.gatewayErrors > 0 ? "err" : "ok"}`}>
+            {stat(st?.gatewayErrors, (n) => n.toLocaleString())}
+          </div>
+          <div className="sub">
+            {st === undefined
+              ? "—"
+              : `${st.rateLimited.toLocaleString()} rate-limited · ${st.unauthorized.toLocaleString()} unauthorized`}
+          </div>
         </div>
         <div className="kpi">
           <div className="label">Latency p50/p95/p99 ({range.label})</div>
@@ -234,22 +385,46 @@ export default function App() {
           </div>
           <div className="sub">max {stat(summary?.latencyMs.max, fmtMs)}</div>
         </div>
-        <div className="kpi" title="Requests deliberately violating the published OpenAPI/WSDL contract, and whether the gateway rejected them">
-          <div className="label">Contract validation</div>
-          <div className={`value ${contract === undefined ? "" : contract.wronglyAccepted > 0 ? "err" : "ok"}`}>
+        <div
+          className="kpi"
+          title="Requests deliberately violating the published OpenAPI/WSDL contract. Only a rejection the GATEWAY produced counts: a response carrying the SUT's X-Server-Ms header proves the request got all the way through, so the gateway did not validate it — whatever the backend then did about it."
+        >
+          <div className="label">Blocked by gateway</div>
+          <div className={`value ${contract === undefined || noGateway || contractMoot ? "" : contract.leakedToBackend > 0 ? "err" : "ok"}`}>
             {contract === undefined
               ? "—"
-              : contract.invalidSent === 0
-                ? "no probes"
-                : `${((100 * contract.rejected4xx) / Math.max(1, contract.invalidSent)).toFixed(0)}% blocked`}
+              : noGateway || contractMoot
+                ? "n/a"
+                : contract.invalidSent === 0
+                  ? "no probes"
+                  : `${((100 * contract.rejectedByGateway) / Math.max(1, contract.invalidSent)).toFixed(0)}%`}
           </div>
           <div className="sub">
             {contract === undefined
               ? "—"
-              : `${contract.invalidSent.toLocaleString()} invalid sent · ${contract.wronglyAccepted.toLocaleString()} wrongly accepted`}
+              : noGateway
+                ? "no gateway in the path — pointed at the built-in petstore"
+                : contractMoot
+                  ? "gateway is rejecting everything — fix that before reading this"
+                  : `${contract.invalidSent.toLocaleString()} invalid sent · ${contract.leakedToBackend.toLocaleString()} reached the backend`}
           </div>
         </div>
       </div>
+
+      {/* ---------- Status distribution ---------- */}
+      {st && st.buckets.length > 0 && (
+        <div
+          className="strip"
+          title="What the target actually answered. 502/503/504 and no-response are the gateway's own faults; 500 is the backend's, merely relayed."
+        >
+          {st.buckets.map((b) => (
+            <div className="sitem" key={b.bucket}>
+              <span>{b.bucket === "net" ? "no response" : b.bucket}</span>
+              <b style={{ color: statusColor(b.bucket) }}>{b.count.toLocaleString()}</b>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* ---------- Host strip: is the app itself the bottleneck? ---------- */}
       {sys && (
@@ -329,7 +504,7 @@ export default function App() {
 
       <div className="grid-2">
         <div className="section">
-          <h2>Error rate + volume (throughput)</h2>
+          <h2>Failures by kind + volume</h2>
           <Panel height={180}>
             {({ width, height }) => (
               <LineChart width={width} height={height} data={points}>
@@ -338,7 +513,13 @@ export default function App() {
                 <YAxis yAxisId="l" stroke="#8b949e" fontSize={11} />
                 <YAxis yAxisId="r" orientation="right" stroke="#8b949e" fontSize={11} />
                 <Tooltip contentStyle={{ background: "#161b22", border: "1px solid #2d333b" }} />
-                <Line yAxisId="l" type="monotone" dataKey="errors" stroke="#f85149" dot={false} name="errors/bucket" />
+                <Legend />
+                {/* split on purpose: a gateway that starts rate-limiting or
+                    rejecting credentials moves the 4xx line while the 5xx line
+                    stays flat — one chart, two very different diagnoses */}
+                <Line yAxisId="l" type="monotone" dataKey="gatewayErrors" stroke="#f85149" dot={false} name="gateway faults" />
+                <Line yAxisId="l" type="monotone" dataKey="errors" stroke="#db6d28" dot={false} name="5xx + no response" />
+                <Line yAxisId="l" type="monotone" dataKey="clientErrors" stroke="#d29922" dot={false} name="4xx" />
                 <Line yAxisId="r" type="monotone" dataKey="rps" stroke="#58a6ff" dot={false} name="rps" />
               </LineChart>
             )}
@@ -423,13 +604,62 @@ export default function App() {
         </div>
       </div>
 
+      {/* ---------- Gateway policy checks ---------- */}
+      <div className="section">
+        <h2>
+          Gateway policies{" "}
+          <span className="hint">
+            — does the gateway actually <em>enforce</em> anything, or is it only proxying?
+          </span>
+        </h2>
+        <p className="hint">
+          Deliberate single probes with a stated expectation, run every{" "}
+          {policyQ.data?.config.intervalSec ?? "—"}s. <strong>not enforced</strong> means the policy is
+          demonstrably not configured — information, not a defect, unless you mark it required in
+          Configure. Whether the response carried the SUT&apos;s fingerprint is what separates
+          &ldquo;the gateway stopped it&rdquo; from &ldquo;the backend did&rdquo;.
+          {noGateway && " No gateway is configured, so these describe the built-in petstore."}
+        </p>
+        <div className="form-row" style={{ marginBottom: 10 }}>
+          <button onClick={() => policyMut.mutate()} disabled={policyMut.isPending}>
+            {policyMut.isPending ? "Probing…" : "Run policy checks now"}
+          </button>
+          {policyNote && <span className="hint" style={{ alignSelf: "center" }}>{policyNote}</span>}
+        </div>
+        <table>
+          <thead>
+            <tr><th>Policy</th><th>Result</th><th>Status</th><th>Detail</th><th>Checked</th></tr>
+          </thead>
+          <tbody>
+            {(policyQ.data?.results ?? []).map((p) => (
+              <tr key={p.id}>
+                <td>
+                  {p.label}
+                  {policyQ.data?.config.required.includes(p.id) && (
+                    <span className="hint"> · required</span>
+                  )}
+                  <div className="hint mono" style={{ fontSize: 11 }}>{p.probe}</div>
+                </td>
+                <td><span className={`badge ${policyBadge(p.state)}`}>{POLICY_LABEL[p.state]}</span></td>
+                <td className="mono">{p.status ?? "—"}</td>
+                <td className="hint">{p.detail}</td>
+                <td className="hint">{new Date(p.checkedAt).toLocaleTimeString()}</td>
+              </tr>
+            ))}
+            {(policyQ.data?.results.length ?? 0) === 0 && (
+              <tr><td colSpan={5} className="hint">No policy probes have run yet.</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
       {/* ---------- Per stress-class ---------- */}
       <div className="section">
         <h2>Per stress class — how the GW handles each traffic pattern ({range.label} window)</h2>
         <table>
           <thead>
             <tr>
-              <th>Class</th><th>Calls</th><th>Err %</th>
+              <th>Class</th><th>Calls</th><th>Err %</th><th>4xx</th><th>GW faults</th>
               <th>Latency p50</th><th>Latency p95</th><th>Latency p99</th>
               <th className="accent">GW OH p50</th><th className="accent">GW OH p95</th><th className="accent">GW OH p99</th><th className="accent">GW OH avg</th>
               <th>avg req</th><th>avg resp</th>
@@ -441,6 +671,13 @@ export default function App() {
                 <td><span className={`badge ${c.cls.replace("-", "")}`}>{c.cls}</span></td>
                 <td>{c.total.toLocaleString()}</td>
                 <td style={{ color: c.errorPct > 2 ? "var(--err)" : undefined }}>{c.errorPct.toFixed(1)}%</td>
+                {/* 4xx is expected for the invalid class and a red flag anywhere else */}
+                <td style={{ color: c.clientErrors > 0 && c.cls !== "invalid" ? "var(--warn, #d29922)" : undefined }}>
+                  {c.clientErrors.toLocaleString()}
+                </td>
+                <td style={{ color: c.gatewayErrors > 0 ? "var(--err)" : undefined }}>
+                  {c.gatewayErrors.toLocaleString()}
+                </td>
                 <td>{fmtMs(c.latencyMs.p50)}</td>
                 <td>{fmtMs(c.latencyMs.p95)}</td>
                 <td>{fmtMs(c.latencyMs.p99)}</td>
@@ -453,7 +690,7 @@ export default function App() {
               </tr>
             ))}
             {(summary?.perClass.length ?? 0) === 0 && (
-              <tr><td colSpan={12} className="hint">No traffic yet — start a run.</td></tr>
+              <tr><td colSpan={14} className="hint">No traffic yet — start a run.</td></tr>
             )}
           </tbody>
         </table>
@@ -504,26 +741,37 @@ export default function App() {
         </h2>
         <table>
           <thead>
-            <tr><th>Time</th><th>Proto</th><th>Method</th><th>Endpoint</th><th>Status</th><th>Latency</th><th>Resp</th><th>Error</th></tr>
+            <tr>
+              <th>Time</th><th>Request id</th><th>Proto</th><th>Method</th><th>Endpoint</th>
+              <th>Status</th><th>Answered by</th><th>Latency</th><th>Resp</th><th>Error</th>
+            </tr>
           </thead>
           <tbody>
             {recent.map((r, i) => (
               <tr key={`${r.ts}-${i}`}>
                 <td className="mono">{new Date(r.ts).toLocaleTimeString()}</td>
+                {/* the full id is on the title so it can be copied and grepped
+                    straight out of the gateway's access log or trace backend */}
+                <td className="mono hint" title={r.requestId || "not recorded"}>
+                  {r.requestId ? r.requestId.slice(0, 8) : "—"}
+                </td>
                 <td><span className={`badge ${r.protocol}`}>{r.protocol}</span></td>
                 <td className="mono">{r.method}</td>
                 <td className="mono">{r.endpoint}</td>
                 <td>
-                  <span className={`badge ${r.status === 0 ? "warn" : r.status >= 500 ? "err" : r.status >= 400 ? "warn" : "ok"}`}>
+                  <span className={`badge ${r.status === 0 ? "err" : r.status >= 500 ? "err" : r.status >= 400 ? "warn" : "ok"}`}>
                     {r.status === 0 ? "NET" : r.status}
                   </span>
                 </td>
+                {/* X-Server-Ms on the response is the backend's fingerprint:
+                    "gateway" here means the response never reached the SUT */}
+                <td className="hint">{r.reachedBackend ? "backend" : "gateway"}</td>
                 <td>{fmtMs(r.latencyMs)}</td>
                 <td>{fmtBytes(r.bytesResp)}</td>
                 <td className="hint">{r.error ?? ""}</td>
               </tr>
             ))}
-            {recent.length === 0 && <tr><td colSpan={8} className="hint">Nothing yet.</td></tr>}
+            {recent.length === 0 && <tr><td colSpan={10} className="hint">Nothing yet.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -533,22 +781,60 @@ export default function App() {
         <h2>Run history</h2>
         <table>
           <thead>
-            <tr><th>Run</th><th>Started</th><th>Stopped</th><th>Duration</th><th>Mode</th><th>Concurrency</th><th>SOAP %</th><th>Invalid %</th></tr>
+            <tr>
+              <th>Run</th><th>Started</th><th>Duration</th><th>Mode</th>
+              <th>Verdict</th><th>Report</th>
+            </tr>
           </thead>
           <tbody>
             {(runsQ.data ?? []).map((r: RunEvent) => (
               <tr key={r.id}>
                 <td className="mono">{r.runId}</td>
                 <td>{new Date(r.startedAt).toLocaleString()}</td>
-                <td>{r.stoppedAt ? new Date(r.stoppedAt).toLocaleString() : "…"}</td>
                 <td>{fmtDuration(((r.stoppedAt ?? Date.now()) - r.startedAt) / 1000)}</td>
-                <td>{r.profile?.mode ?? "—"}</td>
-                <td>{r.profile?.maxConcurrency ?? "—"}</td>
-                <td>{r.profile ? `${r.profile.soapRatioPct}%` : "—"}</td>
-                <td>{r.profile?.invalidRatioPct != null ? `${r.profile.invalidRatioPct}%` : "—"}</td>
+                <td>
+                  {r.profile?.mode ?? "—"}
+                  <span className="hint">
+                    {r.profile ? ` · ${r.profile.soapRatioPct}% SOAP · ${r.profile.invalidRatioPct}% invalid` : ""}
+                  </span>
+                </td>
+                <td>
+                  {verdicts[r.runId] === "loading" ? (
+                    <span className="hint">checking…</span>
+                  ) : verdicts[r.runId] ? (
+                    (() => {
+                      const v = verdicts[r.runId] as { state: VerdictState; reasons: string[] };
+                      // the reasons are the whole value of a verdict: "inconclusive"
+                      // on its own tells you nothing you can act on
+                      const why = v.reasons.length > 0
+                        ? v.reasons.join("\n")
+                        : v.state === "pass" ? "Every configured threshold held." : undefined;
+                      return (
+                        <span className={`badge ${v.state === "pass" ? "ok" : v.state === "fail" ? "err" : "warn"}`} title={why}>
+                          {VERDICT_LABEL[v.state]}
+                        </span>
+                      );
+                    })()
+                  ) : (
+                    <button className="linklike" type="button" onClick={() => void loadVerdict(r.runId)}>
+                      check
+                    </button>
+                  )}
+                </td>
+                <td>
+                  <button className="linklike" type="button"
+                          onClick={() => void grab(`/api/runs/${encodeURIComponent(r.runId)}/report.md`, `${r.runId}-report.md`)}>
+                    Markdown
+                  </button>
+                  {" · "}
+                  <button className="linklike" type="button"
+                          onClick={() => void grab(`/api/runs/${encodeURIComponent(r.runId)}/report`, `${r.runId}-report.json`)}>
+                    JSON
+                  </button>
+                </td>
               </tr>
             ))}
-            {(runsQ.data?.length ?? 0) === 0 && <tr><td colSpan={8} className="hint">No runs recorded yet.</td></tr>}
+            {(runsQ.data?.length ?? 0) === 0 && <tr><td colSpan={6} className="hint">No runs recorded yet.</td></tr>}
           </tbody>
         </table>
         <div className="form-row" style={{ marginTop: 12 }}>

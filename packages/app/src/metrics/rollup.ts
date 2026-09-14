@@ -1,4 +1,4 @@
-import { HISTOGRAM_EDGES_MS } from "@apigw/shared";
+import { HISTOGRAM_EDGES_MS, STATUS_BUCKETS, statusBucketIndex } from "@apigw/shared";
 
 /** Fixed log-scale histogram over latency in milliseconds. */
 
@@ -6,6 +6,23 @@ export type Histogram = number[];
 
 export function emptyHistogram(): Histogram {
   return new Array(HISTOGRAM_EDGES_MS.length + 1).fill(0);
+}
+
+/**
+ * Counts per STATUS_BUCKETS slot. Same fixed-length-array shape as the latency
+ * histogram on purpose: the merge helpers and the SQL upsert both work
+ * positionally, so this needs no machinery of its own.
+ */
+export type StatusHistogram = number[];
+
+export function emptyStatusHistogram(): StatusHistogram {
+  return new Array(STATUS_BUCKETS.length).fill(0);
+}
+
+export function addToStatusHistogram(h: StatusHistogram, status: number, count = 1): void {
+  const i = statusBucketIndex(status);
+  if (i < 0) return;
+  h[i] = ((h[i] as number) ?? 0) + count;
 }
 
 export function bucketIndex(latencyMs: number): number {

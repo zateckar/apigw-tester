@@ -25,6 +25,7 @@ export function openDb(path: string): DbHandle {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
       run_id TEXT NOT NULL,
+      request_id TEXT NOT NULL DEFAULT '',
       protocol TEXT NOT NULL,
       endpoint TEXT NOT NULL,
       class TEXT NOT NULL DEFAULT 'small-rest',
@@ -35,6 +36,7 @@ export function openDb(path: string): DbHandle {
       overhead_ms REAL NOT NULL DEFAULT 0,
       bytes_req INTEGER NOT NULL,
       bytes_resp INTEGER NOT NULL,
+      reached_backend INTEGER NOT NULL DEFAULT 0,
       error TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_raw_ts ON requests_raw(ts);
@@ -54,8 +56,11 @@ export function openDb(path: string): DbHandle {
       overhead_max_ms REAL NOT NULL DEFAULT 0,
       bytes_req INTEGER NOT NULL,
       bytes_resp INTEGER NOT NULL,
+      reached_backend INTEGER NOT NULL DEFAULT 0,
+      rejected4xx_gw INTEGER NOT NULL DEFAULT 0,
       hist TEXT NOT NULL,
       overhead_hist TEXT NOT NULL DEFAULT '[]',
+      status_hist TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (bucket_ts, protocol, endpoint, cls)
     );
 
@@ -74,9 +79,40 @@ export function openDb(path: string): DbHandle {
       overhead_max_ms REAL NOT NULL DEFAULT 0,
       bytes_req INTEGER NOT NULL,
       bytes_resp INTEGER NOT NULL,
+      reached_backend INTEGER NOT NULL DEFAULT 0,
+      rejected4xx_gw INTEGER NOT NULL DEFAULT 0,
       hist TEXT NOT NULL,
       overhead_hist TEXT NOT NULL DEFAULT '[]',
+      status_hist TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (bucket_ts, protocol, endpoint, cls)
+    );
+
+    -- Scheduler accounting: what the profile asked for vs what the concurrency
+    -- ceiling let us issue. Without this a throttled run silently delivers less
+    -- load than the chart claims and the latency looks better for it.
+    CREATE TABLE IF NOT EXISTS load_shed (
+      bucket_ts INTEGER PRIMARY KEY,
+      dropped INTEGER NOT NULL DEFAULT 0,
+      target_sum REAL NOT NULL DEFAULT 0,
+      ticks INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Host health per minute, so a window older than the sampler's in-memory
+    -- ring can still be judged trustworthy or not.
+    CREATE TABLE IF NOT EXISTS host_health (
+      bucket_ts INTEGER PRIMARY KEY,
+      samples INTEGER NOT NULL DEFAULT 0,
+      cpu_sum REAL NOT NULL DEFAULT 0,
+      cpu_max REAL NOT NULL DEFAULT 0,
+      loop_p99_sum REAL NOT NULL DEFAULT 0,
+      loop_p99_max REAL NOT NULL DEFAULT 0
+    );
+
+    -- Latest outcome per gateway policy probe; one row per policy, overwritten.
+    CREATE TABLE IF NOT EXISTS policy_results (
+      id TEXT PRIMARY KEY,
+      checked_at INTEGER NOT NULL,
+      payload TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS ingest_seen (

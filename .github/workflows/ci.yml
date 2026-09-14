@@ -141,14 +141,20 @@ jobs:
           # the service location really was substituted in the built image
           if grep -q "__SERVICE_LOCATION__" /tmp/petservice.wsdl; then echo "WSDL placeholder not filled"; exit 1; fi
 
-          # drive a short run with a deliberate slice of contract violations
+          # drive a short run with a deliberate slice of contract violations.
+          # durationMinutes makes the run end itself — nothing below sends a stop.
           curl -s "${AUTH[@]}" -X PUT "$BASE/api/config/profile" \
             -H "Content-Type: application/json" \
-            -d '{"mode":"constant","rps":25,"maxConcurrency":30,"soapRatioPct":25,"invalidRatioPct":10,
+            -d '{"mode":"constant","rps":25,"maxConcurrency":30,"soapRatioPct":25,"invalidRatioPct":10,"durationMinutes":0.33,
                  "scenarioWeights":{"listPets":40,"getPet":20,"createPet":15,"updatePet":10,"deletePet":5,"placeOrder":10}}' > /dev/null
-          curl -s "${AUTH[@]}" -X POST "$BASE/api/run/start" -H "Content-Type: application/json" -d '{}' > /dev/null
-          sleep 20
-          curl -s "${AUTH[@]}" -X POST "$BASE/api/run/stop" > /dev/null
+          RUN_ID="$(curl -s "${AUTH[@]}" -X POST "$BASE/api/run/start" -H "Content-Type: application/json" -d '{}' | node -e "
+            let b='';process.stdin.on('data',d=>b+=d).on('end',()=>console.log(JSON.parse(b).runId))")"
+          echo "run: $RUN_ID"
+          sleep 30
+          curl -sf "${AUTH[@]}" "$BASE/api/run/status" -o /tmp/status.json
+          node -e "const s=require('/tmp/status.json');
+            if(s.state==='running') throw new Error('durationMinutes did not stop the run: '+s.state);
+            console.log('run auto-stopped, state',s.state);"
 
           curl -sf "${AUTH[@]}" "$BASE/api/summary?window=15m" -o /tmp/summary.json
           node -e "const s=require('/tmp/summary.json');
@@ -162,9 +168,72 @@ jobs:
             // the invalid slice must have been generated and rejected by the SUT
             if(!(s.contract.invalidSent>0)) throw new Error('no invalid traffic generated');
             if(s.contract.wronglyAccepted>0) throw new Error('SUT accepted '+s.contract.wronglyAccepted+' invalid requests');
-            // and the valid majority must not be erroring
+            // no gateway in front here, so every invalid request MUST have
+            // reached the backend. A non-zero rejectedByGateway would mean the
+            // X-Server-Ms attribution is crediting the wrong party.
+            if(s.contract.rejectedByGateway>0)
+              throw new Error('no gateway configured, yet '+s.contract.rejectedByGateway+' rejections credited to one');
+            if(s.contract.leakedToBackend!==s.contract.invalidSent)
+              throw new Error('invalid traffic did not all reach the backend: '+JSON.stringify(s.contract));
+            // the status dimension must be populated and reconcile
+            const st=s.status, byBucket=st.buckets.reduce((a,b)=>a+b.count,0);
+            if(byBucket!==s.total) throw new Error('status buckets '+byBucket+' != total '+s.total);
+            if(!(st.ok>0)) throw new Error('no successful responses recorded');
+            if(st.gatewayErrors>0) throw new Error('gateway faults against the built-in SUT: '+st.gatewayErrors);
+            // and the valid majority must not be erroring. unexpectedFailurePct
+            // excludes the deliberate invalid slice, so a 10% invalid ratio
+            // must not by itself push this over the bar.
             if(s.errorPct>5) throw new Error('error rate too high: '+s.errorPct);
-            console.log('metrics reconcile; contract validation observed');"
+            if(s.unexpectedFailurePct>5) throw new Error('failure rate too high: '+s.unexpectedFailurePct);
+            // the validity block must be populated, or every number above is
+            // being reported without the caveat that makes it trustworthy
+            const v=s.validity;
+            if(typeof v.shedPct!=='number'||typeof v.achievedRps!=='number')
+              throw new Error('no validity block: '+JSON.stringify(v));
+            if(v.ok!==(v.reasons.length===0)) throw new Error('validity.ok disagrees with its reasons');
+            console.log('validity',JSON.stringify(v));
+            console.log('metrics reconcile; status dimension and contract attribution observed');"
+
+          # policy probes: with no gateway in front, the honest answer is that
+          # nothing was measured — not a pass for the bundled petstore
+          curl -s "${AUTH[@]}" -X PUT "$BASE/api/policy" -H "Content-Type: application/json" \
+            -d '{"enabled":true,"intervalSec":900,"required":["rate-limit"]}' > /dev/null
+          curl -s "${AUTH[@]}" -X POST "$BASE/api/policy/run" > /dev/null
+          sleep 5
+          curl -sf "${AUTH[@]}" "$BASE/api/policy" -o /tmp/policy.json
+          node -e "const p=require('/tmp/policy.json');
+            if(p.results.length!==8) throw new Error('expected 8 probes, got '+p.results.length);
+            const wrong=p.results.filter(r=>r.state!=='error');
+            if(wrong.length) throw new Error('probes claimed a verdict with no gateway: '+JSON.stringify(wrong.map(r=>r.id)));
+            console.log('policy probes reported not-measured for all',p.results.length,'checks');"
+
+          # the per-run report, its verdict, and the redaction that makes it shareable
+          curl -sf "${AUTH[@]}" "$BASE/api/runs/$RUN_ID/report" -o /tmp/report.json
+          node -e "const r=require('/tmp/report.json');
+            if(r.runId!=='$RUN_ID') throw new Error('report is for the wrong run: '+r.runId);
+            if(!['pass','fail','inconclusive'].includes(r.verdict.state)) throw new Error('bad verdict: '+r.verdict.state);
+            if(r.verdict.state==='fail'&&!r.verdict.reasons.length) throw new Error('a failing verdict with no reason');
+            // rate-limit was marked required and there is no gateway to enforce
+            // it, so a pass here would be a green tick over an unasked question
+            if(r.verdict.state==='pass') throw new Error('reported a pass with no gateway in the path');
+            if(JSON.stringify(r).includes('apiKey\":\"')&&r.gateway.rest.apiKey&&r.gateway.rest.apiKey!=='[redacted]')
+              throw new Error('report leaked an api key');
+            console.log('report verdict:',r.verdict.state,JSON.stringify(r.verdict.reasons));"
+          curl -sf "${AUTH[@]}" "$BASE/api/runs/$RUN_ID/report.md" -o /tmp/report.md
+          grep -q "# Gateway test report" /tmp/report.md
+          grep -q "## Measurement validity" /tmp/report.md
+          test "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/runs/no-such-run/report")" = "404"
+
+          # every recorded request carries a correlation id, so a row in the
+          # dashboard can be found again in a gateway's own access log
+          curl -sf "${AUTH[@]}" "$BASE/api/recent?limit=50" -o /tmp/recent.json
+          node -e "const r=require('/tmp/recent.json').items;
+            if(!(r.length>0)) throw new Error('no recent requests recorded');
+            const bad=r.filter(x=>!/^[0-9a-f]{32}\$/.test(x.requestId||''));
+            if(bad.length) throw new Error(bad.length+' rows without a usable request id');
+            if(new Set(r.map(x=>x.requestId)).size!==r.length) throw new Error('duplicate request ids');
+            if(!r.some(x=>x.reachedBackend)) throw new Error('nothing marked as backend-reached');
+            console.log('correlation ids ok:',r.length,'rows');"
 
           # a hostile range must be clamped, not OOM the process
           curl -sf "${AUTH[@]}" "$BASE/api/timeseries?bucket=60&from=0&to=$(date +%s)000" -o /tmp/ts.json

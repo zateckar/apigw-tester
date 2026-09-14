@@ -1,21 +1,43 @@
-import { HISTOGRAM_EDGES_MS, LIMITS } from "@apigw/shared";
+import {
+  DEFAULT_POLICY_CONFIG,
+  DEFAULT_SLO,
+  GATEWAY_FAULT_BUCKETS,
+  HISTOGRAM_EDGES_MS,
+  LIMITS,
+  STATUS_BUCKETS,
+  VALIDITY_LIMITS,
+  sanitizePolicyConfig,
+  sanitizeSlo
+} from "@apigw/shared";
 import type {
   ClassStat,
+  ContractStats,
   EndpointStat,
   GwTargets,
   IngestBatch,
   LoadProfile,
   MetricSummary,
+  PolicyConfig,
+  PolicyResult,
   RequestResult,
   RunEvent,
   ScenarioClass,
+  SloThresholds,
+  StatusBreakdown,
+  StatusBucket,
+  SystemSample,
   TimePoint,
-  TimeSeries
+  TimeSeries,
+  WindowScope,
+  WindowValidity
 } from "@apigw/shared";
 import { openDb, ensureColumn, type DbHandle } from "./db.js";
 import {
   Histogram,
+  StatusHistogram,
+  addToStatusHistogram,
   emptyHistogram,
+  emptyStatusHistogram,
   meanFromRollup,
   mergeHistograms,
   percentile,
@@ -40,6 +62,21 @@ const MAX_SAMPLE_K = 100;
 export interface MetricsStore {
   ingestBatch: (batch: IngestBatch) => { ingested: number; duplicate?: boolean };
   summary: (windowMs: number) => MetricSummary;
+  /** Same shape as summary(), over an explicit span — the basis of a per-run
+   *  report. Buckets are minute-granular, so a span is resolved to the buckets
+   *  it touches rather than to the millisecond. */
+  summaryBetween: (from: number, to: number) => MetricSummary;
+  /** How much of a report window's traffic belongs to some other run. */
+  windowScope: (runId: string, from: number, to: number) => WindowScope;
+  /** Fold one host sample into the current minute's health row. */
+  recordHealth: (sample: SystemSample) => void;
+  readPolicyResults: () => PolicyResult[];
+  writePolicyResults: (results: PolicyResult[]) => void;
+  readPolicyConfig: () => PolicyConfig;
+  writePolicyConfig: (cfg: PolicyConfig) => void;
+  readSlo: () => SloThresholds;
+  writeSlo: (slo: SloThresholds) => void;
+  findRun: (runId: string) => RunEvent | null;
   timeseries: (bucketSec: 60 | 3600, from: number, to: number) => TimeSeries;
   recent: (limit: number) => RequestResult[];
   readGateway: () => unknown | null;
@@ -67,6 +104,8 @@ interface RollupRow {
   errors: number;
   ok2xx: number;
   rejected4xx: number;
+  rejected4xx_gw: number;
+  reached_backend: number;
   latency_sum_ms: number;
   max_latency_ms: number;
   overhead_sum_ms: number;
@@ -75,6 +114,7 @@ interface RollupRow {
   bytes_resp: number;
   hist: string;
   overhead_hist: string;
+  status_hist: string;
 }
 
 interface Combined {
@@ -85,6 +125,8 @@ interface Combined {
   errors: number;
   ok2xx: number;
   rejected4xx: number;
+  rejected4xxGw: number;
+  reachedBackend: number;
   latencySumMs: number;
   maxLatencyMs: number;
   overheadSumMs: number;
@@ -93,17 +135,34 @@ interface Combined {
   bytesResp: number;
   hist: Histogram;
   overheadHist: Histogram;
+  statusHist: StatusHistogram;
 }
 
 function newCombined(r: RollupRow): Combined {
   return {
     protocol: r.protocol, endpoint: r.endpoint, cls: r.cls,
-    count: 0, errors: 0, ok2xx: 0, rejected4xx: 0,
+    count: 0, errors: 0, ok2xx: 0, rejected4xx: 0, rejected4xxGw: 0, reachedBackend: 0,
     latencySumMs: 0, maxLatencyMs: 0,
     overheadSumMs: 0, overheadMaxMs: 0, bytesReq: 0, bytesResp: 0,
-    hist: emptyHistogram(), overheadHist: emptyHistogram()
+    hist: emptyHistogram(), overheadHist: emptyHistogram(), statusHist: emptyStatusHistogram()
   };
 }
+
+/** Count across a status histogram for the named buckets. */
+function statusCount(h: StatusHistogram, buckets: readonly StatusBucket[]): number {
+  let n = 0;
+  for (const b of buckets) {
+    const i = STATUS_BUCKETS.indexOf(b);
+    if (i >= 0) n += h[i] ?? 0;
+  }
+  return n;
+}
+
+const CLIENT_ERROR_BUCKETS: readonly StatusBucket[] =
+  STATUS_BUCKETS.filter((b) => b === "4xx" || /^4\d\d$/.test(b));
+const SERVER_ERROR_BUCKETS: readonly StatusBucket[] =
+  STATUS_BUCKETS.filter((b) => b === "5xx" || /^5\d\d$/.test(b));
+const OK_BUCKETS: readonly StatusBucket[] = ["2xx", "3xx"];
 
 function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class"): Map<string, Combined> {
   // endpoint scope deliberately folds the class away: the same path is hit by
@@ -123,6 +182,8 @@ function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class"): Map<str
     c.errors += r.errors;
     c.ok2xx += r.ok2xx ?? 0;
     c.rejected4xx += r.rejected4xx ?? 0;
+    c.rejected4xxGw += r.rejected4xx_gw ?? 0;
+    c.reachedBackend += r.reached_backend ?? 0;
     c.latencySumMs += r.latency_sum_ms;
     c.maxLatencyMs = Math.max(c.maxLatencyMs, r.max_latency_ms);
     c.overheadSumMs += r.overhead_sum_ms;
@@ -131,6 +192,7 @@ function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class"): Map<str
     c.bytesResp += r.bytes_resp;
     mergeHistograms(c.hist, parseHist(r.hist));
     mergeHistograms(c.overheadHist, parseHist(r.overhead_hist));
+    mergeHistograms(c.statusHist, parseHist(r.status_hist));
   }
   return map;
 }
@@ -183,8 +245,8 @@ function selectRawRows(batchLen: number, results: RequestResult[]): RequestResul
   return kept;
 }
 
-const RAW_COLS = `(ts, run_id, protocol, endpoint, class, method, status, latency_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, error)`;
-const RAW_NCOLS = 13;
+const RAW_COLS = `(ts, run_id, request_id, protocol, endpoint, class, method, status, latency_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, reached_backend, error)`;
+const RAW_NCOLS = 15;
 
 /** build one multi-row INSERT for `rows` raw results */
 function rawInsertSql(rows: number): string {
@@ -193,8 +255,9 @@ function rawInsertSql(rows: number): string {
 }
 
 function rawInsertParams(r: RequestResult): (string | number | null)[] {
-  return [r.ts, r.runId, r.protocol, r.endpoint, r.class, r.method, r.status,
-    r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp, r.error ?? null];
+  return [r.ts, r.runId, r.requestId ?? "", r.protocol, r.endpoint, r.class, r.method, r.status,
+    r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp,
+    r.reachedBackend === true ? 1 : 0, r.error ?? null];
 }
 
 export function createMetricsStore(dbPath: string): MetricsStore {
@@ -203,44 +266,66 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 
   const upsertMinute = db.prepare(layer("rollup_minute"));
   const upsertHour = db.prepare(layer("rollup_hour"));
+
+  /** Element-wise sum of a fixed-length JSON count array against the incoming
+   *  row. The sequence is sized from `excluded`, which is always written at
+   *  full length, so a row stored by an older build (`'[]'`) still merges. */
+  function mergeArrayCol(table: string, col: string): string {
+    return `(
+         SELECT json_group_array(b.sum) FROM (
+           WITH RECURSIVE seq(i) AS (
+             SELECT 0
+             UNION ALL SELECT i+1 FROM seq WHERE i < json_array_length(excluded.${col}) - 1
+           )
+           SELECT COALESCE(json_extract(${table}.${col}, '$[' || i || ']'), 0) +
+                  COALESCE(json_extract(excluded.${col}, '$[' || i || ']'), 0) AS sum
+           FROM seq
+         ) b
+       )`;
+  }
+
   function layer(table: string): string {
     return `
-     INSERT INTO ${table} (bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, latency_sum_ms, max_latency_ms, overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     INSERT INTO ${table} (bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, rejected4xx_gw, reached_backend, latency_sum_ms, max_latency_ms, overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist, status_hist)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(bucket_ts, protocol, endpoint, cls) DO UPDATE SET
        count = count + excluded.count,
        errors = errors + excluded.errors,
        ok2xx = ok2xx + excluded.ok2xx,
        rejected4xx = rejected4xx + excluded.rejected4xx,
+       rejected4xx_gw = rejected4xx_gw + excluded.rejected4xx_gw,
+       reached_backend = reached_backend + excluded.reached_backend,
        latency_sum_ms = latency_sum_ms + excluded.latency_sum_ms,
        max_latency_ms = MAX(max_latency_ms, excluded.max_latency_ms),
        overhead_sum_ms = overhead_sum_ms + excluded.overhead_sum_ms,
        overhead_max_ms = MAX(overhead_max_ms, excluded.overhead_max_ms),
        bytes_req = bytes_req + excluded.bytes_req,
        bytes_resp = bytes_resp + excluded.bytes_resp,
-       hist = (
-         SELECT json_group_array(b.sum) FROM (
-           WITH RECURSIVE seq(i) AS (
-             SELECT 0
-             UNION ALL SELECT i+1 FROM seq WHERE i < json_array_length(excluded.hist) - 1
-           )
-           SELECT COALESCE(json_extract(${table}.hist, '$[' || i || ']'), 0) +
-                  COALESCE(json_extract(excluded.hist, '$[' || i || ']'), 0) AS sum
-           FROM seq
-         ) b
-       ),
-       overhead_hist = (
-         SELECT json_group_array(b.sum) FROM (
-           WITH RECURSIVE seq(i) AS (
-             SELECT 0
-             UNION ALL SELECT i+1 FROM seq WHERE i < json_array_length(excluded.overhead_hist) - 1
-           )
-           SELECT COALESCE(json_extract(${table}.overhead_hist, '$[' || i || ']'), 0) +
-                  COALESCE(json_extract(excluded.overhead_hist, '$[' || i || ']'), 0) AS sum
-           FROM seq
-         ) b
-       )`;
+       hist = ${mergeArrayCol(table, "hist")},
+       overhead_hist = ${mergeArrayCol(table, "overhead_hist")},
+       status_hist = ${mergeArrayCol(table, "status_hist")}`;
   }
+  const upsertShed = db.prepare(
+    `INSERT INTO load_shed (bucket_ts, dropped, target_sum, ticks) VALUES (?, ?, ?, ?)
+     ON CONFLICT(bucket_ts) DO UPDATE SET
+       dropped = dropped + excluded.dropped,
+       target_sum = target_sum + excluded.target_sum,
+       ticks = ticks + excluded.ticks`
+  );
+  const upsertHealth = db.prepare(
+    `INSERT INTO host_health (bucket_ts, samples, cpu_sum, cpu_max, loop_p99_sum, loop_p99_max)
+     VALUES (?, 1, ?, ?, ?, ?)
+     ON CONFLICT(bucket_ts) DO UPDATE SET
+       samples = samples + 1,
+       cpu_sum = cpu_sum + excluded.cpu_sum,
+       cpu_max = MAX(cpu_max, excluded.cpu_max),
+       loop_p99_sum = loop_p99_sum + excluded.loop_p99_sum,
+       loop_p99_max = MAX(loop_p99_max, excluded.loop_p99_max)`
+  );
+  const upsertPolicy = db.prepare(
+    `INSERT INTO policy_results (id, checked_at, payload) VALUES (?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET checked_at = excluded.checked_at, payload = excluded.payload`
+  );
   const insertRun = db.prepare(`INSERT INTO runs (run_id, started_at, profile) VALUES (?, ?, ?)`);
   const stopRun = db.prepare(`UPDATE runs SET stopped_at = ? WHERE run_id = ? AND stopped_at IS NULL`);
   const getConfig = db.prepare(`SELECT value FROM config WHERE key = ?`);
@@ -253,8 +338,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 
   const readRows = (table: "rollup_minute" | "rollup_hour", fromBucket: number, toBucket: number): RollupRow[] =>
     db.prepare(
-      `SELECT bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, latency_sum_ms, max_latency_ms,
-              overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist
+      `SELECT bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, rejected4xx_gw,
+              reached_backend, latency_sum_ms, max_latency_ms,
+              overhead_sum_ms, overhead_max_ms, bytes_req, bytes_resp, hist, overhead_hist, status_hist
        FROM ${table} WHERE bucket_ts >= ? AND bucket_ts <= ?`
     ).all(fromBucket, toBucket) as unknown as RollupRow[];
 
@@ -262,12 +348,14 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const n = Number(limit);
     // guard both NaN and negatives: SQLite reads LIMIT -1 as "no limit"
     const safe = Number.isFinite(n) ? Math.min(LIMITS.recentLimit, Math.max(1, Math.trunc(n))) : 100;
-    return db.prepare(
-      `SELECT ts, run_id AS runId, protocol, endpoint, class, method, status,
+    const rows = db.prepare(
+      `SELECT ts, run_id AS runId, request_id AS requestId, protocol, endpoint, class, method, status,
               latency_ms AS latencyMs, baseline_ms AS baselineMs, overhead_ms AS overheadMs,
-              bytes_req AS bytesReq, bytes_resp AS bytesResp, error
+              bytes_req AS bytesReq, bytes_resp AS bytesResp, reached_backend AS reachedBackend, error
        FROM requests_raw ORDER BY ts DESC LIMIT ?`
-    ).all(safe) as unknown as RequestResult[];
+    ).all(safe) as unknown as (Omit<RequestResult, "reachedBackend"> & { reachedBackend: number })[];
+    // SQLite has no boolean type; hand the UI a real one rather than 0/1
+    return rows.map((r) => ({ ...r, reachedBackend: r.reachedBackend === 1 }));
   };
 
   /** Above this window length the hour roll-up is used instead of the minute
@@ -283,13 +371,93 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   /** Wall-clock time of the most recent successfully ingested batch. */
   let lastIngestAt: number | null = null;
 
-  function windowRows(windowMs: number): RollupRow[] {
-    const now = Date.now();
-    const from = now - windowMs;
-    if (windowMs <= MINUTE_LAYER_MAX_MS) {
-      return readRows("rollup_minute", Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS, Math.floor(now / MINUTE_BUCKETS) * MINUTE_BUCKETS);
+  function windowRows(from: number, to: number): RollupRow[] {
+    const spanMs = to - from;
+    if (spanMs <= MINUTE_LAYER_MAX_MS) {
+      return readRows("rollup_minute", Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS, Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS);
     }
-    return readRows("rollup_hour", Math.floor(from / HOUR_BUCKETS) * HOUR_BUCKETS, Math.floor(now / HOUR_BUCKETS) * HOUR_BUCKETS);
+    return readRows("rollup_hour", Math.floor(from / HOUR_BUCKETS) * HOUR_BUCKETS, Math.floor(to / HOUR_BUCKETS) * HOUR_BUCKETS);
+  }
+
+  /**
+   * Whether this window's numbers can be believed.
+   *
+   * Both inputs are minute-granular regardless of which roll-up layer the
+   * metrics came from — one row per minute is cheap even across a week, and a
+   * validity signal averaged into hour buckets would hide exactly the short
+   * saturation spikes it exists to catch.
+   */
+  function validityFor(from: number, to: number, total: number): WindowValidity {
+    const fromB = Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS;
+    const toB = Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS;
+    const shed = db.prepare(
+      `SELECT COALESCE(SUM(dropped),0) AS dropped, COALESCE(SUM(target_sum),0) AS targetSum,
+              COALESCE(SUM(ticks),0) AS ticks
+       FROM load_shed WHERE bucket_ts >= ? AND bucket_ts <= ?`
+    ).get(fromB, toB) as { dropped: number; targetSum: number; ticks: number };
+    const health = db.prepare(
+      `SELECT COALESCE(MAX(cpu_max),-1) AS cpuMax, COALESCE(MAX(loop_p99_max),-1) AS loopMax,
+              COALESCE(SUM(samples),0) AS samples
+       FROM host_health WHERE bucket_ts >= ? AND bucket_ts <= ?`
+    ).get(fromB, toB) as { cpuMax: number; loopMax: number; samples: number };
+
+    const windowSec = Math.max(1, (to - from) / 1000);
+    const dropped = Number(shed.dropped) || 0;
+    const issued = total;
+    const intended = issued + dropped;
+    const shedPct = intended === 0 ? 0 : (100 * dropped) / intended;
+    const targetRps = Number(shed.ticks) > 0 ? Number(shed.targetSum) / Number(shed.ticks) : null;
+    const cpuMax = Number(health.samples) > 0 && health.cpuMax >= 0 ? health.cpuMax : null;
+    const loopMax = Number(health.samples) > 0 && health.loopMax >= 0 ? health.loopMax : null;
+
+    const reasons: string[] = [];
+    if (shedPct > VALIDITY_LIMITS.shedPct) {
+      reasons.push(
+        `${shedPct.toFixed(1)}% of the intended load was never issued (${dropped.toLocaleString()} requests) — ` +
+        `the concurrency ceiling throttled the generator, so the target was never actually offered to the gateway`
+      );
+    }
+    if (cpuMax !== null && cpuMax > VALIDITY_LIMITS.cpuProcessPct) {
+      reasons.push(`generator CPU peaked at ${cpuMax.toFixed(0)}% of the machine (limit ${VALIDITY_LIMITS.cpuProcessPct}%) — measured latency includes our own queueing`);
+    }
+    if (loopMax !== null && loopMax > VALIDITY_LIMITS.eventLoopP99Ms) {
+      reasons.push(`event-loop p99 stalled at ${loopMax.toFixed(0)} ms (limit ${VALIDITY_LIMITS.eventLoopP99Ms} ms) — every latency in this window is inflated by that much`);
+    }
+
+    return {
+      ok: reasons.length === 0,
+      reasons,
+      droppedRequests: dropped,
+      shedPct,
+      targetRps,
+      achievedRps: issued / windowSec,
+      cpuProcessPctMax: cpuMax,
+      eventLoopP99MsMax: loopMax
+    };
+  }
+
+  /**
+   * How much of a report window is somebody else's traffic.
+   *
+   * Roll-ups carry no run id, so a per-run summary is really "everything in the
+   * minutes this run touched". The raw table does carry one, and it is kept for
+   * 24h — long enough to answer this for any run you would actually report on.
+   * Older than that, the honest answer is "unknown", not "zero".
+   */
+  function windowScope(runId: string, from: number, to: number): WindowScope {
+    const fromB = Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS;
+    const toB = Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS + MINUTE_BUCKETS - 1;
+    const row = db.prepare(
+      `SELECT COUNT(*) AS total, COALESCE(SUM(CASE WHEN run_id <> ? THEN 1 ELSE 0 END), 0) AS foreign_rows
+         FROM requests_raw WHERE ts >= ? AND ts <= ?`
+    ).get(runId, fromB, toB) as { total: number; foreign_rows: number };
+    const total = Number(row.total) || 0;
+    const foreignRequests = Number(row.foreign_rows) || 0;
+    return {
+      foreignRequests,
+      totalRequests: total,
+      foreignPct: total === 0 ? 0 : (100 * foreignRequests) / total
+    };
   }
 
   function ingestBatch(batch: IngestBatch): { ingested: number; duplicate?: boolean } {
@@ -301,10 +469,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     interface Bucket {
       bucket_ts: number; protocol: string; endpoint: string; cls: string;
       count: number; errors: number; ok2xx: number; rejected4xx: number;
+      rejected4xx_gw: number; reached_backend: number;
       latency_sum_ms: number; max_latency_ms: number;
       overhead_sum_ms: number; overhead_max_ms: number;
       bytes_req: number; bytes_resp: number;
-      hist: Histogram; overhead_hist: Histogram;
+      hist: Histogram; overhead_hist: Histogram; status_hist: StatusHistogram;
     }
     const minute = new Map<string, Bucket>();
     const hour = new Map<string, Bucket>();
@@ -325,6 +494,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         const isErr = r.status === 0 || r.status >= 500;
         const is2xx = r.status >= 200 && r.status < 300;
         const is4xx = r.status >= 400 && r.status < 500;
+        // `X-Server-Ms` on the response is the backend's fingerprint. Without
+        // it the response was manufactured before the backend was reached —
+        // which is how "the gateway rejected it" is told apart from "the
+        // backend rejected it" for the deliberately-invalid slice.
+        const reached = r.reachedBackend === true;
 
         for (const [bucketTs, table] of [[mB, minute], [hB, hour]] as const) {
           const key = `${bucketTs}|${r.protocol}|${r.endpoint}|${r.class}`;
@@ -333,10 +507,12 @@ export function createMetricsStore(dbPath: string): MetricsStore {
             b = {
               bucket_ts: bucketTs, protocol: r.protocol, endpoint: r.endpoint, cls: r.class,
               count: 0, errors: 0, ok2xx: 0, rejected4xx: 0,
+              rejected4xx_gw: 0, reached_backend: 0,
               latency_sum_ms: 0, max_latency_ms: 0,
               overhead_sum_ms: 0, overhead_max_ms: 0,
               bytes_req: 0, bytes_resp: 0,
-              hist: emptyHistogram(), overhead_hist: emptyHistogram()
+              hist: emptyHistogram(), overhead_hist: emptyHistogram(),
+              status_hist: emptyStatusHistogram()
             };
             table.set(key, b);
           }
@@ -344,6 +520,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           b.errors += isErr ? 1 : 0;
           b.ok2xx += is2xx ? 1 : 0;
           b.rejected4xx += is4xx ? 1 : 0;
+          b.rejected4xx_gw += is4xx && !reached ? 1 : 0;
+          b.reached_backend += reached ? 1 : 0;
           b.latency_sum_ms += r.latencyMs;
           b.max_latency_ms = Math.max(b.max_latency_ms, r.latencyMs);
           b.overhead_sum_ms += r.overheadMs;
@@ -352,6 +530,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           b.bytes_resp += r.bytesResp;
           addToHistogram(b.hist, r.latencyMs);
           addToHistogram(b.overhead_hist, r.overheadMs);
+          addToStatusHistogram(b.status_hist, r.status);
         }
       }
       // requests_raw is only ever read by the recent tail (GET /api/recent,
@@ -366,11 +545,24 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         const params = slice.flatMap(rawInsertParams);
         db.prepare(rawInsertSql(slice.length)).run(...params);
       }
-      for (const b of minute.values()) {
-        upsertMinute.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
-      }
-      for (const b of hour.values()) {
-        upsertHour.run(b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx, b.latency_sum_ms, b.max_latency_ms, b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp, JSON.stringify(b.hist), JSON.stringify(b.overhead_hist));
+      const upsertParams = (b: Bucket): unknown[] => [
+        b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx,
+        b.rejected4xx_gw, b.reached_backend, b.latency_sum_ms, b.max_latency_ms,
+        b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp,
+        JSON.stringify(b.hist), JSON.stringify(b.overhead_hist), JSON.stringify(b.status_hist)
+      ];
+      for (const b of minute.values()) upsertMinute.run(...upsertParams(b));
+      for (const b of hour.values()) upsertHour.run(...upsertParams(b));
+      // shed rows ride the same transaction as the requests they explain, so a
+      // window can never show the load we issued without the load we did not
+      for (const s of batch.shed ?? []) {
+        if (!Number.isFinite(s?.bucketTs)) continue;
+        upsertShed.run(
+          Math.floor(s.bucketTs / MINUTE_BUCKETS) * MINUTE_BUCKETS,
+          Math.max(0, Math.round(s.dropped) || 0),
+          Number.isFinite(s.targetSum) ? s.targetSum : 0,
+          Math.max(0, Math.round(s.ticks) || 0)
+        );
       }
       markBatch.run(batch.batchId, Date.now());
       db.exec("COMMIT");
@@ -383,10 +575,16 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   }
 
   function summary(windowMs: number): MetricSummary {
+    const now = Date.now();
+    return summaryBetween(now - windowMs, now);
+  }
+
+  function summaryBetween(from: number, to: number): MetricSummary {
     // Roll-ups are written synchronously during ingest, so they already include
     // the in-progress minute. There is deliberately no separate "live tail" pass
     // here — adding one double-counted every request in the current bucket.
-    const rows = windowRows(windowMs);
+    const rows = windowRows(from, to);
+    const windowMs = Math.max(0, to - from);
     const byEndpointCls = rowsToCombined(rows, "endpoint");
     const byClass = rowsToCombined(rows, "class");
 
@@ -398,6 +596,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     let overheadSum = 0;
     const totalHist = emptyHistogram();
     const totalOverheadHist = emptyHistogram();
+    const totalStatusHist = emptyStatusHistogram();
     const perEndpoint: EndpointStat[] = [];
     const perClass: ClassStat[] = [];
     const protoAcc = new Map<string, { total: number; errors: number }>();
@@ -413,6 +612,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       overheadSum += c.overheadSumMs;
       mergeHistograms(totalHist, c.hist);
       mergeHistograms(totalOverheadHist, c.overheadHist);
+      mergeHistograms(totalStatusHist, c.statusHist);
       perEndpoint.push({
         protocol: c.protocol === "soap" ? "soap" : "rest",
         endpoint: c.endpoint,
@@ -431,13 +631,22 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       protoAcc.set(c.protocol, acc);
     }
 
+    // Every request that did not return 2xx/3xx, minus the invalid slice's
+    // rejections — those are the point of that slice, not a failure.
+    let unexpectedFailures = 0;
     for (const [cls, c] of byClass.entries()) {
       if (c.count === 0) continue;
+      const notOk = c.count - statusCount(c.statusHist, OK_BUCKETS);
+      // an `invalid` request answered 4xx is a pass, not a failure; an invalid
+      // request that 502s or 2xxs still counts against the gateway
+      unexpectedFailures += cls === "invalid" ? Math.max(0, notOk - c.rejected4xx) : notOk;
       perClass.push({
         cls: cls as ScenarioClass,
         total: c.count,
         errors: c.errors,
         errorPct: (100 * c.errors) / c.count,
+        clientErrors: statusCount(c.statusHist, CLIENT_ERROR_BUCKETS),
+        gatewayErrors: statusCount(c.statusHist, GATEWAY_FAULT_BUCKETS),
         rps: perSec(c.count),
         latencyMs: {
           p50: percentile(c.hist, 50),
@@ -457,11 +666,34 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     }
 
     const invalid = byClass.get("invalid");
+    const status: StatusBreakdown = {
+      buckets: STATUS_BUCKETS
+        .map((bucket, i) => ({ bucket: bucket as StatusBucket, count: totalStatusHist[i] ?? 0 }))
+        .filter((b) => b.count > 0)
+        .sort((a, b) => b.count - a.count),
+      ok: statusCount(totalStatusHist, OK_BUCKETS),
+      clientErrors: statusCount(totalStatusHist, CLIENT_ERROR_BUCKETS),
+      serverErrors: statusCount(totalStatusHist, SERVER_ERROR_BUCKETS),
+      gatewayErrors: statusCount(totalStatusHist, GATEWAY_FAULT_BUCKETS),
+      rateLimited: statusCount(totalStatusHist, ["429"]),
+      unauthorized: statusCount(totalStatusHist, ["401", "403"]),
+      networkErrors: statusCount(totalStatusHist, ["net"])
+    };
+    const contract: ContractStats = {
+      invalidSent: invalid?.count ?? 0,
+      rejectedByGateway: invalid?.rejected4xxGw ?? 0,
+      rejectedByBackend: Math.max(0, (invalid?.rejected4xx ?? 0) - (invalid?.rejected4xxGw ?? 0)),
+      leakedToBackend: invalid?.reachedBackend ?? 0,
+      wronglyAccepted: invalid?.ok2xx ?? 0,
+      rejected4xx: invalid?.rejected4xx ?? 0
+    };
     return {
       windowSec,
       total,
       errors,
       errorPct: total === 0 ? 0 : (100 * errors) / total,
+      unexpectedFailures,
+      unexpectedFailurePct: total === 0 ? 0 : (100 * unexpectedFailures) / total,
       rps: perSec(total),
       latencyMs: {
         p50: percentile(totalHist, 50),
@@ -479,6 +711,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         avg: overheadSum / Math.max(total, 1)
       },
       bytes: { req: bytesReq, resp: bytesResp, respPerSec: perSec(bytesResp) },
+      status,
+      validity: validityFor(from, to, total),
       perProtocol: [...protoAcc.entries()].map(([protocol, a]) => ({
         protocol: protocol === "soap" ? "soap" as const : "rest" as const,
         total: a.total,
@@ -486,11 +720,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       })),
       perEndpoint: perEndpoint.sort((a, b) => b.total - a.total),
       perClass: perClass.sort((a, b) => b.total - a.total),
-      contract: {
-        invalidSent: invalid?.count ?? 0,
-        rejected4xx: invalid?.rejected4xx ?? 0,
-        wronglyAccepted: invalid?.ok2xx ?? 0
-      }
+      contract
     };
   }
 
@@ -516,7 +746,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const rows = readRows(table, startB, toB);
 
     interface Acc {
-      ts: number; total: number; errors: number; bytesResp: number;
+      ts: number; total: number; errors: number; clientErrors: number; gatewayErrors: number;
+      bytesResp: number;
       restTotal: number; soapTotal: number; restErrors: number; soapErrors: number;
       hist: Histogram; overheadHist: Histogram;
     }
@@ -525,7 +756,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       let p = points.get(r.bucket_ts);
       if (!p) {
         p = {
-          ts: r.bucket_ts, total: 0, errors: 0, bytesResp: 0,
+          ts: r.bucket_ts, total: 0, errors: 0, clientErrors: 0, gatewayErrors: 0, bytesResp: 0,
           restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0,
           hist: emptyHistogram(), overheadHist: emptyHistogram()
         };
@@ -533,6 +764,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       }
       p.total += r.count;
       p.errors += r.errors;
+      p.clientErrors += r.rejected4xx ?? 0;
+      p.gatewayErrors += statusCount(parseHist(r.status_hist), GATEWAY_FAULT_BUCKETS);
       p.bytesResp += r.bytes_resp;
       mergeHistograms(p.hist, parseHist(r.hist));
       mergeHistograms(p.overheadHist, parseHist(r.overhead_hist));
@@ -561,7 +794,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     for (let t = startB; t <= toB; t += sizeMs) {
       const p = points.get(t);
       if (!p) {
-        const zero: TimePoint = { ts: t, total: 0, errors: 0, rps: 0, p50: 0, p90: 0, p99: 0, overheadP50: 0, overheadP95: 0, overheadP99: 0, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 };
+        const zero: TimePoint = { ts: t, total: 0, errors: 0, clientErrors: 0, gatewayErrors: 0, rps: 0, p50: 0, p90: 0, p99: 0, overheadP50: 0, overheadP95: 0, overheadP99: 0, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 };
         if (windowIsCurrent && live && (t === toB || (lastDataTs !== null && t > lastDataTs))) {
           zero.partial = true;
         }
@@ -570,6 +803,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       }
       const point: TimePoint = {
         ts: p.ts, total: p.total, errors: p.errors,
+        clientErrors: p.clientErrors, gatewayErrors: p.gatewayErrors,
         rps: p.total / bucketSec,
         p50: percentile(p.hist, 50),
         p90: percentile(p.hist, 90),
@@ -597,6 +831,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       db.prepare(`DELETE FROM rollup_minute WHERE bucket_ts < ?`).run(minuteCutoff);
       const hourCutoff = Math.floor((Date.now() - HOUR_RETENTION_MS) / HOUR_BUCKETS) * HOUR_BUCKETS;
       db.prepare(`DELETE FROM rollup_hour WHERE bucket_ts < ?`).run(hourCutoff);
+      // validity inputs are minute-granular and only ever read alongside the
+      // minute layer, so they age out on the same schedule as it
+      db.prepare(`DELETE FROM load_shed WHERE bucket_ts < ?`).run(minuteCutoff);
+      db.prepare(`DELETE FROM host_health WHERE bucket_ts < ?`).run(minuteCutoff);
       cleanupSeen.run(Date.now() - 6 * HOUR_BUCKETS);
       // WAL would otherwise grow without bound across a multi-week run
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -607,11 +845,60 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   }, 10 * 60_000);
   rawCleaner.unref();
 
+  const readJsonConfig = <T,>(key: string, coerce: (raw: unknown) => T): T => {
+    const row = getConfig.get(key) as { value: string } | undefined;
+    if (!row) return coerce(undefined);
+    try { return coerce(JSON.parse(row.value)); } catch { return coerce(undefined); }
+  };
+
   return {
     ingestBatch,
     summary,
+    summaryBetween,
+    windowScope,
     timeseries,
     recent: readRawRecent,
+    recordHealth: (s) => {
+      // a null CPU means the sampler had no previous sample to delta against;
+      // folding 0 in would make a starting process look idle rather than unknown
+      if (s.cpuProcessPct === null && s.eventLoopP99ms === null) return;
+      const bucket = Math.floor(s.ts / MINUTE_BUCKETS) * MINUTE_BUCKETS;
+      const cpu = s.cpuProcessPct ?? 0;
+      const loop = s.eventLoopP99ms ?? 0;
+      upsertHealth.run(bucket, cpu, cpu, loop, loop);
+    },
+    readPolicyResults: () => {
+      const rows = db.prepare(`SELECT payload FROM policy_results ORDER BY id`).all() as unknown as { payload: string }[];
+      const out: PolicyResult[] = [];
+      for (const r of rows) {
+        try { out.push(JSON.parse(r.payload) as PolicyResult); } catch { /* a row we can't read is a row we skip */ }
+      }
+      return out;
+    },
+    writePolicyResults: (results) => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        for (const r of results) upsertPolicy.run(r.id, r.checkedAt, JSON.stringify(r));
+        db.exec("COMMIT");
+      } catch (e) {
+        try { db.exec("ROLLBACK"); } catch { /* already unwound */ }
+        throw e;
+      }
+    },
+    readPolicyConfig: () => readJsonConfig("policy", (raw) => sanitizePolicyConfig(raw, DEFAULT_POLICY_CONFIG)),
+    writePolicyConfig: (cfg) => setConfig.run("policy", JSON.stringify(cfg)),
+    readSlo: () => readJsonConfig("slo", (raw) => sanitizeSlo(raw, DEFAULT_SLO)),
+    writeSlo: (slo) => setConfig.run("slo", JSON.stringify(slo)),
+    findRun: (runId) => {
+      const row = db.prepare(
+        `SELECT id, run_id AS runId, started_at AS startedAt, stopped_at AS stoppedAt, profile
+         FROM runs WHERE run_id = ? ORDER BY started_at DESC LIMIT 1`
+      ).get(runId) as unknown as (Omit<RunEvent, "profile"> & { profile: string }) | undefined;
+      if (!row) return null;
+      let profile: LoadProfile;
+      try { profile = JSON.parse(row.profile) as LoadProfile; } catch { profile = {} as LoadProfile; }
+      return { ...row, profile };
+    },
     readGateway: () => {
       const row = getConfig.get("gateway") as { value: string } | undefined;
       if (!row) return null;
@@ -625,6 +912,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         db.exec("DELETE FROM requests_raw");
         db.exec("DELETE FROM rollup_minute");
         db.exec("DELETE FROM rollup_hour");
+        db.exec("DELETE FROM load_shed");
+        db.exec("DELETE FROM host_health");
+        db.exec("DELETE FROM policy_results");
         db.exec("DELETE FROM ingest_seen");
         db.exec("DELETE FROM runs");
         db.exec("COMMIT");
@@ -666,12 +956,25 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   };
 }
 
-/** Additive migrations for databases created by an older build. */
+/**
+ * Additive migrations for databases created by an older build.
+ *
+ * Every column defaults to a value that reads as "we did not record this", so a
+ * pre-migration bucket reports zero gateway rejections rather than inventing
+ * them: `status_hist` of `'[]'` merges positionally as all-zero, and
+ * `reached_backend`/`rejected4xx_gw` of 0 leave the contract block showing the
+ * conservative answer for old data instead of a flattering one.
+ */
 function migrate(db: DbHandle): void {
   for (const table of ["rollup_minute", "rollup_hour"]) {
     ensureColumn(db, table, "ok2xx", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, table, "rejected4xx", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, table, "rejected4xx_gw", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, table, "reached_backend", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, table, "status_hist", "TEXT NOT NULL DEFAULT '[]'");
   }
+  ensureColumn(db, "requests_raw", "request_id", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, "requests_raw", "reached_backend", "INTEGER NOT NULL DEFAULT 0");
 }
 
 export const HISTOGRAM_EDGES = HISTOGRAM_EDGES_MS;

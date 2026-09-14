@@ -1,5 +1,5 @@
-import type { GwTargets, LoadProfile } from "@apigw/shared";
-import { DEFAULT_LOAD_PROFILE } from "@apigw/shared";
+import type { ForwardBasicAuth, GwConfig, GwTargets, LoadProfile } from "@apigw/shared";
+import { DEFAULT_LOAD_PROFILE, FORWARD_BASIC_AUTH_MODES } from "@apigw/shared";
 
 /**
  * Read an environment variable, treating blank as unset.
@@ -42,13 +42,20 @@ export function readConfig(): AppConfig {
     baseUrl: env("GW_BASE_URL"),
     apiKey: env("GW_API_KEY"),
     apiKeyHeader: env("GW_API_KEY_HEADER"),
-    pathPrefix: env("GW_PATH_PREFIX")
+    pathPrefix: env("GW_PATH_PREFIX"),
+    forwardBasicAuth: env("GW_FORWARD_BASIC_AUTH")
   };
-  const side = (p: "REST" | "SOAP") => ({
+  const forward = (raw: string | undefined): ForwardBasicAuth =>
+    FORWARD_BASIC_AUTH_MODES.includes(raw as ForwardBasicAuth) ? (raw as ForwardBasicAuth) : "auto";
+
+  const side = (p: "REST" | "SOAP"): GwConfig => ({
     baseUrl: env(`GW_${p}_BASE_URL`) ?? legacy.baseUrl ?? selfUrl,
     apiKey: env(`GW_${p}_API_KEY`) ?? legacy.apiKey ?? "",
     apiKeyHeader: env(`GW_${p}_API_KEY_HEADER`) ?? legacy.apiKeyHeader ?? "X-API-Key",
-    pathPrefix: env(`GW_${p}_PATH_PREFIX`) ?? legacy.pathPrefix ?? ""
+    pathPrefix: env(`GW_${p}_PATH_PREFIX`) ?? legacy.pathPrefix ?? "",
+    // "auto" — forward this rig's Basic credential only to our own origin.
+    // Anything else must be opted into explicitly; see ForwardBasicAuth.
+    forwardBasicAuth: forward(env(`GW_${p}_FORWARD_BASIC_AUTH`) ?? legacy.forwardBasicAuth)
   });
 
   return {
