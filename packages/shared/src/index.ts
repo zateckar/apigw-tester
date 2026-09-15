@@ -413,9 +413,17 @@ export interface RequestResult {
   method: string;
   status: number; // 0 = network error / timeout
   latencyMs: number;
-  /** Estimated ms cost the gateway added vs. hitting the SUT directly. */
+  /** Time to first byte: start → response headers arrived. Null when the
+   *  request never got a response (network error / timeout). */
+  ttfbMs: number | null;
+  /** Estimated ms of the request not attributable to the gateway: backend
+   *  time (exact per request via X-Server-Ms, else class baseline) plus the
+   *  direct-path transport measured on baseline probes. */
   baselineMs: number;
-  overheadMs: number; // latencyMs - baselineMs (clipped at 0)
+  /** What the gateway added before the first byte: ttfbMs - baselineMs
+   *  (clipped at 0). Response-body transfer is deliberately excluded — it
+   *  stays visible as latencyMs - ttfbMs. */
+  overheadMs: number;
   bytesReq: number;
   bytesResp: number;
   /**

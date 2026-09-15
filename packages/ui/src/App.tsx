@@ -743,7 +743,7 @@ export default function App() {
           <thead>
             <tr>
               <th>Time</th><th>Request id</th><th>Proto</th><th>Method</th><th>Endpoint</th>
-              <th>Status</th><th>Answered by</th><th>Latency</th><th>Resp</th><th>Error</th>
+              <th>Status</th><th>Answered by</th><th>Latency</th><th>TTFB</th><th>Body</th><th>GW OH</th><th>Resp</th><th>Error</th>
             </tr>
           </thead>
           <tbody>
@@ -767,11 +767,14 @@ export default function App() {
                     "gateway" here means the response never reached the SUT */}
                 <td className="hint">{r.reachedBackend ? "backend" : "gateway"}</td>
                 <td>{fmtMs(r.latencyMs)}</td>
+                <td>{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(r.ttfbMs)}</td>
+                <td className="hint">{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(Math.max(0, r.latencyMs - r.ttfbMs))}</td>
+                <td>{fmtMs(r.overheadMs)}</td>
                 <td>{fmtBytes(r.bytesResp)}</td>
                 <td className="hint">{r.error ?? ""}</td>
               </tr>
             ))}
-            {recent.length === 0 && <tr><td colSpan={10} className="hint">Nothing yet.</td></tr>}
+            {recent.length === 0 && <tr><td colSpan={13} className="hint">Nothing yet.</td></tr>}
           </tbody>
         </table>
       </div>

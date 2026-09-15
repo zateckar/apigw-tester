@@ -12,7 +12,7 @@ function mk(over: Partial<RequestResult> = {}): RequestResult {
   return {
     runId: "r1", requestId: `req${++seq}`, ts: Date.now(), protocol: "rest", endpoint: "GET /api/pets",
     class: "small-rest", method: "GET", status: 200,
-    latencyMs: 100, baselineMs: 0, overheadMs: 100,
+    latencyMs: 100, ttfbMs: 80, baselineMs: 0, overheadMs: 100,
     bytesReq: 10, bytesResp: 100, reachedBackend: true, error: null,
     ...over
   };

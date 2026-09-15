@@ -295,14 +295,14 @@ export class Driver {
       const auth = expectedAuthHeader();
       if (auth) headers["authorization"] = auth.toString("utf-8");
       const res = await fetch(url, { method: spec.method, headers, body: spec.body, signal: ac.signal });
+      // headers arrived: transport incl. connect+send+backend is now known
+      const ttfb = Date.now() - t0;
       await res.arrayBuffer();
-      const rtt = Date.now() - t0;
       // subtract the SUT's own time and batch the remainder (transport + client
-      // stack) across all classes: per-request serverMs covers the class random
-      // variation at run time, so a per-class total-latency baseline would just
-      // re-import the noise we removed
+      // stack) across all classes; body transfer after TTFB is excluded so the
+      // baseline matches the run-time overhead, which is also TTFB-based
       const serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
-      return serverMs === null ? rtt : Math.max(0, rtt - serverMs);
+      return serverMs === null ? ttfb : Math.max(0, ttfb - serverMs);
     } catch {
       return null;
     } finally {
@@ -319,11 +319,12 @@ export class Driver {
   }
 
   /**
-   * Split a through-gateway latency into backend time and gateway time for the
-   * *same* request. With X-Server-Ms present this is exact: the backend's own
-   * variability (per-request sleeps, chaos, padding) lands in baselineMs and
-   * never in overheadMs. Without it (gateway-generated rejection, or a real SUT
-   * with no header) we fall back to the class baseline as the backend estimate.
+   * Split a through-gateway time-to-first-byte into backend time and gateway
+   * time for the *same* request. With X-Server-Ms present this is exact: the
+   * backend's own variability (per-request sleeps, chaos, padding) lands in
+   * baselineMs and never in overheadMs. Without it (gateway-generated
+   * rejection, or a real SUT with no header) we fall back to the class
+   * baseline as the backend estimate.
    */
   private overheadFor(cls: ScenarioClass, latencyMs: number, serverMs: number | null): { baselineMs: number; overheadMs: number } {
     const backendMs = Math.max(0, serverMs ?? this.baselineFor(cls));
@@ -527,6 +528,7 @@ export class Driver {
     const timeout = setTimeout(() => ac.abort(), budgetMs);
     let status = 0;
     let bytesResp = 0;
+    let ttfbMs: number | null = null;
     let error: string | null = null;
     /** SUT's own time for this request; null when the response never touched the
      *  SUT (gateway's own rejection) or a real gateway stripped the header. */
@@ -547,6 +549,8 @@ export class Driver {
         signal: ac.signal
       });
       status = res.status;
+      // fetch() resolves on response headers: this is the request's TTFB
+      ttfbMs = Date.now() - started;
       serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
       // only the createPet flow needs the parsed body (to learn the new id);
       // everything else just wants the byte count, which the length header
@@ -602,7 +606,11 @@ export class Driver {
 
     const finished = Date.now();
     const latencyMs = finished - started;
-    const { baselineMs, overheadMs } = this.overheadFor(spec.class, latencyMs, serverMs);
+    // Overhead uses TTFB, not end-of-body: what the gateway adds to finding
+    // and proxying the request. Body transfer time after headers (which for a
+    // multi-MB response dwarfs everything else and mostly charges link speed
+    // to the gateway) stays in total latency, not in "GW overhead".
+    const { baselineMs, overheadMs } = this.overheadFor(spec.class, ttfbMs ?? latencyMs, serverMs);
 
     this.record({
       runId,
@@ -614,6 +622,7 @@ export class Driver {
       method: spec.method,
       status,
       latencyMs,
+      ttfbMs,
       baselineMs,
       overheadMs,
       bytesReq: spec.class === "big-request" ? bigRequestBytes(spec.body) : Buffer.byteLength(spec.body ?? ""),

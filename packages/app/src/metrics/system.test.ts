@@ -51,7 +51,7 @@ function batch(bytesReq: number, bytesResp: number): IngestBatch {
     results: [{
       runId: "r", requestId: `req-${Math.random()}`, ts: Date.now(), protocol: "rest", endpoint: "GET /x",
       class: "small-rest", method: "GET", status: 200,
-      latencyMs: 1, baselineMs: 0, overheadMs: 1,
+      latencyMs: 1, ttfbMs: 1, baselineMs: 0, overheadMs: 1,
       bytesReq, bytesResp, reachedBackend: true, error: null
     }]
   };

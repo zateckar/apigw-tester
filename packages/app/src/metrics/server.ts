@@ -248,8 +248,8 @@ function selectRawRows(batchLen: number, results: RequestResult[]): RequestResul
   return kept;
 }
 
-const RAW_COLS = `(ts, run_id, request_id, protocol, endpoint, class, method, status, latency_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, reached_backend, error)`;
-const RAW_NCOLS = 15;
+const RAW_COLS = `(ts, run_id, request_id, protocol, endpoint, class, method, status, latency_ms, ttfb_ms, baseline_ms, overhead_ms, bytes_req, bytes_resp, reached_backend, error)`;
+const RAW_NCOLS = 16;
 
 /** build one multi-row INSERT for `rows` raw results */
 function rawInsertSql(rows: number): string {
@@ -259,7 +259,7 @@ function rawInsertSql(rows: number): string {
 
 function rawInsertParams(r: RequestResult): (string | number | null)[] {
   return [r.ts, r.runId, r.requestId ?? "", r.protocol, r.endpoint, r.class, r.method, r.status,
-    r.latencyMs, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp,
+    r.latencyMs, r.ttfbMs ?? null, r.baselineMs, r.overheadMs, r.bytesReq, r.bytesResp,
     r.reachedBackend === true ? 1 : 0, r.error ?? null];
 }
 
@@ -350,7 +350,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const safe = Number.isFinite(n) ? Math.min(LIMITS.recentLimit, Math.max(1, Math.trunc(n))) : 100;
     const rows = db.prepare(
       `SELECT ts, run_id AS runId, request_id AS requestId, protocol, endpoint, class, method, status,
-              latency_ms AS latencyMs, baseline_ms AS baselineMs, overhead_ms AS overheadMs,
+              latency_ms AS latencyMs, ttfb_ms AS ttfbMs, baseline_ms AS baselineMs, overhead_ms AS overheadMs,
               bytes_req AS bytesReq, bytes_resp AS bytesResp, reached_backend AS reachedBackend, error
        FROM requests_raw ORDER BY ts DESC LIMIT ?`
     ).all(safe) as unknown as (Omit<RequestResult, "reachedBackend"> & { reachedBackend: number })[];
@@ -387,6 +387,39 @@ export function createMetricsStore(dbPath: string): MetricsStore {
    * validity signal averaged into hour buckets would hide exactly the short
    * saturation spikes it exists to catch.
    */
+  const spanOfTraffic = db.prepare(
+    `SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM requests_raw WHERE ts >= ? AND ts < ?`
+  );
+
+  /**
+   * Seconds the window actually carried traffic. Dividing counts by the full
+   * nominal window (to - from) reads "4 rps" for a run that started 90 s into
+   * a 15 m window but really delivered 50: the empty minutes are not absence
+   * of traffic, they are absence of a run. Coverage comes from the raw rows'
+   * real timestamps; when the raw tail has aged out (>24h) the minute buckets
+   * still bound the span, plus one bucket-width for the open tail bucket.
+   */
+  function coveredSec(from: number, to: number, total: number): number {
+    const nominal = (to - from) / 1000;
+    if (total === 0) return nominal;
+    const row = spanOfTraffic.get(from, to) as { lo: number | null; hi: number | null };
+    if (row.lo !== null && row.hi !== null) {
+      return Math.max(1, Math.min(nominal, (row.hi - row.lo) / 1000 + 1));
+    }
+    const rows = windowRows(from, to);
+    if (rows.length > 0) {
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (const r of rows) {
+        if (r.bucket_ts < lo) lo = r.bucket_ts;
+        if (r.bucket_ts > hi) hi = r.bucket_ts;
+      }
+      const bucketMs = to - from <= MINUTE_LAYER_MAX_MS ? MINUTE_BUCKETS : HOUR_BUCKETS;
+      return Math.max(1, Math.min(nominal, (hi - lo + bucketMs) / 1000));
+    }
+    return nominal;
+  }
+
   function validityFor(from: number, to: number, total: number): WindowValidity {
     const fromB = Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS;
     const toB = Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS;
@@ -401,7 +434,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
        FROM host_health WHERE bucket_ts >= ? AND bucket_ts <= ?`
     ).get(fromB, toB) as { cpuMax: number; loopMax: number; samples: number };
 
-    const windowSec = Math.max(1, (to - from) / 1000);
+    const windowSec = Math.max(1, coveredSec(from, to, total));
     const dropped = Number(shed.dropped) || 0;
     const issued = total;
     const intended = issued + dropped;
@@ -529,10 +562,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           b.bytes_req += r.bytesReq;
           b.bytes_resp += r.bytesResp;
           addToHistogram(b.hist, r.latencyMs);
-          // overhead percentiles are only quoted for the latency-sensitive
-          // classes; for the noise classes the histogram stays all-zero (the
-          // sums above still feed the avg) and the UI renders it fine
-          if (OVERHEAD_CLASSES.has(r.class)) addToHistogram(b.overhead_hist, r.overheadMs);
+          // every class records its overhead histogram — percentile columns in
+          // the per-class table read it. The top-level chart/KPI filter back to
+          // OVERHEAD_CLASSES so bulk/invalid noise doesn't move the headline.
+          addToHistogram(b.overhead_hist, r.overheadMs);
           addToStatusHistogram(b.status_hist, r.status);
         }
       }
@@ -619,7 +652,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     // the in-progress minute. There is deliberately no separate "live tail" pass
     // here — adding one double-counted every request in the current bucket.
     const rows = windowRows(from, to);
-    const windowMs = Math.max(0, to - from);
     const byEndpointCls = rowsToCombined(rows, "endpoint");
     const byClass = rowsToCombined(rows, "class");
 
@@ -635,7 +667,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const perEndpoint: EndpointStat[] = [];
     const perClass: ClassStat[] = [];
     const protoAcc = new Map<string, { total: number; errors: number }>();
-    const windowSec = windowMs / 1000;
+    // rps divides by the span the window actually carried traffic, not the
+    // nominal window: a 90-second-old run on the 15m tab is not a 4-rps run.
+    let totalCount = 0;
+    for (const r of rows) totalCount += r.count;
+    const windowSec = coveredSec(from, to, totalCount);
     const perSec = (n: number): number => (windowSec > 0 ? n / windowSec : 0);
 
     for (const c of byEndpointCls.values()) {
@@ -644,9 +680,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       bytesReq += c.bytesReq;
       bytesResp += c.bytesResp;
       latencySum += c.latencySumMs;
-      overheadSum += c.overheadSumMs;
       mergeHistograms(totalHist, c.hist);
-      mergeHistograms(totalOverheadHist, c.overheadHist);
       mergeHistograms(totalStatusHist, c.statusHist);
       perEndpoint.push({
         protocol: c.protocol === "soap" ? "soap" : "rest",
@@ -669,8 +703,16 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     // Every request that did not return 2xx/3xx, minus the invalid slice's
     // rejections — those are the point of that slice, not a failure.
     let unexpectedFailures = 0;
+    let overheadClassCount = 0;
     for (const [cls, c] of byClass.entries()) {
       if (c.count === 0) continue;
+      // the headline overhead chart/KPI stay with the latency-sensitive
+      // classes; per-class rows get their own histograms regardless
+      if (OVERHEAD_CLASSES.has(cls)) {
+        overheadSum += c.overheadSumMs;
+        overheadClassCount += c.count;
+        mergeHistograms(totalOverheadHist, c.overheadHist);
+      }
       const notOk = c.count - statusCount(c.statusHist, OK_BUCKETS);
       // an `invalid` request answered 4xx is a pass, not a failure; an invalid
       // request that 502s or 2xxs still counts against the gateway
@@ -743,7 +785,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         p90: percentile(totalOverheadHist, 90),
         p95: percentile(totalOverheadHist, 95),
         p99: percentile(totalOverheadHist, 99),
-        avg: overheadSum / Math.max(total, 1)
+        avg: overheadSum / Math.max(overheadClassCount, 1)
       },
       bytes: { req: bytesReq, resp: bytesResp, respPerSec: perSec(bytesResp) },
       status,
@@ -803,7 +845,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       p.gatewayErrors += statusCount(parseHist(r.status_hist), GATEWAY_FAULT_BUCKETS);
       p.bytesResp += r.bytes_resp;
       mergeHistograms(p.hist, parseHist(r.hist));
-      mergeHistograms(p.overheadHist, parseHist(r.overhead_hist));
+      // the chart series keeps the latency-sensitive filter; per-class rows
+      // carry every class's histogram for the table
+      if (OVERHEAD_CLASSES.has(r.cls)) {
+        mergeHistograms(p.overheadHist, parseHist(r.overhead_hist));
+      }
       if (r.protocol === "soap") {
         p.soapTotal += r.count;
         p.soapErrors += r.errors;
@@ -1014,6 +1060,7 @@ function migrate(db: DbHandle): void {
   }
   ensureColumn(db, "requests_raw", "request_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "requests_raw", "reached_backend", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "requests_raw", "ttfb_ms", "REAL");
 }
 
 export const HISTOGRAM_EDGES = HISTOGRAM_EDGES_MS;
