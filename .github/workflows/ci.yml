@@ -20,12 +20,36 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: .bun-version
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
       - run: bun install --frozen-lockfile
       - run: bunx eslint .
       - run: npm run typecheck
+
+      # TS-side tests. The Go driver integration test skips automatically
+      # when the worker binary is absent (the go step below builds one).
+      - name: Build the Go loadgen worker (needed by the integration test)
+        working-directory: packages/worker
+        run: |
+          mkdir -p bin
+          GOOS=linux GOARCH=amd64 go build -trimpath -o bin/gwtester-worker ./cmd/gwtester-worker
       - run: bun test packages/app/src
       # the image build compiles the UI; make sure that path works on PRs too
       - run: npm run build
+
+      # --- Go worker --------------------------------------------------------
+      - name: Go vet + tests
+        working-directory: packages/worker
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Go format
+        working-directory: packages/worker
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "gofmt would change:"; gofmt -d .; exit 1
+          fi
 
   # Builds the production image on every push. Pushes to ghcr.io under the
   # current ref's sha tag; also tags 'latest' for main and for version tags.

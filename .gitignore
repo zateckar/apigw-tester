@@ -11,3 +11,6 @@ coverage/
 .env.*
 !.env.example
 .kilo/*
+
+# Go loadgen worker — built locally or in CI, never committed
+packages/worker/bin/

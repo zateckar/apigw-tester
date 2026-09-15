@@ -11,6 +11,19 @@ COPY packages/shared packages/shared
 COPY packages/ui packages/ui
 RUN bun run --cwd packages/ui build
 
+# Go loadgen worker — stdlib only, no CGO, static binary. A BUILDPLATFORM-
+# pinned native stage so cross-builds (`--platform=linux/arm64`) stay cheap:
+# TARGETOS/TARGETARCH fan out to the running platform's toolchain output.
+FROM golang:1.24-alpine AS worker
+WORKDIR /src
+COPY packages/worker/go.mod packages/worker/
+COPY packages/worker/internal packages/worker/internal
+COPY packages/worker/cmd packages/worker/cmd
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+      -o /out/gwtester-worker ./packages/worker/cmd/gwtester-worker
+
 # App stage: no emit step — the app is TypeScript run directly by Bun at
 # runtime. Only the workspace manifests + source need to ship.
 FROM oven/bun:1.4-alpine AS server
@@ -32,6 +45,10 @@ COPY --from=server /repo/packages ./packages
 COPY package.json ./
 # UI bundle baked in, served from the same process
 COPY --from=ui /repo/packages/ui/dist ./packages/app/public
+# Go loadgen worker — the spawn path looks for packages/worker/bin/gwtester-worker
+# (no .exe suffix on linux). Default LOADGEN_BACKEND is "go"; the image ships the
+# binary so that default is safisfied — set LOADGEN_BACKEND=ts to opt out.
+COPY --from=worker /out/gwtester-worker ./packages/worker/bin/gwtester-worker
 # chown before VOLUME so a fresh named volume inherits bun-owned /app/data.
 # A volume that already has content is mounted verbatim and never re-seeded —
 # docker-entrypoint.sh is what covers that case.
