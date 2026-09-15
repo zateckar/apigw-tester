@@ -5,7 +5,9 @@ import { POLICY_LIMITS, type RequestResult, type SystemMetrics } from "@apigw/sh
 
 // Auth: tests run with a fixed known credential
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
-const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
+// Exercise the TS driver here (backend coverage lives in driver.go.test.ts),
+// otherwise these runs spawn the Go worker whenever its binary is present.
+process.env["LOADGEN_BACKEND"] = "ts";const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 let base: string;
 let built: ReturnType<typeof buildApp>;
