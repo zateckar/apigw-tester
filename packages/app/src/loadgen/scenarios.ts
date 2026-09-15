@@ -380,7 +380,7 @@ export function buildBaselineProbe(ctx: SpecContext): ReqSpec[] {
       expectBytes: 800 },
     buildBigResponseSpec(),
     { protocol: "rest", endpoint: "POST /api/echo", class: "big-request", method: "POST", path: "/api/echo",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ _pad: "x".repeat(65536 - 24) }), expectBytes: 200 },
+      headers: { "Content-Type": "application/json" }, body: bigRequestBody(65536), expectBytes: 200 },
     { protocol: "rest", endpoint: "GET /api/slow/{ms}", class: "slow-upstream", method: "GET", path: "/api/slow/500", headers: {}, body: null, expectBytes: 200 },
     { protocol: "rest", endpoint: "GET /api/pets", class: "concurrency", method: "GET", path: "/api/pets?size=5", headers: {}, body: null, expectBytes: 1000 },
     // a known-invalid probe so the 'invalid' class also gets a baseline

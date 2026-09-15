@@ -22,8 +22,10 @@ const RANGES: { label: SummaryWindow; hours: number }[] = [
   { label: "7d", hours: 24 * 7 }
 ];
 
-/** long windows are much more expensive to compute — poll them less often */
-const pollFor = (w: SummaryWindow): number => (w === "24h" || w === "7d" ? 30_000 : 5_000);
+/** long windows are much more expensive to compute — poll them less often;
+ *  and summary/timeseries data only changes on the loadgen flush (10s), so a
+ *  faster poll is half re-compute of identical numbers */
+const pollFor = (w: SummaryWindow): number => (w === "24h" || w === "7d" ? 30_000 : 10_000);
 
 function errorOf(...queries: UseQueryResult<unknown, Error>[]): string | null {
   for (const q of queries) if (q.isError && q.error) return q.error.message;
@@ -89,9 +91,9 @@ export default function App() {
     queryFn: () => api.timeseries(range.hours),
     refetchInterval: pollFor(range.label)
   });
-  const recentQ = useQuery({ queryKey: ["recent"], queryFn: () => api.recent(150), refetchInterval: 5_000 });
+  const recentQ = useQuery({ queryKey: ["recent"], queryFn: () => api.recent(150), refetchInterval: 10_000 });
   const runsQ = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 30_000 });
-  const systemQ = useQuery({ queryKey: ["system"], queryFn: api.system, refetchInterval: 2_000 });
+  const systemQ = useQuery({ queryKey: ["system"], queryFn: api.system, refetchInterval: 5_000 });
   const defsQ = useQuery({ queryKey: ["definitions"], queryFn: api.definitions, refetchInterval: false });
   const policyQ = useQuery({ queryKey: ["policy"], queryFn: api.policy, refetchInterval: 15_000 });
 

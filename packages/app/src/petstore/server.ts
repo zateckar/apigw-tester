@@ -351,8 +351,11 @@ export function createPetstoreRoutes(): { routes: Record<string, RouteDef>; stor
       return bad(ctx, `size must be between 0 and ${LIMITS.bigBytes}`);
     }
     // stream zero-filled chunks so a 4MB response doesn't materialise on the
-    // loop, and the client abort (req.signal) stops the generator
-    const CHUNK = 64 * 1024;
+    // loop, and the client abort (req.signal) stops the generator. 256KB
+    // chunks: at 64KB the stream pump (onReadStreamIntoSinkChunk, one promise
+    // turn per chunk) dominated CPU at high big-response rps — fewer, larger
+    // writes on loopback drop that fourfold with no fidelity loss.
+    const CHUNK = 256 * 1024;
     const buf = new Uint8Array(Math.min(size, CHUNK)).fill("Z".charCodeAt(0));
     const signal = ctx.req.signal;
     let streamWritten = 0;

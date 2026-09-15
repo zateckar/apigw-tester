@@ -149,19 +149,34 @@ export type SoapOperation = "getPetById" | "findPetsByStatus" | "placeOrder";
 
 export const SOAP_OPERATIONS: readonly SoapOperation[] = ["getPetById", "findPetsByStatus", "placeOrder"];
 
+// The operation-detection regexes are fixed at load time — building a RegExp
+// per request per operation is pure churn at thousands of SOAP rps.
+const OPERATION_RES = new Map<SoapOperation, RegExp>(
+  SOAP_OPERATIONS.map(op => [op, new RegExp(`<(?:[\\w.-]+:)?${op}Request(?:[\\s/>])`)])
+);
+
 export function detectOperation(soapAction: string | undefined, body: string): SoapOperation | null {
   const action = (soapAction ?? "").replace(/"/g, "").split("/").pop() ?? "";
   for (const op of SOAP_OPERATIONS) {
     // match `<op Request` / `<ns:opRequest` as an element, not as loose text
-    if (action === op || new RegExp(`<(?:[\\w.-]+:)?${op}Request(?:[\\s/>])`).test(body)) return op;
+    if (action === op || OPERATION_RES.get(op)!.test(body)) return op;
   }
   return null;
 }
 
 /** Element text extractor. Tolerates namespace prefixes, attributes (xsi:type
- *  and friends) and surrounding whitespace — real SOAP stacks emit all three. */
+ *  and friends) and surrounding whitespace — real SOAP stacks emit all three.
+ *  Regexes are cached per (tag, inner): the petstore only ever asks for three
+ *  tags, but constructing them per request on the load path shows up in CPU. */
+const elementReCache = new Map<string, RegExp>();
 function elementRe(tag: string, inner: string): RegExp {
-  return new RegExp(`<(?:[\\w.-]+:)?${tag}(?:\\s[^>]*)?>\\s*(${inner})\\s*</(?:[\\w.-]+:)?${tag}>`);
+  const key = `${tag}${inner}`;
+  let re = elementReCache.get(key);
+  if (!re) {
+    re = new RegExp(`<(?:[\\w.-]+:)?${tag}(?:\\s[^>]*)?>\\s*(${inner})\\s*</(?:[\\w.-]+:)?${tag}>`);
+    elementReCache.set(key, re);
+  }
+  return re;
 }
 
 function extractInt(body: string, tag: string): number | null {

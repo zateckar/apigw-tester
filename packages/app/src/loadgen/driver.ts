@@ -25,6 +25,7 @@ import { TokenBucket, peakTargetRps } from "./scheduler.js";
 import {
   buildSpec, buildBaselineProbe, bigRequestBytes, type ReqSpec, type SpecContext
 } from "./scenarios.js";
+import { GoWorkerClient, workerBinaryPath, type GoStatusMsg } from "./goClient.js";
 import { expectedAuthHeader } from "../auth.js";
 import { SERVER_MS_HEADER } from "../petstore/server.js";
 import { probeContext, type ProbeContext } from "./policy.js";
@@ -92,6 +93,10 @@ const TICK_MS = 20;
 /** must match FLUSH_MS in metrics/server.ts — the store's ingest-rate
  *  estimate and liveness window are derived from the same cadence */
 const FLUSH_MS = 10_000;
+/** must match intervalMs in metrics/system.ts — health-stamp grouping keys
+ *  results by the sampler's own cadence; if they drift, grouping degrades to
+ *  finer resolution (correct, just marginally more checks per flush) */
+const HEALTH_SAMPLE_MS = 2_000;
 
 /**
  * Drain the response body chunk-by-chunk, keeping only the total size. Never
@@ -109,6 +114,16 @@ async function readOrDrain(res: Response, wantBody: boolean): Promise<{ bytes: n
   // the SUT always sets Content-Length, and its value is cheaper than the
   // body itself; fall back to counting chunks for anyone who doesn't
   const declared = cl === null ? null : Number(cl);
+  // Big declared bodies: arrayBuffer() outruns a manual chunk loop. The loop
+  // pays one promise turn per chunk through Bun's stream machinery (the
+  // onReadStreamIntoSinkChunk/pull frames dominating the CPU profile at high
+  // big-response rps); arrayBuffer hands the whole drain to native code. The
+  // 4MB alloc+drop it costs is cheaper than dozens of loop turns. Do this
+  // before getReader(): a locked body rejects arrayBuffer().
+  if (declared !== null && Number.isFinite(declared) && declared >= 256 * 1024) {
+    const buf = await res.arrayBuffer();
+    return { bytes: buf.byteLength, buf: null };
+  }
   const reader = res.body?.getReader();
   if (!reader) return { bytes: declared ?? 0, buf: null };
   try {
@@ -129,7 +144,9 @@ async function readOrDrain(res: Response, wantBody: boolean): Promise<{ bytes: n
   }
 }
 
-const BASELINE_PROBE_MS = 60_000;
+/** baselines drift slowly; probing every minute (7 sequential fetches incl. a
+ *  streamed 4MB response) lands an event-loop burst exactly once a minute */
+const BASELINE_PROBE_MS = 120_000;
 const BASELINE_SAMPLES_PER_CLASS = 8;
 const BASELINE_PROBE_TIMEOUT_MS = 15_000;
 const MAX_SPOOL = 50_000;
@@ -153,9 +170,23 @@ const THROTTLE_WARN_MS = 10_000;
 
 export type IngestFn = (batch: IngestBatch) => { ingested: number } | Promise<{ ingested: number }>;
 
+/** Which load-generation backend the driver uses. Default "go" — measured
+ *  ~10× cheaper CPU and ~10× tighter event-loop latency than in-process TS
+ *  (the JS loop no longer touches requests, so its own stalls no longer
+ *  inflate what it measures). Set LOADGEN_BACKEND=ts to opt back into the
+ *  in-process driver, useful on hosts where the worker binary isn't built. */
+export type LoadgenBackend = "ts" | "go";
+
+function readBackend(): LoadgenBackend {
+  return process.env["LOADGEN_BACKEND"] === "ts" ? "ts" : "go";
+}
+
 /**
  * In-process load driver. One Driver per app: scheduler, scenario emitters,
  * direct-to-SUT baseline probes (for GW-overhead math), and batched ingest.
+ * Backend "go" delegates generation to the Go worker process (goClient.ts);
+ * this class stays the control plane: config push, run lifecycle, status,
+ * health-stamping of incoming batches, ingest.
  */
 export class Driver {
   private gw: GwTargets = { rest: { ...defaultGwTargets.rest }, soap: { ...defaultGwTargets.soap } };
@@ -191,6 +222,14 @@ export class Driver {
   private errLogBudget = 30; // log first N request errors per run
   private baselineAt = new Map<ScenarioClass, number>();
   private healthCheck: (from: number, to: number) => string | null = () => "health unavailable";
+
+  /** Resolved at construction; tests pin LOADGEN_BACKEND=ts explicitly.
+   *  Flips to "ts" if the worker binary is missing or fails to start. */
+  private backend: LoadgenBackend = readBackend();
+  /** Control-plane client for the Go worker; created lazily on first use. */
+  private goClient: GoWorkerClient | null = null;
+  /** last status broadcast from the worker (arrives ~every 10s while running) */
+  private goLastStatus: GoStatusMsg | null = null;
 
   setHealthCheck(check: (from: number, to: number) => string | null): void { this.healthCheck = check; }
 
@@ -233,6 +272,7 @@ export class Driver {
     this.baselineAt.clear();
     this.baselineUrl = url.replace(/\/+$/, "");
     this.refreshUrlPrefixes();
+    this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
   }
 
   get currentGw(): GwTargets {
@@ -243,10 +283,64 @@ export class Driver {
   setGw(gw: unknown): void {
     this.gw = sanitizeGwTargets(gw, this.gw);
     this.refreshUrlPrefixes();
+    this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
   }
 
   setProfile(profile: Partial<LoadProfile>): void {
     this.profile = sanitizeLoadProfile({ ...this.profile, ...profile }, this.profile);
+    this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
+  }
+
+  /** Lazily create the Go worker control client and wire its events into the
+   *  plain Driver surface: batches arrive health-stamped (the client applies
+   *  the same 2s-window grouping the ts flush path uses) and land in
+   *  ingestFn; baseline broadcasts feed the same maps probeBaselines fills. */
+  private go(): GoWorkerClient | null {
+    if (this.backend !== "go") return null;
+    if (workerBinaryPath() === null) {
+      // the image bakes the binary but a source checkout may not have it built;
+      // auto-fall back so LOADGEN_BACKEND=ts doesn't have to be remembered
+      console.warn("[driver] packages/worker/bin/gwtester-worker is missing — falling back to in-process ts driver (build it under packages/worker to use the default go backend)");
+      this.backend = "ts";
+      return null;
+    }
+    if (!this.goClient) {
+      const client = new GoWorkerClient({
+        onStatus: (s) => { this.goLastStatus = s; },
+        onBaseline: (b) => {
+          for (const cls of Object.keys(b.byClass) as ScenarioClass[]) {
+            const samples = b.byClass[cls];
+            if (samples) this.baselines.set(cls, samples.slice());
+          }
+          for (const [cls, at] of Object.entries(b.at)) {
+            this.baselineAt.set(cls as ScenarioClass, at);
+          }
+        },
+        onBatch: async (batch) => {
+          if (!this.ingestFn) return;
+          try { await this.ingestFn(batch); } catch (e) {
+            console.error("[driver] ingest failed:", (e as Error).message);
+          }
+        },
+        onStopped: () => {
+          if (this.state === "running") {
+            this.state = "idle";
+            this.runId = null;
+            this.startedAt = null;
+            this.stoppedAt = null;
+          }
+        }
+      });
+      client.setHealthCheck((from, to) => this.healthCheck(from, to));
+      void client.ensureStarted().catch((e) => {
+        console.error("[driver] go worker failed to start — falling back to ts:", (e as Error).message);
+        this.goClient = null;
+        this.backend = "ts";
+      });
+      client.configure(this.gw, this.profile, this.baselineUrl);
+      this.goClient = client;
+    }
+    return this.goClient;
   }
 
   /** Wire the ingest function (in-process, called from the metrics module). */
@@ -265,6 +359,12 @@ export class Driver {
   }
 
   async init(): Promise<void> {
+    if (this.go()) {
+      // the flush timer and the baseline probe timer exist only for the ts
+      // backend: the worker streams its own 10s batches and does its own
+      // probing, pushing both as events instead
+      return;
+    }
     this.flushTimer = setInterval(() => void this.flush(), FLUSH_MS);
     this.flushTimer.unref?.();
     this.baselineTimer = setInterval(() => void this.probeBaselines(), BASELINE_PROBE_MS);
@@ -341,6 +441,21 @@ export class Driver {
   }
 
   start(runId: string): { ok: true; runId: string } {
+    const goClient = this.go();
+    if (goClient) {
+      if (this.state === "running") return { ok: true, runId: this.runId ?? runId };
+      void goClient.ensureStarted().then(() => {
+        goClient.configure(this.gw, this.profile, this.baselineUrl);
+        goClient.start(runId);
+      });
+      this.state = "running";
+      this.runId = runId;
+      this.startedAt = Date.now();
+      this.stoppedAt = null;
+      this.goLastStatus = null;
+      console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.rest.baseUrl} (go backend)`);
+      return { ok: true, runId };
+    }
     if (this.state === "running") return { ok: true, runId: this.runId ?? runId };
     // a stop() still draining is superseded by the new run
     if (this.drainTimer) { clearTimeout(this.drainTimer); this.drainTimer = null; }
@@ -397,6 +512,13 @@ export class Driver {
 
   stop(): { stopped: true; runId: string | null } {
     const runId = this.runId;
+    if (this.goClient && this.state !== "idle") {
+      this.goClient.stop();
+      this.state = "stopping";
+      this.stoppedAt = Date.now();
+      // the "stopped" broadcast (and the worker's final batch) move us to idle
+      return { stopped: true, runId };
+    }
     if (this.state === "idle") return { stopped: true, runId: null };
     this.state = "stopping";
     this.stoppedAt = Date.now();
@@ -698,9 +820,25 @@ export class Driver {
     }
     this.flushing = true;
     const chunk = this.spool.splice(0, this.spool.length);
-    for (const r of chunk) {
-      if (r.overheadReason === null) {
-        r.overheadReason = this.healthCheck(r.ts, r.ts + r.latencyMs);
+    // Health is sampled every ~2s, so the old per-request qualityBetween() here
+    // was an O(batch × history) scan on the event loop (50k × 600 samples) —
+    // a stall inflating the very latencies being stamped. The flip side is
+    // that the sampler's granularity makes per-request windows meaningless:
+    // two requests 100ms apart share the same 2s health sample. Group by
+    // sample window instead — one check per distinct window in the batch —
+    // which keeps healthy neighbors of a stall valid while staying O(batch)
+    // with no per-result array scan.
+    if (chunk.length > 0) {
+      const byWindow = new Map<number, string | null>();
+      for (const r of chunk) {
+        if (r.overheadReason !== null) continue;
+        const w = Math.floor(r.ts / HEALTH_SAMPLE_MS);
+        let reason = byWindow.get(w);
+        if (reason === undefined) {
+          reason = this.healthCheck(w * HEALTH_SAMPLE_MS, (w + 1) * HEALTH_SAMPLE_MS);
+          byWindow.set(w, reason);
+        }
+        if (reason !== null) r.overheadReason = reason;
       }
     }
     const batch: IngestBatch = { batchId: randomUUID(), results: chunk, shed };
@@ -752,6 +890,35 @@ export class Driver {
   }
 
   status(): RunStatus {
+    if (this.goClient && this.state !== "idle") {
+      const s = this.goLastStatus;
+      return {
+        state: this.state,
+        runId: this.runId,
+        startedAt: this.startedAt,
+        uptimeSec: this.startedAt ? Math.floor((Date.now() - this.startedAt) / 1000) : null,
+        profile: { ...this.profile },
+        targetRps: s?.targetRps ?? 0,
+        effectiveMaxConcurrency: this.effectiveMaxConcurrency,
+        throttledSinceMs: null,
+        counters: {
+          sent: s?.sent ?? 0,
+          ok: s?.ok ?? 0,
+          errors: s?.errors ?? 0,
+          clientErrors: s?.r4xx ?? 0,
+          gatewayErrors: s?.gwFaults ?? 0,
+          rateLimited: s?.rateLimited ?? 0,
+          unauthorized: s?.unauthorized ?? 0,
+          timeouts: 0,
+          droppedRequests: s?.dropped ?? 0,
+          invalidSent: s?.invalidSent ?? 0,
+          invalidRejectedByGateway: s?.invalidRejectedByGateway ?? 0,
+          invalidLeaked: s?.invalidLeaked ?? 0
+        },
+        gateway: this.currentGw,
+        targetIsSelf: { rest: this.isSelf(this.gw.rest), soap: this.isSelf(this.gw.soap) }
+      };
+    }
     return {
       state: this.state,
       runId: this.runId,
@@ -789,6 +956,19 @@ export class Driver {
   }
 
   async shutdown(): Promise<void> {
+    if (this.goClient) {
+      // stop the timers the ts path may have armed before the client came up
+      if (this.tickTimer) clearInterval(this.tickTimer);
+      if (this.flushTimer) clearInterval(this.flushTimer);
+      if (this.baselineTimer) clearInterval(this.baselineTimer);
+      this.tickTimer = this.flushTimer = this.baselineTimer = null;
+      const client = this.goClient;
+      this.goClient = null;
+      this.state = "idle";
+      this.runId = null;
+      await client.shutdown();
+      return;
+    }
     if (this.tickTimer) clearInterval(this.tickTimer);
     if (this.flushTimer) clearInterval(this.flushTimer);
     if (this.baselineTimer) clearInterval(this.baselineTimer);

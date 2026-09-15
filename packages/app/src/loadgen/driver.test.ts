@@ -2,6 +2,10 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { LIMITS, type ScenarioClass } from "@apigw/shared";
 import { Driver } from "./driver.js";
 
+// The default backend flipped to "go" once the worker shipped; these tests
+// exercise the in-process driver's internals directly and must not switch.
+process.env["LOADGEN_BACKEND"] = "ts";
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** reach into the driver's internals to simulate in-flight state */
 const priv = (d: Driver) => d as unknown as Record<string, any>;
@@ -646,7 +650,7 @@ describe("overhead qualification", () => {
     expect(x.overheadFor("small-rest", null, 10).overheadReason).toBe("no response headers");
     expect(x.overheadFor("small-rest", 100, null).overheadReason).toBe("backend timing unavailable");
     expect(x.overheadFor("small-rest", 12, 10).overheadMs).toBeNull();
-    x.baselineAt.set("small-rest", Date.now() - 180_000);
+    x.baselineAt.set("small-rest", Date.now() - 300_000);
     expect(x.overheadFor("small-rest", 100, 10).overheadReason).toContain("stale");
   });
 
@@ -661,6 +665,35 @@ describe("overhead qualification", () => {
     expect(batches[0].results[0].latencyMs).toBe(50);
     expect(batches[0].results[0].overheadMs).toBe(10);
     expect(batches[0].results[0].overheadReason).toBe("local CPU throttling");
+    await d.shutdown();
+  });
+
+  it("stamps health per 2s sample window — a stall taints only its own window", async () => {
+    // a healthy request must not be excluded for sharing a flush with a
+    // stalled one; and each distinct window is checked exactly once
+    const d = new Driver();
+    const now = Date.now();
+    const w = (ts: number) => Math.floor(ts / 2_000) * 2_000;
+    const stalled = w(now);            // window containing "now"
+    const healthy = stalled - 2_000;   // previous window
+    const checked: [number, number][] = [];
+    d.setHealthCheck((from, to) => {
+      checked.push([from, to]);
+      return from === stalled ? "local event-loop stall" : null;
+    });
+    const batches: any[] = [];
+    d.setIngest(batch => { batches.push(batch); return { ingested: batch.results.length }; });
+    const base = { runId: "r", latencyMs: 50, overheadMs: 10, overheadReason: null };
+    priv(d).record({ ...base, ts: healthy + 100 });
+    priv(d).record({ ...base, ts: healthy + 900 });
+    priv(d).record({ ...base, ts: stalled + 100 });
+    await priv(d).flush(true);
+    const results = batches[0].results;
+    expect(results).toHaveLength(3);
+    expect(results[0].overheadReason).toBeNull();
+    expect(results[1].overheadReason).toBeNull();
+    expect(results[2].overheadReason).toBe("local event-loop stall");
+    expect(checked).toEqual([[healthy, healthy + 2_000], [stalled, stalled + 2_000]]);
     await d.shutdown();
   });
 });

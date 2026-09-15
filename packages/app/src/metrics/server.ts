@@ -394,6 +394,12 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   const LIVE_WINDOW_MS = 30_000;
   /** Wall-clock time of the most recent successfully ingested batch. */
   let lastIngestAt: number | null = null;
+  // Persisted rollup state carried across flushes so the open minute/hour
+  // rows are not re-SELECTed and re-parsed every 10s. Cleared by any write
+  // path that can change rollup tables behind ingestBatch's back.
+  const minuteRollupCache = new Map<string, { reasons: Record<string, number>; hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram }>();
+  const hourRollupCache = new Map<string, { reasons: Record<string, number>; hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram }>();
+  const clearRollupCaches = () => { minuteRollupCache.clear(); hourRollupCache.clear(); };
 
   function windowRows(from: number, to: number): RollupRow[] {
     const spanMs = to - from;
@@ -542,6 +548,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           const key = `${bucketTs}|${r.protocol}|${r.endpoint}|${r.class}`;
           let b = table.get(key);
           if (!b) {
+            // Each batch MUST build fresh histogram/reason objects here. The
+            // rollup caches below keep references to these arrays between
+            // flushes as "what is in the DB"; sharing a bucket object across
+            // batches would be silently double-merged by the cache logic.
             b = {
               exclusion_reasons: {},
               first_ts: r.ts, last_ts: r.ts,
@@ -603,25 +613,69 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         b.qualified_overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp,
         JSON.stringify(b.hist), JSON.stringify(b.qualified_overhead_hist), JSON.stringify(b.status_hist)
       ];
+      // Every flush touches the same open minute/hour rows — previously a
+      // SELECT + JSON.parse × 3 histograms + merge + JSON.stringify × 3, per
+      // key, per flush. rollupCache holds the *stored* histogram state between
+      // flushes: each key is SELECTed and parsed at most once (on first sight
+      // or after the row was written by another process/reset), thereafter the
+      // cache entry is simply the post-merge arrays from the previous flush
+      // (kept by reference; the per-batch Bucket objects are discarded after
+      // the upsert, so the reference stays valid and exact).
+      const storeKey = (b: Bucket) => `${b.bucket_ts}|${b.protocol}|${b.endpoint}|${b.cls}`;
+      interface StoredState {
+        reasons: Record<string, number>;
+        hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram;
+      }
       const mergeIntoAndUpsert = (
         buckets: Map<string, Bucket>,
         select: typeof selectMinute,
-        upsert: typeof upsertMinute
+        upsert: typeof upsertMinute,
+        cache: Map<string, StoredState>,
+        bucketWidthMs: number
       ): void => {
+        // prune only entries for buckets that closed before this batch started:
+        // pruning by *batch membership* would evict a still-open key whenever
+        // a batch happens to carry no results for it, forcing a pointless
+        // re-read on the next flush
+        const oldestOpen = Math.floor(Date.now() / bucketWidthMs) * bucketWidthMs;
+        for (const [k] of cache) {
+          const ts = Number(k.split("|", 1)[0]);
+          if (Number.isFinite(ts) && ts < oldestOpen) cache.delete(k);
+        }
         for (const b of buckets.values()) {
-          const existing = select.get(b.bucket_ts, b.protocol, b.endpoint, b.cls) as StoredHists | undefined;
-          if (existing) {
-            const reasons = JSON.parse(existing.exclusion_reasons || "{}") as Record<string, number>;
-            for (const [reason, count] of Object.entries(reasons)) b.exclusion_reasons[reason] = (b.exclusion_reasons[reason] ?? 0) + count;
-            mergeHistograms(b.hist, parseHist(existing.hist));
-            mergeHistograms(b.qualified_overhead_hist, parseHist(existing.qualified_overhead_hist));
-            mergeHistograms(b.status_hist, parseHist(existing.status_hist));
+          const key = storeKey(b);
+          const cached = cache.get(key);
+          if (cached !== undefined) {
+            for (const [reason, count] of Object.entries(cached.reasons)) {
+              b.exclusion_reasons[reason] = (b.exclusion_reasons[reason] ?? 0) + count;
+            }
+            mergeHistograms(b.hist, cached.hist);
+            mergeHistograms(b.qualified_overhead_hist, cached.qualifiedHist);
+            mergeHistograms(b.status_hist, cached.statusHist);
+          } else {
+            const row = select.get(b.bucket_ts, b.protocol, b.endpoint, b.cls) as StoredHists | undefined;
+            if (row) {
+              const reasons = JSON.parse(row.exclusion_reasons || "{}") as Record<string, number>;
+              for (const [reason, count] of Object.entries(reasons)) {
+                b.exclusion_reasons[reason] = (b.exclusion_reasons[reason] ?? 0) + count;
+              }
+              mergeHistograms(b.hist, parseHist(row.hist));
+              mergeHistograms(b.qualified_overhead_hist, parseHist(row.qualified_overhead_hist));
+              mergeHistograms(b.status_hist, parseHist(row.status_hist));
+            }
           }
+          // the upsert writes exactly b's (merged) state, so b becomes the
+          // cached stored state for the next flush — scalar columns are
+          // SQL-side deltas and never need the cache
+          cache.set(key, {
+            reasons: b.exclusion_reasons,
+            hist: b.hist, qualifiedHist: b.qualified_overhead_hist, statusHist: b.status_hist
+          });
           upsert.run(...upsertParams(b));
         }
       };
-      mergeIntoAndUpsert(minute, selectMinute, upsertMinute);
-      mergeIntoAndUpsert(hour, selectHour, upsertHour);
+      mergeIntoAndUpsert(minute, selectMinute, upsertMinute, minuteRollupCache, MINUTE_BUCKETS);
+      mergeIntoAndUpsert(hour, selectHour, upsertHour, hourRollupCache, HOUR_BUCKETS);
       // shed rows ride the same transaction as the requests they explain, so a
       // window can never show the load we issued without the load we did not
       for (const s of batch.shed ?? []) {
@@ -637,6 +691,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       db.exec("COMMIT");
     } catch (e) {
       try { db.exec("ROLLBACK"); } catch { /* already unwound */ }
+      // the merged state the caches captured was never persisted
+      clearRollupCaches();
       throw e;
     }
     lastIngestAt = Date.now();
@@ -925,18 +981,21 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   const rawCleaner = setInterval(() => {
     try {
       const cutoff = Date.now() - RAW_RETENTION_MS;
-      db.prepare(`DELETE FROM requests_raw WHERE ts < ?`).run(cutoff);
+      let deleted = 0;
+      deleted += Number(db.prepare(`DELETE FROM requests_raw WHERE ts < ?`).run(cutoff).changes) || 0;
       const minuteCutoff = Math.floor((Date.now() - MINUTE_RETENTION_MS) / MINUTE_BUCKETS) * MINUTE_BUCKETS;
-      db.prepare(`DELETE FROM rollup_minute WHERE bucket_ts < ?`).run(minuteCutoff);
+      deleted += Number(db.prepare(`DELETE FROM rollup_minute WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
       const hourCutoff = Math.floor((Date.now() - HOUR_RETENTION_MS) / HOUR_BUCKETS) * HOUR_BUCKETS;
-      db.prepare(`DELETE FROM rollup_hour WHERE bucket_ts < ?`).run(hourCutoff);
+      deleted += Number(db.prepare(`DELETE FROM rollup_hour WHERE bucket_ts < ?`).run(hourCutoff).changes) || 0;
       // validity inputs are minute-granular and only ever read alongside the
       // minute layer, so they age out on the same schedule as it
-      db.prepare(`DELETE FROM load_shed WHERE bucket_ts < ?`).run(minuteCutoff);
-      db.prepare(`DELETE FROM host_health WHERE bucket_ts < ?`).run(minuteCutoff);
+      deleted += Number(db.prepare(`DELETE FROM load_shed WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
+      deleted += Number(db.prepare(`DELETE FROM host_health WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
       cleanupSeen.run(Date.now() - 6 * HOUR_BUCKETS);
-      // WAL would otherwise grow without bound across a multi-week run
-      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      // WAL would otherwise grow without bound across a multi-week run — but a
+      // TRUNCATE checkpoint on an untouched retention window is pure blocking
+      // I/O, so only pay it when this sweep actually removed rows
+      if (deleted > 0) db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     } catch (e) {
       // a throw inside a timer callback would take the whole process down
       console.error("[metrics] retention sweep failed:", (e as Error).message);
@@ -1016,6 +1075,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         db.exec("DELETE FROM policy_results");
         db.exec("DELETE FROM ingest_seen");
         db.exec("DELETE FROM runs");
+        clearRollupCaches();
         db.exec("COMMIT");
       } catch (e) {
         try { db.exec("ROLLBACK"); } catch { /* already unwound */ }

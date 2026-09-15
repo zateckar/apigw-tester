@@ -104,14 +104,20 @@ export function forwardsBasicAuth(target: GwConfig, selfUrl: string): boolean {
 
 /** Baseline response headers + request id; HSTS only once TLS terminates in
  *  front of us — mirrored from the Express middleware, including the exact
- *  header set the CI smoke suite greps for. Never set x-powered-by. */
-function applySecurityHeaders(req: Request, headers: Headers): void {
-  headers.set("Content-Security-Policy", CSP);
-  headers.set("X-Content-Type-Options", "nosniff");
-  headers.set("X-Frame-Options", "DENY");
-  headers.set("Referrer-Policy", "no-referrer");
-  headers.set("Cross-Origin-Opener-Policy", "same-origin");
-  const proto = req.headers.get("x-forwarded-proto") ?? new URL(req.url).protocol.replace(":", "");
+ *  header set the CI smoke suite greps for. Never set x-powered-by.
+ *  The five constant headers are pre-baked once; per-request work is the HSTS
+ *  check and the server-ms stamp. Original parse of req.url for the proto is
+ *  gone: the caller already has the URL and passes the protocol down. */
+const STATIC_SECURITY_HEADERS: readonly [string, string][] = [
+  ["Content-Security-Policy", CSP],
+  ["X-Content-Type-Options", "nosniff"],
+  ["X-Frame-Options", "DENY"],
+  ["Referrer-Policy", "no-referrer"],
+  ["Cross-Origin-Opener-Policy", "same-origin"]
+];
+
+function applySecurityHeaders(proto: string, headers: Headers): void {
+  for (const [k, v] of STATIC_SECURITY_HEADERS) headers.set(k, v);
   if (proto === "https") {
     headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
@@ -516,11 +522,12 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     const url = new URL(req.url);
     const pathname = url.pathname;
     const segs = pathname.split("/").filter(Boolean);
+    const proto = req.headers.get("x-forwarded-proto") ?? url.protocol.replace(":", "");
 
     const finish = (res: Response): Response => {
       const headers = new Headers(res.headers);
       if (stampsServerMs(pathname)) headers.set(SERVER_MS_HEADER, String(Math.max(0, performance.now() - enteredAt)));
-      applySecurityHeaders(req, headers);
+      applySecurityHeaders(proto, headers);
       return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
     };
 
