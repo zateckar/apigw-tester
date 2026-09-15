@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSystemSampler } from "./system.js";
+import { createSystemSampler, readCpuCapacity } from "./system.js";
 import type { IngestBatch } from "@apigw/shared";
 
 // counters across two "reads" of a fake /proc file: the second content carries
@@ -51,7 +51,7 @@ function batch(bytesReq: number, bytesResp: number): IngestBatch {
     results: [{
       runId: "r", requestId: `req-${Math.random()}`, ts: Date.now(), protocol: "rest", endpoint: "GET /x",
       class: "small-rest", method: "GET", status: 200,
-      latencyMs: 1, ttfbMs: 1, baselineMs: 0, overheadMs: 1,
+      latencyMs: 1, ttfbMs: 1, measurementVersion: 2, overheadReason: null, baselineMs: 0, overheadMs: 1,
       bytesReq, bytesResp, reachedBackend: true, error: null
     }]
   };
@@ -191,4 +191,34 @@ describe("app traffic accounting", () => {
     expect(s.latest().appInBps).toBe(0);
     expect(s.latest().appOutBps).toBe(0);
   });
+});
+
+
+it("honors the tightest CPU quota, cpuset and ancestor throttling", () => {
+  const parent = mkdtempSync(join(tmpdir(), "cpu-parent-"));
+  const child = mkdtempSync(join(tmpdir(), "cpu-child-"));
+  try {
+    writeFileSync(join(parent, "cpu.max"), "150000 100000");
+    writeFileSync(join(child, "cpu.max"), "200000 100000");
+    writeFileSync(join(child, "cpuset.cpus.effective"), "0-3,6");
+    writeFileSync(join(parent, "cpu.stat"), "throttled_usec 2000\n");
+    writeFileSync(join(child, "cpu.stat"), "throttled_usec 1000\n");
+    expect(readCpuCapacity([child, parent], 16)).toEqual({ cores: 1.5, throttledUs: 3000 });
+  } finally { rmSync(parent, { recursive: true }); rmSync(child, { recursive: true }); }
+});
+
+
+it("rejects incomplete health coverage and intervals overlapping a stall", async () => {
+  const sampler = createSystemSampler({ intervalMs: 30 });
+  sampler.start();
+  try {
+    expect(sampler.qualityBetween(Date.now() - 10_000, Date.now())).toContain("unavailable");
+    await sleep(60);
+    const start = Date.now();
+    const until = performance.now() + 80;
+    while (performance.now() < until) { /* simulate synchronous metrics work */ }
+    await sleep(40);
+    sampler.sampleNow();
+    expect(sampler.qualityBetween(start, Date.now())).not.toBeNull();
+  } finally { sampler.stop(); }
 });

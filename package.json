@@ -11,7 +11,7 @@
     "build": "bun run --cwd packages/ui build",
     "test": "bun test packages/app/src",
     "lint": "eslint .",
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "typecheck": "bun run --filter './packages/*' typecheck",
     "verify": "npm run lint && npm run typecheck && npm test",
     "start": "bun run packages/app/src/index.ts",
     "compose:up": "docker compose up --build -d",

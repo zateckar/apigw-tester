@@ -26,7 +26,7 @@ const CHAOS_TIMEOUT_MS = LIMITS.delayMs;
  *  overhead" excludes backend latency — including per-request jitter, chaos
  *  injection and per-class sleep/size randomness — without guessing from a
  *  class-median baseline. Absent on responses not issued by the SUT (e.g. a
- *  gateway's own 401/404), and the driver falls back to its baseline there. */
+ *  gateway's own 401/404). Without it, overhead attribution is unavailable. */
 export const SERVER_MS_HEADER = "X-Server-Ms";
 
 /** setTimeout that resolves early if the signal fires — Bun.sleep's signal

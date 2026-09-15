@@ -17,7 +17,7 @@ async function probe(
 ): Promise<Omit<PolicyResult, "id" | "label" | "probe" | "expectation" | "checkedAt">> {
   const def = PROBES.find((p) => p.id === id);
   if (!def) throw new Error(`no probe ${id}`);
-  const spy = spyOn(globalThis, "fetch").mockImplementation(async (input, init) =>
+  const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async (input, init) =>
     respond(String(input), init ?? {})
   );
   try {
@@ -84,7 +84,7 @@ describe("probe credentials", () => {
     const def = PROBES.find((p) => p.id === id);
     if (!def) throw new Error(`no probe ${id}`);
     let seen: string | undefined;
-    const spy = spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+    const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async (_input, init) => {
       const h = (init?.headers ?? {}) as Record<string, string>;
       seen ??= h["X-Gw-Key"];
       return backend(200);
@@ -210,7 +210,7 @@ describe("cors probe", () => {
 
 describe("required policies", () => {
   it("promotes not-enforced to a failure only for policies the operator requires", async () => {
-    const spy = spyOn(globalThis, "fetch").mockImplementation(async () => backend(200));
+    const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async () => backend(200));
     try {
       const results = await runPolicyProbes(ctx, { ...DEFAULT_POLICY_CONFIG, required: ["rate-limit"] });
       const byId = new Map(results.map((r) => [r.id, r]));
@@ -227,7 +227,7 @@ describe("required policies", () => {
     // express answers an undeclared route 404 with no X-Server-Ms, which is
     // indistinguishable from a gateway refusing it — so the unknown-route probe
     // would otherwise report a pass for a gateway that isn't there
-    const spy = spyOn(globalThis, "fetch").mockImplementation(async () => backend(200));
+    const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async () => backend(200));
     try {
       const selfCtx = probeContext(DEFAULT_GW_TARGETS, () => null, true);
       const results = await runPolicyProbes(selfCtx, { ...DEFAULT_POLICY_CONFIG, required: ["unknown-route"] });
@@ -241,7 +241,7 @@ describe("required policies", () => {
   });
 
   it("returns one result per probe even when every call throws", async () => {
-    const spy = spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("unreachable"); });
+    const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async () => { throw new Error("unreachable"); });
     try {
       const results = await runPolicyProbes(ctx, DEFAULT_POLICY_CONFIG);
       expect(results.length).toBe(PROBES.length);

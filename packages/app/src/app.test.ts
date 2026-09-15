@@ -8,9 +8,10 @@ process.env["APP_BASIC_AUTH"] = "test:pw-123";
 const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 let base: string;
+let built: ReturnType<typeof buildApp>;
 let server: ReturnType<ReturnType<typeof buildApp>["listen"]>;
 
-async function authed(path: string, init?: RequestInit): Promise<Response> {
+async function authed(path: string, init?: RequestInit): Promise<Omit<Response, "json"> & { json(): Promise<any> }> {
   return fetch(`${base}${path}`, {
     ...init,
     headers: {
@@ -24,7 +25,7 @@ async function authed(path: string, init?: RequestInit): Promise<Response> {
 function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", cls = "small-rest"): RequestResult {
   const latencyMs = 50 + (i % 100);
   return {
-    runId: "test-run",
+    runId: "test-run", requestId: `r-${i}`, ttfbMs: latencyMs, reachedBackend: true, measurementVersion: 2, overheadReason: null,
     ts,
     protocol,
     endpoint: protocol === "soap" ? "SOAP getPetById" : "GET /api/pets",
@@ -41,12 +42,13 @@ function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", c
 }
 
 beforeAll(async () => {
-  const built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
+  built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
   server = built.listen(0);
   base = `http://127.0.0.1:${server.port}`;
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await built.shutdown();
   server.stop(true);
 });
 
@@ -454,6 +456,7 @@ describe("apigw-tester app (auth protected)", () => {
   });
 
   it("resets metrics and runs but keeps config", async () => {
+    await waitIdle();
     // the earlier tests have ingested data by now; make sure the primitives agree
     const before = await (await authed("/api/summary?window=24h")).json();
     expect(before.total).toBeGreaterThan(0);
@@ -476,6 +479,7 @@ describe("apigw-tester app (auth protected)", () => {
     const r = await authed("/api/metrics/reset", { method: "POST" });
     expect(r.status).toBe(409);
     await authed("/api/run/stop", { method: "POST" });
+    await waitIdle();
     expect((await authed("/api/metrics/reset", { method: "POST" })).status).toBe(200);
   });
 
@@ -544,4 +548,27 @@ describe("apigw-tester app (auth protected)", () => {
     expect(kept.deleted).toBe(0);
     expect(((await (await authed("/api/runs")).json()) as unknown[]).length).toBe(runs.length);
   });
+});
+
+
+async function waitIdle(): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (built.driver.status().state !== "idle" && Date.now() < deadline) await Bun.sleep(25);
+  expect(built.driver.status().state).toBe("idle");
+}
+
+it("excludes delayed upload reception from the stamped backend duration", async () => {
+  const req = new Request("http://localhost/api/echo", {
+    method: "POST", headers: { authorization: AUTH },
+    body: new ReadableStream({ async start(controller) {
+      await Bun.sleep(100);
+      controller.enqueue(new TextEncoder().encode("upload"));
+      controller.close();
+    } })
+  });
+  const start = performance.now();
+  const res = await built.fetch(req);
+  expect(res.status).toBe(200);
+  expect(performance.now() - start).toBeGreaterThan(70);
+  expect(Number(res.headers.get("X-Server-Ms"))).toBeLessThan(40);
 });

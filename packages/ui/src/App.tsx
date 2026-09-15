@@ -32,8 +32,8 @@ function errorOf(...queries: UseQueryResult<unknown, Error>[]): string | null {
 
 /** Render a number, or an em-dash when the data genuinely isn't there — so a
  *  failed fetch never renders as a healthy-looking zero. */
-function stat(value: number | undefined, render: (n: number) => string): string {
-  return value === undefined || !Number.isFinite(value) ? "—" : render(value);
+function stat(value: number | null | undefined, render: (n: number) => string): string {
+  return value == null || !Number.isFinite(value) ? "—" : render(value);
 }
 
 /** Colour a status bucket by who is at fault: red for the gateway's own
@@ -308,7 +308,7 @@ export default function App() {
       {/* ---------- KPIs ---------- */}
       <div className="kpis">
         <div className="kpi" style={{ borderColor: "var(--accent)" }}>
-          <div className="label">GW overhead ({range.label})</div>
+          <div className="label" title={Object.entries(summary?.overheadMs.exclusionReasons ?? {}).map(([reason, count]) => `${reason}: ${count}`).join("; ")}>Estimated added TTFB ({range.label})</div>
           <div className="value" style={{ color: "var(--accent)" }}>
             {stat(summary?.overheadMs.p95, fmtMs)}
           </div>
@@ -317,6 +317,10 @@ export default function App() {
               ? "no gateway configured — this is loopback slop"
               : `p95 · p50 ${stat(summary?.overheadMs.p50, fmtMs)} · p99 ${stat(summary?.overheadMs.p99, fmtMs)}`}
           </div>
+          <div className="sub">Small REST, concurrency and SOAP: {summary?.overheadMs.eligible ?? 0} eligible / {summary?.overheadMs.excluded ?? 0} excluded</div>
+          {Object.entries(summary?.overheadMs.exclusionReasons ?? {}).map(([reason, count]) => (
+            <div className="sub" key={reason}>{reason}: {count}</div>
+          ))}
         </div>
         <div
           className="kpi"
@@ -467,7 +471,7 @@ export default function App() {
       {/* ---------- Charts grid ---------- */}
       <div className="grid-2">
         <div className="section">
-          <h2>GW overhead (ms / bucket) — what the gateway adds</h2>
+          <h2>Estimated added TTFB — qualified small REST, concurrency and SOAP</h2>
           <Panel height={240}>
             {({ width, height }) => (
               <AreaChart width={width} height={height} data={points}>
@@ -684,7 +688,7 @@ export default function App() {
                 <td className="accent-cell">{fmtMs(c.overheadMs.p50)}</td>
                 <td className="accent-cell">{fmtMs(c.overheadMs.p95)}</td>
                 <td className="accent-cell">{fmtMs(c.overheadMs.p99)}</td>
-                <td className="accent-cell">{fmtMs(c.overheadMs.avg)}</td>
+                <td className="accent-cell">{fmtMs(c.overheadMs.avg)}<small className="hint"> · {c.overheadMs.eligible ?? 0} eligible / {c.overheadMs.excluded ?? 0} excluded</small></td>
                 <td>{fmtBytes(c.avgBytesReq)}</td>
                 <td>{fmtBytes(c.avgBytesResp)}</td>
               </tr>
@@ -769,7 +773,7 @@ export default function App() {
                 <td>{fmtMs(r.latencyMs)}</td>
                 <td>{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(r.ttfbMs)}</td>
                 <td className="hint">{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(Math.max(0, r.latencyMs - r.ttfbMs))}</td>
-                <td>{fmtMs(r.overheadMs)}</td>
+                <td title={r.overheadReason ?? "Qualified estimate"}>{fmtMs(r.overheadMs)}{r.overheadReason && <small className="hint"> {r.overheadReason}</small>}</td>
                 <td>{fmtBytes(r.bytesResp)}</td>
                 <td className="hint">{r.error ?? ""}</td>
               </tr>

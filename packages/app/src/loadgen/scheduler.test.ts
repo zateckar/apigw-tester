@@ -83,3 +83,13 @@ describe("peakTargetRps", () => {
     expect(peakTargetRps({ ...base, mode: "real", rps: 10 })).toBeCloseTo(10 * 1.8 * 1.2);
   });
 });
+
+
+it("accounts for demand lost while a scheduler tick is stalled", () => {
+  const bucket = new TokenBucket();
+  const profile = { ...DEFAULT_LOAD_PROFILE, rps: 100 };
+  bucket.tick(0, profile, 0);
+  const tick = bucket.tick(5000, profile, 0);
+  expect(tick.due).toBe(100);
+  expect(tick.missed).toBe(400);
+});

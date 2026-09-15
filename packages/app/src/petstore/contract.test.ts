@@ -13,6 +13,7 @@ process.env["APP_BASIC_AUTH"] = "test:pw-123";
 const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 let base: string;
+let built: ReturnType<typeof buildApp>;
 let server: ReturnType<ReturnType<typeof buildApp>["listen"]>;
 
 const ctx = (): SpecContext => ({ seedId: 120, createdIds: [] });
@@ -27,12 +28,13 @@ async function fire(spec: ReqSpec): Promise<{ status: number; body: string }> {
 }
 
 beforeAll(async () => {
-  const built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
+  built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
   server = built.listen(0);
   base = `http://127.0.0.1:${server.port}`;
 });
 
-afterAll(() => {
+afterAll(async () => {
+  await built.shutdown();
   server.stop(true);
 });
 

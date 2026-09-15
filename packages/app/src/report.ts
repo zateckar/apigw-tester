@@ -78,7 +78,7 @@ export function buildRunReport(input: BuildReportInput): RunReport {
     summary.total === 0 ? null : (100 * summary.status.gatewayErrors) / summary.total,
     slo.maxGatewayErrorPct, atMost
   ));
-  push(check("overhead-p95", "Gateway overhead p95 (ms)", summary.overheadMs.p95, slo.maxOverheadP95Ms, atMost));
+  push(check("overhead-p95", "Qualified added TTFB p95 (ms)", summary.overheadMs.p95, slo.maxOverheadP95Ms, atMost));
   // only assert contract leakage when invalid traffic was actually generated —
   // a run with invalidRatioPct = 0 has nothing to say about it either way
   push(check(
@@ -117,6 +117,9 @@ export function buildRunReport(input: BuildReportInput): RunReport {
     // the measurement itself is suspect, so neither pass nor fail is honest
     state = "inconclusive";
     reasons.unshift(...summary.validity.reasons);
+  } else if (slo.maxOverheadP95Ms != null && (summary.overheadMs.p95 === null || (summary.overheadMs.excluded ?? 0) > 0)) {
+    state = "inconclusive";
+    reasons.unshift("overhead acceptance requires complete qualified measurement coverage; excluded or legacy samples cannot establish a pass");
   } else if (scope.foreignPct > VALIDITY_LIMITS.foreignPct) {
     // the window is mostly somebody else's traffic: judging this run on it
     // would be judging the wrong run
@@ -175,7 +178,7 @@ const POLICY_MARK: Record<PolicyResult["state"], string> = {
 /** Markdown rendering, for pasting into a ticket or a review. */
 export function renderRunReportMarkdown(r: RunReport): string {
   const iso = (ms: number | null): string => (ms === null ? "—" : new Date(ms).toISOString());
-  const ms = (n: number): string => `${n.toFixed(1)} ms`;
+  const ms = (n: number | null): string => n === null ? "unavailable" : `${n.toFixed(1)} ms`;
   const pct = (n: number): string => `${n.toFixed(2)} %`;
   const L: string[] = [];
 
@@ -224,7 +227,9 @@ export function renderRunReportMarkdown(r: RunReport): string {
   L.push(`| Rate limited | ${s.status.rateLimited.toLocaleString()} |`);
   L.push(`| Unauthorized | ${s.status.unauthorized.toLocaleString()} |`);
   L.push(`| Latency p50 / p95 / p99 | ${ms(s.latencyMs.p50)} / ${ms(s.latencyMs.p95)} / ${ms(s.latencyMs.p99)} |`);
-  L.push(`| **GW overhead p50 / p95 / p99** | **${ms(s.overheadMs.p50)} / ${ms(s.overheadMs.p95)} / ${ms(s.overheadMs.p99)}** |`);
+  L.push(`| Overhead exclusions | ${Object.entries(s.overheadMs.exclusionReasons ?? {}).map(([reason, count]) => `${reason}: ${count}`).join("; ") || "none"} |`);
+  L.push(`| Overhead coverage | ${s.overheadMs.eligible ?? "unknown"} eligible / ${s.overheadMs.excluded ?? "unknown"} excluded |`);
+  L.push(`| **Qualified added TTFB p50 / p95 / p99** | **${ms(s.overheadMs.p50)} / ${ms(s.overheadMs.p95)} / ${ms(s.overheadMs.p99)}** |`);
   L.push("");
 
   L.push("### Status distribution");

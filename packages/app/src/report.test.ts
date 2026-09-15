@@ -198,3 +198,14 @@ describe("report rendering", () => {
     expect(md).toContain("got a\\|b instead");
   });
 });
+
+
+it("does not pass overhead acceptance by discarding contaminated samples", () => {
+  const report = buildRunReport({
+    run: { id: 1, runId: "filtered", startedAt: 0, stoppedAt: 60_000, profile: DEFAULT_LOAD_PROFILE },
+    summary: summary({ overheadMs: { p50: 1, p90: 1, p95: 1, p99: 1, avg: 1, eligible: 99, excluded: 1 } }),
+    scope: { totalRequests: 100, foreignRequests: 0, foreignPct: 0 },
+    gateway: DEFAULT_GW_TARGETS, policies: [], policyConfig: DEFAULT_POLICY_CONFIG, slo: { ...DEFAULT_SLO, maxOverheadP95Ms: 10 }
+  });
+  expect(report.verdict.state).toBe("inconclusive");
+});

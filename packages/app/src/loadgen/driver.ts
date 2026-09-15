@@ -31,7 +31,7 @@ import { probeContext, type ProbeContext } from "./policy.js";
 
 /** Parse the SUT's per-request server-time header; garbage/absent → null. */
 function parseServerMs(raw: string | null): number | null {
-  if (raw === null) return null;
+  if (raw === null || raw.trim() === "") return null;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : null;
 }
@@ -88,7 +88,7 @@ function originOf(url: string): string | null {
 // the fallback is the better default. Keep Node's default dispatcher.
 
 /** fewer wakeups, larger but still sub-second bursts (bucket allows 1s) */
-const TICK_MS = 250;
+const TICK_MS = 20;
 /** must match FLUSH_MS in metrics/server.ts — the store's ingest-rate
  *  estimate and liveness window are derived from the same cadence */
 const FLUSH_MS = 10_000;
@@ -172,6 +172,7 @@ export class Driver {
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
 
   private inFlight = 0;
+  private activeRequests = new Set<AbortController>();
   private seedId = 120; // ids <= this are seeded by the petstore and never evicted
   private createdIds: number[] = [];
   private counters: RunCounters = { ...EMPTY_RUN_COUNTERS };
@@ -188,6 +189,11 @@ export class Driver {
   private lastThrottleWarnMs = 0;
   private droppedTokens = 0;          // load the cap kept us from issuing, per run
   private errLogBudget = 30; // log first N request errors per run
+  private baselineAt = new Map<ScenarioClass, number>();
+  private healthCheck: (from: number, to: number) => string | null = () => "health unavailable";
+
+  setHealthCheck(check: (from: number, to: number) => string | null): void { this.healthCheck = check; }
+
   private probing = false;   // re-entrancy guard for baseline probes
   private flushing = false;
   private ingestAttempts = 0;
@@ -223,6 +229,8 @@ export class Driver {
   /** Redirect baseline probing (useful in tests and custom setups). Also
    *  defines "us" for forwardBasicAuth: "auto", so it must be re-resolved. */
   setBaselineUrl(url: string): void {
+    this.baselines.clear();
+    this.baselineAt.clear();
     this.baselineUrl = url.replace(/\/+$/, "");
     this.refreshUrlPrefixes();
   }
@@ -277,6 +285,7 @@ export class Driver {
           let arr = this.baselines.get(spec.class);
           if (!arr) this.baselines.set(spec.class, (arr = []));
           arr.push(lat);
+          this.baselineAt.set(spec.class, Date.now());
           if (arr.length > BASELINE_SAMPLES_PER_CLASS) arr.shift();
         }
       }
@@ -289,20 +298,22 @@ export class Driver {
     const url = `${this.baselineUrl}${spec.path}`;
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), BASELINE_PROBE_TIMEOUT_MS);
-    const t0 = Date.now();
+    const startedAt = Date.now();
+    const t0 = performance.now();
     try {
       const headers: Record<string, string> = { ...spec.headers };
       const auth = expectedAuthHeader();
       if (auth) headers["authorization"] = auth.toString("utf-8");
       const res = await fetch(url, { method: spec.method, headers, body: spec.body, signal: ac.signal });
       // headers arrived: transport incl. connect+send+backend is now known
-      const ttfb = Date.now() - t0;
-      await res.arrayBuffer();
+      const ttfb = performance.now() - t0;
+      await readOrDrain(res, false);
       // subtract the SUT's own time and batch the remainder (transport + client
       // stack) across all classes; body transfer after TTFB is excluded so the
       // baseline matches the run-time overhead, which is also TTFB-based
       const serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
-      return serverMs === null ? ttfb : Math.max(0, ttfb - serverMs);
+      if (serverMs === null || this.healthCheck(startedAt, Date.now()) !== null) return null;
+      return Math.max(0, ttfb - serverMs);
     } catch {
       return null;
     } finally {
@@ -318,18 +329,15 @@ export class Driver {
     return sorted[Math.floor(sorted.length * 0.5)] ?? sorted[0] ?? 0;
   }
 
-  /**
-   * Split a through-gateway time-to-first-byte into backend time and gateway
-   * time for the *same* request. With X-Server-Ms present this is exact: the
-   * backend's own variability (per-request sleeps, chaos, padding) lands in
-   * baselineMs and never in overheadMs. Without it (gateway-generated
-   * rejection, or a real SUT with no header) we fall back to the class
-   * baseline as the backend estimate.
-   */
-  private overheadFor(cls: ScenarioClass, latencyMs: number, serverMs: number | null): { baselineMs: number; overheadMs: number } {
-    const backendMs = Math.max(0, serverMs ?? this.baselineFor(cls));
-    const baselineMs = serverMs === null ? backendMs : backendMs + this.baselineFor(cls);
-    return { baselineMs, overheadMs: Math.max(0, latencyMs - baselineMs) };
+  /** Added response-header time, requiring a recent healthy direct probe.
+   * Network and scheduling differences remain in this estimate. */
+  private overheadFor(cls: ScenarioClass, ttfbMs: number | null, serverMs: number | null): { baselineMs: number; overheadMs: number | null; overheadReason: string | null } {
+    const baselineMs = (serverMs ?? 0) + this.baselineFor(cls);
+    const reason = ttfbMs === null ? "no response headers"
+      : serverMs === null ? "backend timing unavailable"
+      : Date.now() - (this.baselineAt.get(cls) ?? 0) > 2 * BASELINE_PROBE_MS ? "calibration unavailable or stale"
+      : ttfbMs < baselineMs ? "negative residual: calibration mismatch" : null;
+    return { baselineMs, overheadMs: reason === null ? ttfbMs! - baselineMs : null, overheadReason: reason };
   }
 
   start(runId: string): { ok: true; runId: string } {
@@ -437,12 +445,12 @@ export class Driver {
       this.stop();
       return;
     }
-    const { due, targetRps } = this.bucket.tick(now, this.profile, this.startedAt);
+    const { due, targetRps, missed } = this.bucket.tick(now, this.profile, this.startedAt);
     this.targetRps = targetRps;
     this.noteSchedulerTick(now, targetRps);
     const headroom = Math.max(0, this.effectiveMaxConcurrency - this.inFlight);
     const cap = Math.min(due, headroom);
-    const dropped = due - cap;
+    const dropped = due - cap + (missed ?? 0);
     if (dropped > 0) {
       this.counters.droppedRequests += dropped;
       this.noteShed(now, dropped);
@@ -522,9 +530,11 @@ export class Driver {
     const url = (soap ? this.urlPrefix.soap : this.urlPrefix.rest) + spec.path;
     const { requestId, traceparent } = this.ids.next();
     const started = Date.now();
+    const timerStarted = performance.now();
     const ac = new AbortController();
     const budgetMs =
       spec.class === "slow-upstream" || spec.class === "big-response" || spec.class === "big-request" ? 60_000 : 15_000;
+    this.activeRequests.add(ac);
     const timeout = setTimeout(() => ac.abort(), budgetMs);
     let status = 0;
     let bytesResp = 0;
@@ -550,7 +560,7 @@ export class Driver {
       });
       status = res.status;
       // fetch() resolves on response headers: this is the request's TTFB
-      ttfbMs = Date.now() - started;
+      ttfbMs = performance.now() - timerStarted;
       serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
       // only the createPet flow needs the parsed body (to learn the new id);
       // everything else just wants the byte count, which the length header
@@ -601,16 +611,16 @@ export class Driver {
       }
     } finally {
       clearTimeout(timeout);
+      this.activeRequests.delete(ac);
       this.inFlight--;
     }
 
-    const finished = Date.now();
-    const latencyMs = finished - started;
+    const latencyMs = performance.now() - timerStarted;
     // Overhead uses TTFB, not end-of-body: what the gateway adds to finding
     // and proxying the request. Body transfer time after headers (which for a
     // multi-MB response dwarfs everything else and mostly charges link speed
     // to the gateway) stays in total latency, not in "GW overhead".
-    const { baselineMs, overheadMs } = this.overheadFor(spec.class, ttfbMs ?? latencyMs, serverMs);
+    const { baselineMs, overheadMs, overheadReason } = this.overheadFor(spec.class, ttfbMs, serverMs);
 
     this.record({
       runId,
@@ -625,6 +635,8 @@ export class Driver {
       ttfbMs,
       baselineMs,
       overheadMs,
+      overheadReason: error === null ? overheadReason : "request failed",
+      measurementVersion: 2,
       bytesReq: spec.class === "big-request" ? bigRequestBytes(spec.body) : Buffer.byteLength(spec.body ?? ""),
       bytesResp,
       reachedBackend: serverMs !== null,
@@ -686,6 +698,11 @@ export class Driver {
     }
     this.flushing = true;
     const chunk = this.spool.splice(0, this.spool.length);
+    for (const r of chunk) {
+      if (r.overheadReason === null) {
+        r.overheadReason = this.healthCheck(r.ts, r.ts + r.latencyMs);
+      }
+    }
     const batch: IngestBatch = { batchId: randomUUID(), results: chunk, shed };
     try {
       await this.ingestFn(batch);
@@ -779,6 +796,12 @@ export class Driver {
     this.tickTimer = this.flushTimer = this.baselineTimer = null;
     this.drainTimer = null;
     this.state = "idle";
+    const deadline = performance.now() + 5000;
+    while (this.activeRequests.size && performance.now() < deadline) await new Promise(r => setTimeout(r, 20));
+    for (const ac of this.activeRequests) ac.abort();
+    // Fetch abort continuations finish recording before the last flush.
+    while (this.activeRequests.size) await new Promise(r => setTimeout(r, 20));
+    while (this.flushing) await new Promise(r => setTimeout(r, 20));
     await this.flush(true);
   }
 }

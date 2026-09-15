@@ -416,14 +416,16 @@ export interface RequestResult {
   /** Time to first byte: start → response headers arrived. Null when the
    *  request never got a response (network error / timeout). */
   ttfbMs: number | null;
-  /** Estimated ms of the request not attributable to the gateway: backend
-   *  time (exact per request via X-Server-Ms, else class baseline) plus the
-   *  direct-path transport measured on baseline probes. */
+  /** Backend-reported processing duration plus calibrated direct transport.
+   * Only meaningful for subtraction when overheadReason is null. */
   baselineMs: number;
-  /** What the gateway added before the first byte: ttfbMs - baselineMs
-   *  (clipped at 0). Response-body transfer is deliberately excluded — it
-   *  stays visible as latencyMs - ttfbMs. */
-  overheadMs: number;
+  /** Estimated added response-header time: ttfbMs - baselineMs. Missing,
+   * stale and negative estimates are unavailable. A locally contaminated
+   * observation is retained internally with an exclusion reason; the recent
+   * API and qualified aggregates expose it as unavailable. */
+  overheadMs: number | null;
+  measurementVersion?: number;
+  overheadReason?: string | null;
   bytesReq: number;
   bytesResp: number;
   /**
@@ -501,7 +503,7 @@ export const VALIDITY_LIMITS = {
   /** share of total machine capacity this process may burn */
   cpuProcessPct: 85,
   /** event-loop stall that starts showing up in measured latency */
-  eventLoopP99Ms: 100,
+  eventLoopP99Ms: 10,
   /** share of intended load we may fail to issue before the window is suspect */
   shedPct: 1,
   /** share of a run report's window that may belong to other runs. Roll-ups are
@@ -556,8 +558,8 @@ export interface MetricSummary {
   unexpectedFailurePct: number;
   rps: number;
   latencyMs: { p50: number; p90: number; p95: number; p99: number; avg: number; max: number };
-  /** How much of the observed latency the gateway is responsible for. */
-  overheadMs: { p50: number; p90: number; p95: number; p99: number; avg: number };
+  /** Qualified added TTFB estimate; includes path differences, not just GW CPU. */
+  overheadMs: { p50: number | null; p90: number | null; p95: number | null; p99: number | null; avg: number | null; eligible?: number; excluded?: number; exclusionReasons?: Record<string, number> };
   bytes: { req: number; resp: number; respPerSec: number };
   status: StatusBreakdown;
   /** Whether this window's numbers are trustworthy at all. Read it before the
@@ -618,7 +620,7 @@ export interface ClassStat {
   gatewayErrors: number;
   rps: number;
   latencyMs: { p50: number; p95: number; p99: number; avg: number };
-  overheadMs: { p50: number; p95: number; p99: number; avg: number };
+  overheadMs: { p50: number | null; p95: number | null; p99: number | null; avg: number | null; eligible?: number; excluded?: number; exclusionReasons?: Record<string, number> };
   avgBytesReq: number;
   avgBytesResp: number;
 }
@@ -636,9 +638,9 @@ export interface TimePoint {
   p50: number;
   p90: number;
   p99: number;
-  overheadP50: number;
-  overheadP95: number;
-  overheadP99: number;
+  overheadP50: number | null;
+  overheadP95: number | null;
+  overheadP99: number | null;
   bytesResp: number;
   restTotal: number;
   soapTotal: number;
@@ -914,6 +916,12 @@ export interface RunEvent {
 // A single point-in-time reading of the machine this app runs on, so the
 // dashboard can tell "the app saturated" apart from "the gateway got slow".
 export interface SystemSample {
+  /** Interval covered by this health observation. */
+  intervalStartTs?: number;
+  cpuCorePct?: number | null;
+  cpuCapacityPct?: number | null;
+  cpuThrottledMs?: number | null;
+  eventLoopMaxMs?: number | null;
   ts: number; // epoch ms when the sample was taken
   // CPU is normalised to total machine capacity (0-100), so a pegged 4-core
   // VM reads ~100, not 400 like `top` would show

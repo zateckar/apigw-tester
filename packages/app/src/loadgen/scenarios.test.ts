@@ -202,7 +202,7 @@ describe("weightedPick edge cases", () => {
 describe("mode safety", () => {
   it("unknown mode returns constant equivalent", async () => {
     const { targetRpsAt } = await import("./scheduler.js");
-    expect(targetRpsAt({ ...p, mode: "unknown" as LoadProfile["mode"] }, Date.now(), Date.now())).toBe(p.rps);
+    expect(targetRpsAt({ ...p, mode: "unknown" as LoadProfile["mode"] }, Date.now(), Date.now())).toBe(p.rps!);
   });
 });
 

@@ -5,6 +5,7 @@ export type LoadModeEx = LoadMode;
 
 export interface TickResult {
   due: number;
+  missed: number;
   targetRps: number;
 }
 
@@ -146,15 +147,17 @@ export class TokenBucket {
     const targetRps = targetRpsAt(profile, nowMs, startedAtMs, this.shaper);
     if (this.lastMs === null) {
       this.lastMs = nowMs;
-      return { due: 0, targetRps };
+      return { due: 0, targetRps, missed: 0 };
     }
     const dtSec = Math.max(0, (nowMs - this.lastMs) / 1000);
     this.lastMs = nowMs;
     // allow burst up to 1s of target rps
-    this.tokens = Math.min(targetRps, this.tokens + dtSec * targetRps);
+    const available = this.tokens + dtSec * targetRps;
+    const missed = Math.floor(Math.max(0, available - targetRps));
+    this.tokens = Math.min(targetRps, available);
     const due = Math.floor(this.tokens);
     this.tokens -= due;
     if (targetRps === 0) this.tokens = 0;
-    return { due, targetRps };
+    return { due, targetRps, missed };
   }
 }

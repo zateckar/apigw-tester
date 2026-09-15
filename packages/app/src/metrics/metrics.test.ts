@@ -12,7 +12,7 @@ function mk(over: Partial<RequestResult> = {}): RequestResult {
   return {
     runId: "r1", requestId: `req${++seq}`, ts: Date.now(), protocol: "rest", endpoint: "GET /api/pets",
     class: "small-rest", method: "GET", status: 200,
-    latencyMs: 100, ttfbMs: 80, baselineMs: 0, overheadMs: 100,
+    latencyMs: 100, ttfbMs: 100, measurementVersion: 2, overheadReason: null, baselineMs: 0, overheadMs: 100,
     bytesReq: 10, bytesResp: 100, reachedBackend: true, error: null,
     ...over
   };
@@ -605,5 +605,71 @@ describe("reset and prune", () => {
     expect(remaining).not.toContain("stopped-run");
     expect(remaining).toContain("still-running");
     s.close();
+  });
+});
+
+
+describe("qualified overhead and durable coverage", () => {
+  it("uses the same full minute for the rate numerator and denominator", () => {
+    const store = createMetricsStore(":memory:");
+    try {
+      const start = Math.floor((Date.now() - 120_000) / 60_000) * 60_000;
+      store.ingestBatch({ batchId: "boundary", results: Array.from({ length: 60 }, (_, i) => mk({ ts: start + i * 1000 })) });
+      const sum = store.summaryBetween(start + 59_000, start + 60_000);
+      expect(sum.total).toBe(60);
+      expect(sum.windowSec).toBe(60);
+      expect(sum.rps).toBe(1);
+    } finally { store.close(); }
+  });
+
+  it("retains identical rates after raw history expires and the store reopens", () => {
+    const dir = mkdtempSync(join(tmpdir(), "coverage-"));
+    const path = join(dir, "test.sqlite");
+    const start = Math.floor((Date.now() - 72 * 3600_000) / 3600_000) * 3600_000;
+    let store = createMetricsStore(path);
+    try {
+      store.ingestBatch({ batchId: "history", results: Array.from({ length: 48 * 60 }, (_, i) => mk({ ts: start + i * 60_000 })) });
+      const before = store.summaryBetween(start, start + 48 * 3600_000);
+      store.close();
+      const db = openDb(path);
+      db.prepare("DELETE FROM requests_raw WHERE ts < ?").run(start + 24 * 3600_000);
+      db.close(true);
+      store = createMetricsStore(path);
+      const after = store.summaryBetween(start, start + 48 * 3600_000);
+      expect(after.rps).toBe(before.rps);
+      expect(after.windowSec).toBe(before.windowSec);
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("preserves failures and totals but excludes unqualified overhead from averages and histograms", () => {
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({ batchId: "qualified", results: [
+        mk({ overheadMs: 10 }),
+        mk({ overheadMs: 20 }),
+        mk({ overheadMs: 1000, overheadReason: "local event-loop stall" }),
+        mk({ overheadMs: null, ttfbMs: null, status: 0, error: "timeout", overheadReason: "no response headers" }),
+        mk({ measurementVersion: 1, overheadMs: 500 }),
+        mk({ class: "big-response", overheadMs: 900 })
+      ] });
+      const sum = store.summary(300_000);
+      expect(sum.total).toBe(6);
+      expect(sum.errors).toBe(1);
+      expect(sum.overheadMs.eligible).toBe(2);
+      expect(sum.overheadMs.excluded).toBe(3);
+      expect(sum.overheadMs.avg).toBe(15);
+      expect(sum.perClass.find(c => c.cls === "big-response")!.overheadMs.avg).toBe(900);
+      expect(store.recent(10).some(r => r.overheadReason === "local event-loop stall")).toBe(true);
+      expect(sum.overheadMs.p95!).toBeLessThan(30);
+    } finally { store.close(); }
+  });
+
+  it("reports unavailable when all measurements use the old definition", () => {
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({ batchId: "old", results: [mk({ measurementVersion: 1 })] });
+      expect(store.summary(300_000).overheadMs.p95).toBeNull();
+      expect(store.summary(300_000).overheadMs.avg).toBeNull();
+    } finally { store.close(); }
   });
 });

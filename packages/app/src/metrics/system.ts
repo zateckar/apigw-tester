@@ -1,4 +1,7 @@
 import os from "node:os";
+import { join, dirname } from "node:path";
+import { existsSync } from "node:fs";
+import { VALIDITY_LIMITS } from "@apigw/shared";
 import { readFileSync } from "node:fs";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { IngestBatch, SystemSample } from "@apigw/shared";
@@ -6,6 +9,7 @@ import type { IngestBatch, SystemSample } from "@apigw/shared";
 export interface SystemSamplerOpts {
   /** Sample cadence; default 2s matches the dashboard poll. */
   intervalMs?: number;
+  cgroupRootPath?: string;
   /** Samples retained in memory, oldest dropped first; default 600 (~20 min). */
   historySize?: number;
   /** Injectable so tests can point at fixture files. */
@@ -18,6 +22,8 @@ export interface SystemSampler {
   start(): void;
   stop(): void;
   latest(): SystemSample;
+  sampleNow(): void;
+  qualityBetween(from: number, to: number): string | null;
   history(n?: number): SystemSample[];
   /** Called once per ingested batch so appInBps/appOutBps can be derived
    *  without the sampler reaching into the metrics store. */
@@ -36,6 +42,8 @@ interface BytePair {
 interface Counters {
   tsMs: number; // wall clock, used for byte-rate elapsed time
   hrtUs: number; // monotonic hrtime in µs, used for CPU elapsed time
+  throttledUs: number | null;
+  capacity: number;
   procCpuUs: number; // process user+system, µs
   sysBusyUs: number; // all cores, user+system+irq etc., µs (idle excluded)
   procIo: BytePair | null; // cumulative process I/O bytes or null off /proc
@@ -159,8 +167,46 @@ function nullSample(ts: number): SystemSample {
  * cannot be measured on this platform degrades to null in every sample; the
  * sampler itself never throws from a tick.
  */
+/** Container CPU quota and cpuset bound the available capacity. Ancestors
+ * may impose a tighter quota than the process's own cgroup. */
+export function readCpuCapacity(paths: string[], fallback: number): { cores: number; throttledUs: number | null } {
+  let cores = fallback;
+  let throttledUs: number | null = null;
+  for (const path of paths) {
+    try {
+      const [quota, period] = readFileSync(join(path, "cpu.max"), "utf8").trim().split(/\s+/);
+      if (quota !== "max" && Number(quota) > 0 && Number(period) > 0) cores = Math.min(cores, Number(quota) / Number(period));
+    } catch { /* not cgroup v2 */ }
+    try {
+      const cpus = readFileSync(join(path, "cpuset.cpus.effective"), "utf8").trim();
+      if (/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(cpus)) {
+        const n = cpus.split(",").reduce((sum, range) => { const [a, b = a] = range.split("-").map(Number); return sum + b! - a! + 1; }, 0);
+        if (n > 0) cores = Math.min(cores, n);
+      }
+    } catch { /* unavailable */ }
+    try {
+      const text = readFileSync(join(path, "cpu.stat"), "utf8");
+      const match = /^throttled_usec\s+(\d+)$/m.exec(text);
+      if (match) throttledUs = (throttledUs ?? 0) + Number(match[1]);
+    } catch { /* unavailable */ }
+  }
+  return { cores: Math.max(0.01, cores), throttledUs };
+}
+
 export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler {
   const intervalMs = opts.intervalMs ?? 2000;
+  const root = opts.cgroupRootPath ?? "/sys/fs/cgroup";
+  const cgroupPaths = [root];
+  if (!opts.cgroupRootPath && process.platform === "linux") {
+    try {
+      const group = /^0::(.*)$/m.exec(readFileSync("/proc/self/cgroup", "utf8"))?.[1];
+      let path = join(root, group ?? "");
+      while (path.startsWith(root + "/") && existsSync(path)) {
+        cgroupPaths.push(path);
+        path = dirname(path);
+      }
+    } catch { /* root may already be the container's cgroup mount */ }
+  }
   const historySize = opts.historySize ?? 600;
   const procNetDevPath = opts.procNetDevPath ?? "/proc/net/dev";
   const procDiskstatsPath = opts.procDiskstatsPath ?? "/proc/diskstats";
@@ -213,7 +259,9 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
     } catch {
       // same degradation as above
     }
+    const capacity = readCpuCapacity(cgroupPaths, Math.max(os.availableParallelism(), 1));
     return {
+      capacity: capacity.cores, throttledUs: capacity.throttledUs,
       tsMs: Date.now(),
       hrtUs: Number(process.hrtime.bigint() / 1000n),
       procCpuUs: cpu.user + cpu.system,
@@ -240,6 +288,11 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
         const clamp = (v: number): number => Math.min(100, Math.max(0, v));
         latestSample = {
           ts: cur.tsMs,
+          intervalStartTs: prev.tsMs,
+          cpuCorePct: (100 * (cur.procCpuUs - prev.procCpuUs)) / elapsedUs,
+          cpuCapacityPct: clamp((100 * (cur.procCpuUs - prev.procCpuUs)) / (elapsedUs * cur.capacity)),
+          cpuThrottledMs: prev.throttledUs === null || cur.throttledUs === null ? null : Math.max(0, cur.throttledUs - prev.throttledUs) / 1000,
+          eventLoopMaxMs: loopHist === null ? null : loopHist.max / NS_PER_MS,
           // both CPU numbers are a share of TOTAL machine capacity, not of one core
           cpuProcessPct: clamp((100 * (cur.procCpuUs - prev.procCpuUs)) / (elapsedUs * coreCount)),
           cpuSystemPct: clamp((100 * (cur.sysBusyUs - prev.sysBusyUs)) / (elapsedUs * coreCount)),
@@ -303,6 +356,7 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
   return {
     start() {
       if (timer !== null) return;
+      loopHist?.enable();
       timer = setInterval(tick, intervalMs);
       // the sampler must never be the reason the process refuses to exit
       timer.unref();
@@ -311,6 +365,20 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
     stop() {
       if (timer !== null) clearInterval(timer);
       timer = null;
+      loopHist?.disable();
+    },
+    sampleNow: tick,
+    qualityBetween(from, to) {
+      // Samples describe the interval since the previous read, not one instant.
+      const overlap = samples.filter(s => s.intervalStartTs !== undefined && s.ts >= from && s.intervalStartTs <= to);
+      if (!overlap.length || overlap[0]!.intervalStartTs! > from || overlap[overlap.length - 1]!.ts < to - 1) return "health coverage unavailable";
+      for (const s of overlap) {
+        if (s.cpuCorePct === null || s.cpuCorePct === undefined || s.eventLoopMaxMs == null) return "health unavailable";
+        if ((s.cpuThrottledMs ?? 0) > 0) return "local CPU throttling";
+        if (s.cpuCorePct > 85 || (s.cpuCapacityPct ?? 0) > 85) return "local CPU saturation";
+        if (s.eventLoopMaxMs > VALIDITY_LIMITS.eventLoopP99Ms) return "local event-loop stall";
+      }
+      return null;
     },
     latest() {
       // before start() (or after a tick threw) report levels with null rates
