@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { DEFAULT_LOAD_PROFILE, PET_STATUSES, type LoadProfile } from "@apigw/shared";
 import {
   buildSpec,

@@ -2,12 +2,15 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "types": ["node"],
+    "types": ["bun", "node"],
     "baseUrl": ".",
     "paths": {
-      "@apigw/shared": ["../shared/src/index.ts"]
+      "@apigw/shared": ["../shared/src/index.ts"],
+      "@apigw/shared/*": ["../shared/src/*"]
     }
   },
   "include": ["src"],
+  // bun test runs test files with types stripped; typecheck only app source.
+  // (Test-side types are still validated by editor tooling via tsconfig.json.)
   "exclude": ["src/**/*.test.ts"]
 }

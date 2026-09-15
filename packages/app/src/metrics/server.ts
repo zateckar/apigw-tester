@@ -50,8 +50,9 @@ const RAW_RETENTION_MS = 24 * HOUR_BUCKETS;
 const MINUTE_RETENTION_MS = 7 * 24 * HOUR_BUCKETS;
 const HOUR_RETENTION_MS = 90 * 24 * HOUR_BUCKETS;
 
-/** the loadgen driver's flush cadence; batch size ÷ this is the ingest rate */
-const FLUSH_MS = 5_000;
+/** the loadgen driver's flush cadence; batch size ÷ this is the ingest rate.
+ *  Must match FLUSH_MS in loadgen/driver.ts. */
+const FLUSH_MS = 10_000;
 const FLUSH_SEC = FLUSH_MS / 1000;
 /** rows per multi-row VALUES insert — 200 × 13 params stays far under
  *  SQLite's ~32766 bind-parameter ceiling */
@@ -157,6 +158,8 @@ function statusCount(h: StatusHistogram, buckets: readonly StatusBucket[]): numb
   }
   return n;
 }
+
+const OVERHEAD_CLASSES: ReadonlySet<string> = new Set(["small-rest", "concurrency", "soap"]);
 
 const CLIENT_ERROR_BUCKETS: readonly StatusBucket[] =
   STATUS_BUCKETS.filter((b) => b === "4xx" || /^4\d\d$/.test(b));
@@ -264,24 +267,17 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   const db = openDb(dbPath);
   migrate(db);
 
-  const upsertMinute = db.prepare(layer("rollup_minute"));
-  const upsertHour = db.prepare(layer("rollup_hour"));
-
-  /** Element-wise sum of a fixed-length JSON count array against the incoming
-   *  row. The sequence is sized from `excluded`, which is always written at
-   *  full length, so a row stored by an older build (`'[]'`) still merges. */
-  function mergeArrayCol(table: string, col: string): string {
-    return `(
-         SELECT json_group_array(b.sum) FROM (
-           WITH RECURSIVE seq(i) AS (
-             SELECT 0
-             UNION ALL SELECT i+1 FROM seq WHERE i < json_array_length(excluded.${col}) - 1
-           )
-           SELECT COALESCE(json_extract(${table}.${col}, '$[' || i || ']'), 0) +
-                  COALESCE(json_extract(excluded.${col}, '$[' || i || ']'), 0) AS sum
-           FROM seq
-         ) b
-       )`;
+  // Histogram columns are merged in JS (positional, fixed-length) rather than
+  // by SQL: a recursive-CTE json merge per column per row was the single
+  // largest CPU sink of the ingest path. The flow is: SELECT the existing row
+  // for each (bucket_ts, protocol, endpoint, cls) key inside the same
+  // transaction, mergeHistograms() the stored arrays into the in-memory
+  // bucket, then write the full merged arrays back with a plain upsert whose
+  // scalar columns stay cheap SQL arithmetic. Rows written by an older build
+  // (hist='[]') merge positionally as all-zero.
+  function selectRow(table: string): string {
+    return `SELECT hist, overhead_hist, status_hist FROM ${table}
+     WHERE bucket_ts = ? AND protocol = ? AND endpoint = ? AND cls = ?`;
   }
 
   function layer(table: string): string {
@@ -301,10 +297,14 @@ export function createMetricsStore(dbPath: string): MetricsStore {
        overhead_max_ms = MAX(overhead_max_ms, excluded.overhead_max_ms),
        bytes_req = bytes_req + excluded.bytes_req,
        bytes_resp = bytes_resp + excluded.bytes_resp,
-       hist = ${mergeArrayCol(table, "hist")},
-       overhead_hist = ${mergeArrayCol(table, "overhead_hist")},
-       status_hist = ${mergeArrayCol(table, "status_hist")}`;
+       hist = excluded.hist,
+       overhead_hist = excluded.overhead_hist,
+       status_hist = excluded.status_hist`;
   }
+  const selectMinute = db.prepare(selectRow("rollup_minute"));
+  const selectHour = db.prepare(selectRow("rollup_hour"));
+  const upsertMinute = db.prepare(layer("rollup_minute"));
+  const upsertHour = db.prepare(layer("rollup_hour"));
   const upsertShed = db.prepare(
     `INSERT INTO load_shed (bucket_ts, dropped, target_sum, ticks) VALUES (?, ?, ?, ?)
      ON CONFLICT(bucket_ts) DO UPDATE SET
@@ -529,7 +529,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           b.bytes_req += r.bytesReq;
           b.bytes_resp += r.bytesResp;
           addToHistogram(b.hist, r.latencyMs);
-          addToHistogram(b.overhead_hist, r.overheadMs);
+          // overhead percentiles are only quoted for the latency-sensitive
+          // classes; for the noise classes the histogram stays all-zero (the
+          // sums above still feed the avg) and the UI renders it fine
+          if (OVERHEAD_CLASSES.has(r.class)) addToHistogram(b.overhead_hist, r.overheadMs);
           addToStatusHistogram(b.status_hist, r.status);
         }
       }
@@ -545,14 +548,33 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         const params = slice.flatMap(rawInsertParams);
         db.prepare(rawInsertSql(slice.length)).run(...params);
       }
-      const upsertParams = (b: Bucket): unknown[] => [
+      type StoredHists = { hist: string; overhead_hist: string; status_hist: string };
+      type Bind = string | number | bigint | null | Uint8Array | boolean;
+      // Merge the stored histograms into the in-memory buckets first, then
+      // write the full merged arrays back; scalar columns stay SQL-side deltas.
+      const upsertParams = (b: Bucket): Bind[] => [
         b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx,
         b.rejected4xx_gw, b.reached_backend, b.latency_sum_ms, b.max_latency_ms,
         b.overhead_sum_ms, b.overhead_max_ms, b.bytes_req, b.bytes_resp,
         JSON.stringify(b.hist), JSON.stringify(b.overhead_hist), JSON.stringify(b.status_hist)
       ];
-      for (const b of minute.values()) upsertMinute.run(...upsertParams(b));
-      for (const b of hour.values()) upsertHour.run(...upsertParams(b));
+      const mergeIntoAndUpsert = (
+        buckets: Map<string, Bucket>,
+        select: typeof selectMinute,
+        upsert: typeof upsertMinute
+      ): void => {
+        for (const b of buckets.values()) {
+          const existing = select.get(b.bucket_ts, b.protocol, b.endpoint, b.cls) as StoredHists | undefined;
+          if (existing) {
+            mergeHistograms(b.hist, parseHist(existing.hist));
+            mergeHistograms(b.overhead_hist, parseHist(existing.overhead_hist));
+            mergeHistograms(b.status_hist, parseHist(existing.status_hist));
+          }
+          upsert.run(...upsertParams(b));
+        }
+      };
+      mergeIntoAndUpsert(minute, selectMinute, upsertMinute);
+      mergeIntoAndUpsert(hour, selectHour, upsertHour);
       // shed rows ride the same transaction as the requests they explain, so a
       // window can never show the load we issued without the load we did not
       for (const s of batch.shed ?? []) {
@@ -571,12 +593,25 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       throw e;
     }
     lastIngestAt = Date.now();
+    summaryCacheKey = "";
+    summaryCacheVal = null;
     return { ingested: batch.results.length };
   }
 
+  // The dashboard polls every ~2s but roll-ups only change on a flush, so the
+  // whole window merge is memoized per (windowMs, flush index). The cache key
+  // advances on every ingest, invalidating automatically.
+  let summaryCacheKey = "";
+  let summaryCacheVal: MetricSummary | null = null;
+
   function summary(windowMs: number): MetricSummary {
     const now = Date.now();
-    return summaryBetween(now - windowMs, now);
+    const key = `${windowMs}|${Math.floor(now / FLUSH_MS)}`;
+    if (summaryCacheVal !== null && key === summaryCacheKey) return summaryCacheVal;
+    const val = summaryBetween(now - windowMs, now);
+    summaryCacheKey = key;
+    summaryCacheVal = val;
+    return val;
   }
 
   function summaryBetween(from: number, to: number): MetricSummary {
@@ -924,6 +959,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       }
       // give the freed pages back to the file system, as the sweeper does
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      summaryCacheKey = "";
+      summaryCacheVal = null;
     },
     pruneRuns: (olderThanMs) => {
       const cutoff = Date.now() - olderThanMs;
@@ -951,7 +988,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     close: () => {
       clearInterval(rawCleaner);
       try { db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch { /* closing anyway */ }
-      db.close();
+      // finalize prepared statements too — without it on Windows the file
+      // stays locked past close() and temp-dir cleanup in tests fails EBUSY
+      db.close(true);
     }
   };
 }

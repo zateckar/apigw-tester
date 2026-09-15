@@ -87,8 +87,11 @@ function originOf(url: string): string | null {
 // same sockets to saturate while short-lived ones pile up. On Windows loopback
 // the fallback is the better default. Keep Node's default dispatcher.
 
-const TICK_MS = 100;
-const FLUSH_MS = 5000;
+/** fewer wakeups, larger but still sub-second bursts (bucket allows 1s) */
+const TICK_MS = 250;
+/** must match FLUSH_MS in metrics/server.ts — the store's ingest-rate
+ *  estimate and liveness window are derived from the same cadence */
+const FLUSH_MS = 10_000;
 
 /**
  * Drain the response body chunk-by-chunk, keeping only the total size. Never

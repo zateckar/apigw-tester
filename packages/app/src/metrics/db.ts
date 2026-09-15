@@ -1,22 +1,15 @@
-// Dynamic import deferred to runtime so vitest/vite don't try to bundle node:sqlite
+// bun:sqlite is a first-class import under the single Bun runtime — no more
+// lazy createRequire dance to keep vitest from bundling node:sqlite.
+import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { createRequire } from "node:module";
 
-type Stmt = { run: (...a: unknown[]) => unknown; get: (...a: unknown[]) => unknown; all: (...a: unknown[]) => unknown };
-export type DbHandle = {
-  exec(sql: string): void;
-  prepare(sql: string): Stmt;
-  close(): void;
-};
-
-const req = createRequire(import.meta.url);
+export type Stmt = import("bun:sqlite").Statement;
+export type DbHandle = Database;
 
 export function openDb(path: string): DbHandle {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
-  // node:sqlite ships with Node 22.5+; not typed for TS yet, so load lazily
-  const mod = req("node:sqlite") as { DatabaseSync: new (p: string) => DbHandle };
-  const db = new mod.DatabaseSync(path);
+  const db = new Database(path);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec("PRAGMA busy_timeout = 5000");
@@ -140,7 +133,7 @@ export function openDb(path: string): DbHandle {
 
 /** Add a column if an older database predates it. Safe to call on every boot. */
 export function ensureColumn(db: DbHandle, table: string, column: string, ddl: string): void {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as unknown as { name: string }[];
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   if (cols.some((c) => c.name === column)) return;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
 }

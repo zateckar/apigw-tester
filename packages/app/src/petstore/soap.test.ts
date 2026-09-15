@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { detectOperation, executeOperation, WSDL } from "./soap.js";
 import { PetStore } from "./store.js";
 

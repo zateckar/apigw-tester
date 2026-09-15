@@ -1,8 +1,8 @@
 #!/bin/sh
-# Repair /app/data ownership, then drop privileges and run the server as `node`.
+# Repair /app/data ownership, then drop privileges and run the server as `bun`.
 #
 # A named volume inherits the image's ownership only when Docker seeds it from
-# empty. A volume that predates `USER node` in this Dockerfile — or any bind
+# empty. A volume that predates the unprivileged `bun` user in this Dockerfile — or any bind
 # mount supplied by the host — arrives owned by whoever created it, Docker will
 # not re-seed it, and the unprivileged server then dies opening the database:
 #
@@ -16,11 +16,11 @@ set -e
 
 if [ "$(id -u)" = "0" ]; then
   mkdir -p /app/data
-  chown -R node:node /app/data 2>/dev/null ||
+  chown -R bun:bun /app/data 2>/dev/null ||
     echo "[apigw-tester] warning: could not chown /app/data — the server may be unable to write metrics.db" >&2
   # su-exec drops root rather than gaining anything, so this stays compatible
   # with no-new-privileges.
-  exec su-exec node "$@"
+  exec su-exec bun "$@"
 fi
 
 # Already unprivileged (compose `user:` override, rootless Docker): nothing to

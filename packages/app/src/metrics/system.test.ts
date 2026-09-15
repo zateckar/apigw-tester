@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -49,10 +49,10 @@ function batch(bytesReq: number, bytesResp: number): IngestBatch {
   return {
     batchId: `b-${Math.random()}`,
     results: [{
-      runId: "r", ts: Date.now(), protocol: "rest", endpoint: "GET /x",
+      runId: "r", requestId: `req-${Math.random()}`, ts: Date.now(), protocol: "rest", endpoint: "GET /x",
       class: "small-rest", method: "GET", status: 200,
       latencyMs: 1, baselineMs: 0, overheadMs: 1,
-      bytesReq, bytesResp, error: null
+      bytesReq, bytesResp, reachedBackend: true, error: null
     }]
   };
 }

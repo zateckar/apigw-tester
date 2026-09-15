@@ -8,25 +8,26 @@
   ],
   "scripts": {
     "clean": "npm run clean --workspaces --if-present",
-    "build": "npm run build -w @apigw/shared && npm run build -w @apigw/app && npm run build -w @apigw/ui",
-    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build -w @apigw/ui",
+    "test": "bun test packages/app/src",
     "lint": "eslint .",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "verify": "npm run lint && npm run typecheck && npm test",
-    "start": "npm start -w @apigw/app",
+    "start": "bun run packages/app/src/index.ts",
     "compose:up": "docker compose up --build -d",
     "compose:down": "docker compose down",
     "compose:reset": "docker compose down -v",
     "logs": "docker compose logs -f"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@types/bun": "^1.2.0",
+    "@types/node": "^26.5.1",
     "eslint": "^9.16.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.18.0"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "bun": ">=1.2.3"
   },
   "allowScripts": {
     "esbuild@0.28.2": true,

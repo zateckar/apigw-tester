@@ -35,10 +35,9 @@ async function shutdown(sig: string): Promise<void> {
     console.error("[apigw-tester] error while draining:", e);
   }
 
-  server.close(() => {
-    clearTimeout(forceExit);
-    process.exit(0);
-  });
+  server.stop();
+  clearTimeout(forceExit);
+  process.exit(0);
 }
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {

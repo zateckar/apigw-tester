@@ -1,10 +1,8 @@
-import express, { type Express, type Request, type Response } from "express";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { HISTOGRAM_EDGES } from "./metrics/server.js";
-import { createMetricsStore, type MetricsStore } from "./metrics/server.js";
+import { createMetricsStore, type MetricsStore, HISTOGRAM_EDGES } from "./metrics/server.js";
 import { createSystemSampler, type SystemSampler } from "./metrics/system.js";
-import { createApp as createPetstoreApp } from "./petstore/server.js";
+import { createPetstoreRoutes, SERVER_MS_HEADER, type Handler, type RouteCtx } from "./petstore/server.js";
 import { buildOpenApiDocument, toYaml } from "./petstore/openapi.js";
 import { WSDL } from "./petstore/soap.js";
 import { Driver, type Driver as DriverType } from "./loadgen/driver.js";
@@ -26,15 +24,17 @@ import { runPolicyProbes } from "./loadgen/policy.js";
 import { buildRunReport, renderRunReportMarkdown } from "./report.js";
 
 export interface BuiltApp {
-  app: Express;
+  /** Bun-native request handler — pass to Bun.serve or call directly in tests. */
+  fetch: (req: Request) => Promise<Response>;
+  /** Ephemeral test server: Bun.serve on the given port (0 = random). */
+  listen: (port: number) => ReturnType<typeof Bun.serve>;
   store: MetricsStore;
   driver: DriverType;
   sampler: SystemSampler;
 }
 
 /**
- * Version of the running build, for /health. Resolves to packages/app/package.json
- * from src/ (dev, tests) and to /app/package.json from dist/ (container) alike.
+ * Version of the running build, for /health.
  */
 const VERSION: string = (() => {
   try {
@@ -50,43 +50,17 @@ const STARTED_AT = Date.now();
 /** How long POST /api/config/gateway/test waits before calling a gateway unreachable. */
 const GATEWAY_PROBE_TIMEOUT_MS = 5_000;
 
-/**
- * Baseline response headers. The dashboard is same-origin and loads no third-party
- * script, so it can run under a tight policy; `style-src 'unsafe-inline'` is the one
- * concession, because Recharts sizes its SVG with inline style attributes.
- */
-function securityHeaders(): express.RequestHandler {
-  const csp = [
-    "default-src 'self'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data:",
-    "connect-src 'self'",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "frame-ancestors 'none'"
-  ].join("; ");
-  return (req, res, next) => {
-    res.setHeader("Content-Security-Policy", csp);
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("X-Frame-Options", "DENY");
-    res.setHeader("Referrer-Policy", "no-referrer");
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-    // Only meaningful once TLS is terminated in front of us; asserting it on a
-    // plain-HTTP hop would pin clients that never had a working https origin.
-    if (req.secure) {
-      res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
-    }
-    next();
-  };
-}
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "object-src 'none'",
+  "base-uri 'none'",
+  "frame-ancestors 'none'"
+].join("; ");
 
-/**
- * Windows the summary endpoint accepts, in ms.
- *
- * A null-prototype object, so a query string of `constructor`/`toString` cannot
- * resolve to an inherited Object.prototype member and slip past the lookup guard.
- */
 const SUMMARY_WINDOWS: Record<string, number> = Object.assign(Object.create(null) as object, {
   "5m": 300_000,
   "15m": 900_000,
@@ -96,15 +70,6 @@ const SUMMARY_WINDOWS: Record<string, number> = Object.assign(Object.create(null
   "7d": 604_800_000
 }) as Record<string, number>;
 
-/**
- * Normalise a server URL that will be reflected into a document we hand out.
- *
- * Returns null unless it is an absolute http(s) URL. The result is re-serialised
- * by the WHATWG URL parser, so a value that would break the XML attribute or the
- * YAML scalar it lands in (quotes, angle brackets, newlines) is either rejected
- * or percent-encoded before it gets there.
- */
-/** XML attribute-value escape. `&` is legal in a URL but not raw in XML. */
 function xmlAttr(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -127,11 +92,6 @@ function originOf(url: string): string | null {
   try { return new URL(url).origin; } catch { return null; }
 }
 
-/**
- * Whether a target may receive this rig's own `Authorization: Basic …`.
- * Mirrors Driver.sendsOurCredential — the probe must not be a way to send the
- * dashboard credential somewhere the load driver itself would refuse to.
- */
 export function forwardsBasicAuth(target: GwConfig, selfUrl: string): boolean {
   if (target.forwardBasicAuth === "always") return true;
   if (target.forwardBasicAuth === "never") return false;
@@ -140,29 +100,57 @@ export function forwardsBasicAuth(target: GwConfig, selfUrl: string): boolean {
   return self !== null && theirs !== null && self === theirs;
 }
 
+/** Baseline response headers + request id; HSTS only once TLS terminates in
+ *  front of us — mirrored from the Express middleware, including the exact
+ *  header set the CI smoke suite greps for. Never set x-powered-by. */
+function applySecurityHeaders(req: Request, headers: Headers): void {
+  headers.set("Content-Security-Policy", CSP);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("Cross-Origin-Opener-Policy", "same-origin");
+  const proto = req.headers.get("x-forwarded-proto") ?? new URL(req.url).protocol.replace(":", "");
+  if (proto === "https") {
+    headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+}
+
+interface ParsedRoute {
+  method: string;
+  segments: string[];
+  def: { handler: Handler; body?: "json" | "text" | "arrayBuffer" };
+}
+
+function compileRoutes(table: Record<string, Handler | { handler: Handler; body?: "json" | "text" | "arrayBuffer" }>): ParsedRoute[] {
+  const out: ParsedRoute[] = [];
+  for (const [key, val] of Object.entries(table)) {
+    const i = key.indexOf(" ");
+    const method = key.slice(0, i);
+    const path = key.slice(i + 1);
+    const def = typeof val === "function" ? { handler: val } : val;
+    out.push({ method, segments: path.split("/").filter(Boolean), def });
+  }
+  return out;
+}
+
+function match(route: ParsedRoute, method: string, segs: string[]): Record<string, string> | null {
+  if (route.method !== method || route.segments.length !== segs.length) return null;
+  const params: Record<string, string> = {};
+  for (let i = 0; i < segs.length; i++) {
+    const rs = route.segments[i] as string;
+    const seg = segs[i] as string;
+    if (rs.startsWith(":")) params[rs.slice(1)] = decodeURIComponent(seg);
+    else if (rs !== seg) return null;
+  }
+  return params;
+}
+
+const json = (status: number, body: unknown, extra?: Record<string, string>): Response =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extra } });
+
 export function buildApp(cfg: AppConfig): BuiltApp {
-  const app = express();
-  app.set("trust proxy", true);
-  app.disable("x-powered-by");
-  app.use(securityHeaders());
-
-  // Public healthcheck (load balancers). Everything else is behind Basic auth.
-  // Deliberately says nothing an anonymous caller could use: version and uptime
-  // only, no config, no counters.
-  app.get("/health", (_req, res) =>
-    res.json({ status: "ok", version: VERSION, uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000) })
-  );
-
-  // Auth gate FIRST: an anonymous caller must not be able to make us parse a
-  // multi-megabyte body before we reject it. Nothing about the check needs the body.
-  app.use(requireAuth());
-
-  app.use(express.text({ type: ["text/xml", "application/soap+xml"], limit: "1mb" }));
-  app.use(express.json({ limit: "5mb" }));
-
   // ---------------- SUT: petstore ----------------
-  const petstore = createPetstoreApp();
-  app.use(petstore.app);
+  const petstore = createPetstoreRoutes();
 
   // ---------------- metrics store (in-process) ----------------
   const store = createMetricsStore(cfg.dbPath);
@@ -172,21 +160,14 @@ export function buildApp(cfg: AppConfig): BuiltApp {
 
   // ---------------- load driver (in-process) ----------------
   const driver = new Driver();
-  // driver flushes straight into the store; the sampler taps the same batches
-  // to derive app traffic bytes/s without touching driver or store internals
   sampler.start();
   driver.setIngest((batch) => {
     sampler.noteBatch(batch);
     return store.ingestBatch(batch);
   });
-  driver.setBaselineUrl(cfg.selfUrl);  // probe the SUT directly (bypasses GW)
-  // a bounded run closes itself out exactly as a manual stop would, so the
-  // report has a stoppedAt to bound its window with
+  driver.setBaselineUrl(cfg.selfUrl);
   driver.onAutoStop((runId) => { if (runId) store.recordRunStop(runId); });
 
-  // Host health is persisted per minute so a window older than the sampler's
-  // in-memory ring can still be judged trustworthy. Cheap: one upsert per
-  // sample, 30 rows a minute at the default cadence.
   const healthTimer = setInterval(() => {
     try { store.recordHealth(sampler.latest()); } catch (e) {
       console.error("[metrics] health sample failed:", (e as Error).message);
@@ -195,13 +176,11 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   healthTimer.unref?.();
 
   // ---------------- gateway policy probes ----------------
-  // Deliberately abusive single probes (a quota burst, an oversized upload, a
-  // hanging upstream) on their own slow cadence — see loadgen/policy.ts.
   let policyTimer: ReturnType<typeof setInterval> | null = null;
   let policyRunning = false;
 
   const runPolicies = async (): Promise<void> => {
-    if (policyRunning) return; // a previous pass is still outstanding
+    if (policyRunning) return;
     const pcfg = store.readPolicyConfig();
     if (!pcfg.enabled) return;
     policyRunning = true;
@@ -224,7 +203,6 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   };
   schedulePolicies();
 
-  // seed from persisted config so a restart keeps your settings
   const savedGw = store.readGateway();
   const savedProfile = store.readProfile();
   if (savedGw) driver.setGw(sanitizeGwTargets(savedGw, cfg.defaultGateway));
@@ -235,249 +213,244 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   void driver.init().catch((e) => console.error("driver init failed", e));
 
   // ---------------- API contract definitions ----------------
-  // Downloadable so they can be imported straight into the gateway under test.
-  // This value is reflected verbatim into the WSDL and the OpenAPI document, so
-  // every path into it — the `?server=` override and the persisted gateway config
-  // alike — goes through normalizeServerUrl first. An unusable override falls back
-  // to the configured gateway rather than being echoed back.
-  const specServerUrl = (req: Request, protocol: "rest" | "soap"): string => {
+  const specServerUrl = (query: URLSearchParams, protocol: "rest" | "soap"): string => {
     const fallback = normalizeServerUrl(cfg.defaultGateway[protocol].baseUrl) ?? `http://127.0.0.1:${cfg.port}`;
-    const override = req.query["server"];
+    const override = query.get("server");
     if (typeof override === "string" && override.trim() !== "") {
       return normalizeServerUrl(override) ?? fallback;
     }
-    // each protocol advertises its own target: the OpenAPI document points where
-    // REST traffic goes, the WSDL where SOAP traffic goes
     const gw = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway)[protocol];
     const prefix = gw.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
     return normalizeServerUrl(`${gw.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}`) ?? fallback;
   };
 
-  app.get("/api/definitions", (req, res) => {
-    res.json({
-      openapiJson: "/api/definitions/openapi.json",
-      openapiYaml: "/api/definitions/openapi.yaml",
-      wsdl: "/api/definitions/petservice.wsdl",
-      serverUrl: specServerUrl(req, "rest"),
-      serverUrlSoap: specServerUrl(req, "soap"),
-      note: "Import these into the gateway under test to enable request/response validation. Override the advertised server with ?server=https://your-gw/base"
-    });
-  });
+  // ---------------- route table ----------------
+  const appRoutes: Record<string, Handler | { handler: Handler; body?: "json" | "text" | "arrayBuffer" }> = {
+    "GET /health": () => json(200, { status: "ok", version: VERSION, uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000) }),
 
-  app.get("/api/definitions/openapi.json", (req, res) => {
-    res.setHeader("Content-Disposition", 'attachment; filename="apigw-tester-openapi.json"');
-    res.type("application/json").send(JSON.stringify(buildOpenApiDocument({ serverUrl: specServerUrl(req, "rest") }), null, 2));
-  });
+    "GET /api/definitions": (ctx) =>
+      json(200, {
+        openapiJson: "/api/definitions/openapi.json",
+        openapiYaml: "/api/definitions/openapi.yaml",
+        wsdl: "/api/definitions/petservice.wsdl",
+        serverUrl: specServerUrl(ctx.query, "rest"),
+        serverUrlSoap: specServerUrl(ctx.query, "soap"),
+        note: "Import these into the gateway under test to enable request/response validation. Override the advertised server with ?server=https://your-gw/base"
+      }),
 
-  app.get("/api/definitions/openapi.yaml", (req, res) => {
-    res.setHeader("Content-Disposition", 'attachment; filename="apigw-tester-openapi.yaml"');
-    res.type("application/yaml").send(toYaml(buildOpenApiDocument({ serverUrl: specServerUrl(req, "rest") })));
-  });
+    "GET /api/definitions/openapi.json": (ctx) =>
+      new Response(JSON.stringify(buildOpenApiDocument({ serverUrl: specServerUrl(ctx.query, "rest") }), null, 2), {
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Disposition": 'attachment; filename="apigw-tester-openapi.json"'
+        }
+      }),
 
-  app.get("/api/definitions/petservice.wsdl", (req, res) => {
-    const location = `${specServerUrl(req, "soap")}/soap/petservice`;
-    res.setHeader("Content-Disposition", 'attachment; filename="petservice.wsdl"');
-    // function replacement so a `$&` in the URL stays literal instead of expanding
-    res.type("text/xml").send(WSDL.replace("__SERVICE_LOCATION__", () => xmlAttr(location)));
-  });
+    "GET /api/definitions/openapi.yaml": (ctx) =>
+      new Response(toYaml(buildOpenApiDocument({ serverUrl: specServerUrl(ctx.query, "rest") })), {
+        headers: {
+          "Content-Type": "application/yaml",
+          "Content-Disposition": 'attachment; filename="apigw-tester-openapi.yaml"'
+        }
+      }),
 
-  // ---------------- API ----------------
-  app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+    "GET /api/definitions/petservice.wsdl": (ctx) => {
+      const location = `${specServerUrl(ctx.query, "soap")}/soap/petservice`;
+      return new Response(WSDL.replace("__SERVICE_LOCATION__", () => xmlAttr(location)), {
+        headers: { "Content-Type": "text/xml", "Content-Disposition": 'attachment; filename="petservice.wsdl"' }
+      });
+    },
 
-  app.post("/api/ingest", (req: Request, res: Response) => {
-    try {
-      const out = store.ingestBatch(req.body);
-      res.json(out);
-    } catch (e) {
-      res.status(400).json({ error: (e as Error).message });
-    }
-  });
+    "GET /api/health": () => json(200, { status: "ok" }),
 
-  app.get("/api/summary", (req, res) => {
-    const win = (req.query["window"] as string) ?? "5m";
-    const windowMs = typeof win === "string" ? SUMMARY_WINDOWS[win] : undefined;
-    if (typeof windowMs !== "number") {
-      return res.status(400).json({ error: `window must be one of ${Object.keys(SUMMARY_WINDOWS).join("|")}` });
-    }
-    res.json(store.summary(windowMs));
-  });
+    "POST /api/ingest": { handler: (ctx) => {
+      try {
+        return json(200, store.ingestBatch(ctx.jsonBody as Parameters<MetricsStore["ingestBatch"]>[0]));
+      } catch (e) {
+        return json(400, { error: (e as Error).message });
+      }
+    }, body: "json" },
 
-  app.get("/api/timeseries", (req, res) => {
-    const bucketRaw = Number(req.query["bucket"] ?? 60);
-    if (bucketRaw !== 60 && bucketRaw !== 3600) {
-      return res.status(400).json({ error: "bucket must be 60 or 3600" });
-    }
-    const now = Date.now();
-    const to = req.query["to"] === undefined ? now : Number(req.query["to"]);
-    const from = req.query["from"] === undefined ? to - 3_600_000 : Number(req.query["from"]);
-    if (!Number.isFinite(to) || !Number.isFinite(from)) {
-      return res.status(400).json({ error: "from and to must be epoch milliseconds" });
-    }
-    if (from > to) return res.status(400).json({ error: "from must not be after to" });
-    // the store clamps the span to LIMITS.timeseriesPoints and reports truncation
-    res.json(store.timeseries(bucketRaw, from, to));
-  });
+    "GET /api/summary": (ctx) => {
+      const wins = ctx.query.getAll("window");
+      const win = wins.length <= 1 ? (wins[0] ?? "5m") : "";
+      const windowMs = SUMMARY_WINDOWS[win];
+      if (typeof windowMs !== "number") {
+        return json(400, { error: `window must be one of ${Object.keys(SUMMARY_WINDOWS).join("|")}` });
+      }
+      return json(200, store.summary(windowMs));
+    },
 
-  app.get("/api/recent", (req, res) => {
-    const raw = req.query["limit"];
-    const n = raw === undefined ? 100 : Number(raw);
-    if (!Number.isInteger(n) || n < 1 || n > LIMITS.recentLimit) {
-      return res.status(400).json({ error: `limit must be an integer between 1 and ${LIMITS.recentLimit}` });
-    }
-    res.json({ items: store.recent(n), histogramEdges: HISTOGRAM_EDGES });
-  });
+    "GET /api/timeseries": (ctx) => {
+      const bucketRaw = Number(ctx.query.get("bucket") ?? 60);
+      if (bucketRaw !== 60 && bucketRaw !== 3600) {
+        return json(400, { error: "bucket must be 60 or 3600" });
+      }
+      const now = Date.now();
+      const to = ctx.query.get("to") === null ? now : Number(ctx.query.get("to"));
+      const from = ctx.query.get("from") === null ? to - 3_600_000 : Number(ctx.query.get("from"));
+      if (!Number.isFinite(to) || !Number.isFinite(from)) {
+        return json(400, { error: "from and to must be epoch milliseconds" });
+      }
+      if (from > to) return json(400, { error: "from must not be after to" });
+      return json(200, store.timeseries(bucketRaw, from, to));
+    },
 
-  app.get("/api/config/gateway", (_req, res) => res.json(sanitizeGwTargets(store.readGateway() ?? DEFAULT_GW_TARGETS)));
-  app.put("/api/config/gateway", (req: Request, res: Response) => {
-    const problem = validateGwTargets(req.body);
-    if (problem) return res.status(400).json({ error: problem });
-    const clean = sanitizeGwTargets(req.body, sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway));
-    store.writeGateway(clean);
-    driver.setGw(clean);
-    res.json({ saved: true, gateway: clean });
-  });
+    "GET /api/recent": (ctx) => {
+      const raw = ctx.query.get("limit");
+      const n = raw === null ? 100 : Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > LIMITS.recentLimit) {
+        return json(400, { error: `limit must be an integer between 1 and ${LIMITS.recentLimit}` });
+      }
+      return json(200, { items: store.recent(n), histogramEdges: HISTOGRAM_EDGES });
+    },
 
-  /**
-   * Reachability probe for a candidate gateway config.
-   *
-   * Runs server-side on purpose. The dashboard ships a `connect-src 'self'` CSP,
-   * so a browser-side fetch at the gateway (a different origin by definition)
-   * is blocked before it leaves the page — and this is also the only probe that
-   * exercises the same path the load driver will actually use.
-   *
-   * Body: one GwConfig plus an optional `protocol` ("rest" | "soap") selecting
-   * which side of the persisted config it falls back to; defaults to "rest".
-   */
-  app.post("/api/config/gateway/test", async (req: Request, res: Response) => {
-    const body = (req.body ?? {}) as Record<string, unknown>;
-    const protocol = body.protocol === "soap" ? "soap" : "rest";
-    const problem = validateGwConfig(body);
-    if (problem) return res.status(400).json({ ok: false, error: problem });
-    const persisted = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
-    const probe = sanitizeGwConfig(body, persisted[protocol]);
-    const prefix = probe.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
-    const url = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}/health`;
+    "GET /api/config/gateway": () => json(200, sanitizeGwTargets(store.readGateway() ?? DEFAULT_GW_TARGETS)),
+    "PUT /api/config/gateway": { handler: (ctx) => {
+      const problem = validateGwTargets(ctx.jsonBody);
+      if (problem) return json(400, { error: problem });
+      const clean = sanitizeGwTargets(ctx.jsonBody, sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway));
+      store.writeGateway(clean);
+      driver.setGw(clean);
+      return json(200, { saved: true, gateway: clean });
+    }, body: "json" },
 
-    const headers: Record<string, string> = {};
-    // Same credential rule as the load driver: an external gateway is a third
-    // party and must not be handed this rig's Basic credential just because an
-    // operator typed a URL into the probe box.
-    if (forwardsBasicAuth(probe, cfg.selfUrl)) {
-      const creds = readBasicAuthCreds();
-      if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
-    }
-    if (probe.apiKey) headers[probe.apiKeyHeader || "X-API-Key"] = probe.apiKey;
+    "POST /api/config/gateway/test": { handler: async (ctx) => {
+      const body = (ctx.jsonBody ?? {}) as Record<string, unknown>;
+      const protocol = body.protocol === "soap" ? "soap" : "rest";
+      const problem = validateGwConfig(body);
+      if (problem) return json(400, { ok: false, error: problem });
+      const persisted = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+      const probe = sanitizeGwConfig(body, persisted[protocol]);
+      const prefix = probe.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
+      const url = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}/health`;
 
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), GATEWAY_PROBE_TIMEOUT_MS);
-    const started = Date.now();
-    // reported back so a 401 can be read correctly: without it the operator
-    // cannot tell "the gateway rejected my API key" from "we sent no credential"
-    const sentBasicAuth = headers["authorization"] !== undefined;
-    try {
-      const upstream = await fetch(url, { method: "GET", headers, signal: ac.signal });
-      await upstream.arrayBuffer(); // drain, so the socket is released
-      res.json({ ok: upstream.ok, status: upstream.status, url, sentBasicAuth, latencyMs: Date.now() - started });
-    } catch (e) {
-      const reason = ac.signal.aborted
-        ? `no response within ${GATEWAY_PROBE_TIMEOUT_MS / 1000}s`
-        : ((e as Error).cause as Error | undefined)?.message ?? (e as Error).message;
-      res.json({ ok: false, url, sentBasicAuth, error: reason, latencyMs: Date.now() - started });
-    } finally {
-      clearTimeout(timer);
-    }
-  });
+      const headers: Record<string, string> = {};
+      if (forwardsBasicAuth(probe, cfg.selfUrl)) {
+        const creds = readBasicAuthCreds();
+        if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
+      }
+      if (probe.apiKey) headers[probe.apiKeyHeader || "X-API-Key"] = probe.apiKey;
 
-  app.get("/api/config/profile", (_req, res) => res.json(store.readProfile() ?? DEFAULT_LOAD_PROFILE));
-  app.put("/api/config/profile", (req: Request, res: Response) => {
-    if (typeof req.body !== "object" || req.body === null || Array.isArray(req.body)) {
-      return res.status(400).json({ error: "body must be a JSON object" });
-    }
-    // every field is clamped to a runnable range — a persisted profile can never
-    // brick the process on the next restart
-    const clean = sanitizeLoadProfile(req.body, store.readProfile() ?? cfg.defaultProfile);
-    store.writeProfile(clean);
-    driver.setProfile(clean);
-    res.json({ saved: true, profile: clean });
-  });
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), GATEWAY_PROBE_TIMEOUT_MS);
+      const started = Date.now();
+      const sentBasicAuth = headers["authorization"] !== undefined;
+      try {
+        const upstream = await fetch(url, { method: "GET", headers, signal: ac.signal });
+        await upstream.arrayBuffer();
+        return json(200, { ok: upstream.ok, status: upstream.status, url, sentBasicAuth, latencyMs: Date.now() - started });
+      } catch (e) {
+        const reason = ac.signal.aborted
+          ? `no response within ${GATEWAY_PROBE_TIMEOUT_MS / 1000}s`
+          : ((e as Error).cause as Error | undefined)?.message ?? (e as Error).message;
+        return json(200, { ok: false, url, sentBasicAuth, error: reason, latencyMs: Date.now() - started });
+      } finally {
+        clearTimeout(timer);
+      }
+    }, body: "json" },
 
-  app.post("/api/run/start", (_req, res) => {
-    const current = driver.status();
-    if (current.state === "running") {
-      return res.json({ ok: true, runId: current.runId, alreadyRunning: true });
-    }
-    const profile = sanitizeLoadProfile(store.readProfile() ?? cfg.defaultProfile, cfg.defaultProfile);
-    const gateway = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
-    const runId = `run-${Date.now()}`;
-    store.recordRunStart(runId, profile);
-    driver.setGw(gateway);
-    driver.setProfile(profile);
-    const out = driver.start(runId);
-    // one pass immediately, so even a short acceptance run has policy results
-    // in its report rather than waiting out a five-minute interval
-    void runPolicies();
-    res.json(out);
-  });
+    "GET /api/config/profile": () => json(200, store.readProfile() ?? DEFAULT_LOAD_PROFILE),
+    "PUT /api/config/profile": { handler: (ctx) => {
+      if (typeof ctx.jsonBody !== "object" || ctx.jsonBody === null || Array.isArray(ctx.jsonBody)) {
+        return json(400, { error: "body must be a JSON object" });
+      }
+      const clean = sanitizeLoadProfile(ctx.jsonBody, store.readProfile() ?? cfg.defaultProfile);
+      store.writeProfile(clean);
+      driver.setProfile(clean);
+      return json(200, { saved: true, profile: clean });
+    }, body: "json" },
 
-  app.post("/api/run/stop", (_req, res) => {
-    const out = driver.stop();
-    if (out.runId) store.recordRunStop(out.runId);
-    res.json(out);
-  });
+    "POST /api/run/start": () => {
+      const current = driver.status();
+      if (current.state === "running") {
+        return json(200, { ok: true, runId: current.runId, alreadyRunning: true });
+      }
+      const profile = sanitizeLoadProfile(store.readProfile() ?? cfg.defaultProfile, cfg.defaultProfile);
+      const gateway = sanitizeGwTargets(store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+      const runId = `run-${Date.now()}`;
+      store.recordRunStart(runId, profile);
+      driver.setGw(gateway);
+      driver.setProfile(profile);
+      const out = driver.start(runId);
+      void runPolicies();
+      return json(200, out);
+    },
 
-  app.get("/api/run/status", (_req, res) => {
-    const s = driver.status();
-    res.json({ ...s, gateway: driver.currentGw });
-  });
+    "POST /api/run/stop": () => {
+      const out = driver.stop();
+      if (out.runId) store.recordRunStop(out.runId);
+      return json(200, out);
+    },
 
-  // host-level "are WE the bottleneck?" view; 120 samples ≈ last 4 minutes
-  app.get("/api/system", (_req, res) => {
-    res.json({ current: sampler.latest(), history: sampler.history(120) });
-  });
+    "GET /api/run/status": () => json(200, { ...driver.status(), gateway: driver.currentGw }),
 
-  app.get("/api/runs", (_req, res) => res.json(store.listRuns()));
+    "GET /api/system": () => json(200, { current: sampler.latest(), history: sampler.history(120) }),
 
-  // ---------------- gateway policy checks ----------------
-  app.get("/api/policy", (_req, res) => {
-    res.json({ config: store.readPolicyConfig(), results: store.readPolicyResults() });
-  });
+    "GET /api/runs": () => json(200, store.listRuns()),
 
-  app.put("/api/policy", (req: Request, res: Response) => {
-    const clean = sanitizePolicyConfig(req.body, store.readPolicyConfig());
-    store.writePolicyConfig(clean);
-    schedulePolicies();
-    res.json({ saved: true, config: clean });
-  });
+    "GET /api/runs/:runId/report": (ctx) => {
+      const report = reportFor(String(ctx.params["runId"]));
+      if (!report) return json(404, { error: "no such run" });
+      return json(200, report);
+    },
 
-  /** Run the probes now rather than waiting for the next interval. */
-  app.post("/api/policy/run", (_req, res) => {
-    // without this the caller gets a 202 and then waits forever for results
-    // that were never going to be produced
-    if (!store.readPolicyConfig().enabled) {
-      return res.status(409).json({ error: "policy probing is disabled — enable it first" });
-    }
-    if (policyRunning) return res.status(409).json({ error: "a policy pass is already running" });
-    void runPolicies().then(() => undefined);
-    res.status(202).json({ started: true });
-  });
+    "GET /api/runs/:runId/report.md": (ctx) => {
+      const runId = String(ctx.params["runId"]);
+      const report = reportFor(runId);
+      if (!report) return json(404, { error: "no such run" });
+      const safe = runId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
+      return new Response(renderRunReportMarkdown(report), {
+        headers: { "Content-Type": "text/markdown", "Content-Disposition": `attachment; filename="${safe}-report.md"` }
+      });
+    },
 
-  app.get("/api/config/slo", (_req, res) => res.json(store.readSlo()));
-  app.put("/api/config/slo", (req: Request, res: Response) => {
-    if (typeof req.body !== "object" || req.body === null || Array.isArray(req.body)) {
-      return res.status(400).json({ error: "body must be a JSON object" });
-    }
-    const clean = sanitizeSlo(req.body, store.readSlo());
-    store.writeSlo(clean);
-    res.json({ saved: true, slo: clean });
-  });
+    "GET /api/policy": () => json(200, { config: store.readPolicyConfig(), results: store.readPolicyResults() }),
+    "PUT /api/policy": { handler: (ctx) => {
+      const clean = sanitizePolicyConfig(ctx.jsonBody, store.readPolicyConfig());
+      store.writePolicyConfig(clean);
+      schedulePolicies();
+      return json(200, { saved: true, config: clean });
+    }, body: "json" },
 
-  // ---------------- per-run report ----------------
-  /**
-   * Build a report for one run. The window is the run's own span, resolved to
-   * the minute buckets it touches — two runs inside the same minute will bleed
-   * into each other's numbers, which is why a meaningful acceptance run should
-   * be minutes long, not seconds.
-   */
+    "POST /api/policy/run": () => {
+      if (!store.readPolicyConfig().enabled) {
+        return json(409, { error: "policy probing is disabled — enable it first" });
+      }
+      if (policyRunning) return json(409, { error: "a policy pass is already running" });
+      void runPolicies().then(() => undefined);
+      return json(202, { started: true });
+    },
+
+    "GET /api/config/slo": () => json(200, store.readSlo()),
+    "PUT /api/config/slo": { handler: (ctx) => {
+      if (typeof ctx.jsonBody !== "object" || ctx.jsonBody === null || Array.isArray(ctx.jsonBody)) {
+        return json(400, { error: "body must be a JSON object" });
+      }
+      const clean = sanitizeSlo(ctx.jsonBody, store.readSlo());
+      store.writeSlo(clean);
+      return json(200, { saved: true, slo: clean });
+    }, body: "json" },
+
+    "POST /api/metrics/reset": () => {
+      if (driver.status().state === "running") {
+        return json(409, { error: "stop the run before resetting metrics" });
+      }
+      store.resetAll();
+      return json(200, { ok: true });
+    },
+
+    "POST /api/runs/prune": { handler: (ctx) => {
+      const days = Number((ctx.jsonBody as Record<string, unknown> | undefined)?.olderThanDays);
+      if (!Number.isFinite(days) || days < 1 || days > 3650) {
+        return json(400, { error: "olderThanDays must be a number between 1 and 3650" });
+      }
+      return json(200, { deleted: store.pruneRuns(days * DAY_MS) });
+    }, body: "json" }
+  };
+
+  const DAY_MS = 86_400_000;
+
   const reportFor = (runId: string): RunReport | null => {
     const run = store.findRun(runId);
     if (!run) return null;
@@ -494,84 +467,116 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     });
   };
 
-  app.get("/api/runs/:runId/report", (req: Request, res: Response) => {
-    const report = reportFor(String(req.params["runId"]));
-    if (!report) return res.status(404).json({ error: "no such run" });
-    res.json(report);
-  });
-
-  app.get("/api/runs/:runId/report.md", (req: Request, res: Response) => {
-    const runId = String(req.params["runId"]);
-    const report = reportFor(runId);
-    if (!report) return res.status(404).json({ error: "no such run" });
-    // a filename built from operator-supplied text goes through the same
-    // sanitising as everything else that crosses a header boundary
-    const safe = runId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
-    res.setHeader("Content-Disposition", `attachment; filename="${safe}-report.md"`);
-    res.type("text/markdown").send(renderRunReportMarkdown(report));
-  });
-
-  /**
-   * Wipe all metric data. Refused while a run is live: the driver holds up to a
-   * flush interval of results in memory and would re-insert them, stamped with
-   * the old run id, after the reset.
-   */
-  app.post("/api/metrics/reset", (_req, res) => {
-    if (driver.status().state === "running") {
-      return res.status(409).json({ error: "stop the run before resetting metrics" });
-    }
-    store.resetAll();
-    res.json({ ok: true });
-  });
-
-  const DAY_MS = 86_400_000;
-  app.post("/api/runs/prune", (req: Request, res: Response) => {
-    const days = Number((req.body as Record<string, unknown> | undefined)?.olderThanDays);
-    if (!Number.isFinite(days) || days < 1 || days > 3650) {
-      return res.status(400).json({ error: "olderThanDays must be a number between 1 and 3650" });
-    }
-    res.json({ deleted: store.pruneRuns(days * DAY_MS) });
-  });
-
   // ---------------- static dashboard ----------------
   const publicDir = resolve(cfg.publicDir);
+  const uiFiles = new Map<string, Uint8Array>();
+  let indexHtml: Uint8Array | null = null;
   if (existsSync(publicDir)) {
-    app.use(express.static(publicDir, { maxAge: "1h" }));
-    // SPA fallback: anything that isn't an asset or a known API path
-    app.use((req, res, next) => {
-      if (/^\/(api|soap|admin|health)\b/.test(req.path)) return next();
-      if (req.method !== "GET") return next();
-      res.sendFile(join(publicDir, "index.html"));
-    });
-  } else {
-    app.get("/", (_req, res) => {
-      res.status(503).send("dashboard not built — run the UI build first (packages/ui → dist).");
-    });
+    try {
+      for (const entry of new Bun.Glob("**/*").scanSync({ cwd: publicDir, onlyFiles: true })) {
+        const data = new Uint8Array(readFileSync(join(publicDir, entry)));
+        uiFiles.set("/" + entry.replace(/\\/g, "/"), data);
+      }
+      indexHtml = uiFiles.get("/index.html") ?? null;
+    } catch { /* fall through to the 503 root */ }
   }
 
-  // Last-resort error handler: a throw in any handler returns JSON, never an
-  // HTML stack trace, and never takes the process down.
-  app.use((err: Error, _req: Request, res: Response, _next: express.NextFunction) => {
-    if (res.headersSent) return;
-    // body-parser rejections are the caller's fault, not ours, and answering
-    // 500 to an oversized upload actively misleads: a gateway under test looks
-    // like it broke the backend when it merely relayed a body we refused.
-    const parseErr = err as Error & { type?: string; status?: number };
-    if (parseErr.type === "entity.too.large") {
-      return res.status(413).json({ error: "request body too large" });
-    }
-    if (parseErr.type === "entity.parse.failed" || parseErr.type === "encoding.unsupported") {
-      return res.status(400).json({ error: "request body could not be parsed" });
-    }
-    console.error("[apigw-tester] request failed:", err);
-    res.status(500).json({ error: "internal error" });
-  });
+  // ---------------- dispatcher ----------------
+  const petCompiled = compileRoutes(petstore.routes);
+  const appCompiled = compileRoutes(appRoutes);
+  const all = [...appCompiled, ...petCompiled];
 
-  return { app, store, driver, sampler };
+  /** Routes the SUT stamps X-Server-Ms on — the petstore paths plus the three
+   *  synthetic stress endpoints. Mirrors the old serverMsStamp middleware's
+   *  coverage exactly (petstore router + /api/slow /api/big /api/echo). */
+  const stampsServerMs = (pathname: string): boolean =>
+    pathname.startsWith("/api/pets") || pathname.startsWith("/api/store") ||
+    pathname.startsWith("/soap/") || pathname.startsWith("/admin/") ||
+    pathname === "/api/slow" || pathname.startsWith("/api/slow/") ||
+    pathname === "/api/big" || pathname.startsWith("/api/big/") ||
+    pathname === "/api/echo";
+
+  const fetchHandler = async (req: Request): Promise<Response> => {
+    const enteredAt = Date.now();
+    const url = new URL(req.url);
+    const pathname = url.pathname;
+    const segs = pathname.split("/").filter(Boolean);
+
+    const finish = (res: Response): Response => {
+      const headers = new Headers(res.headers);
+      if (stampsServerMs(pathname)) headers.set(SERVER_MS_HEADER, String(Math.max(0, Date.now() - enteredAt)));
+      applySecurityHeaders(req, headers);
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+    };
+
+    try {
+      // public healthcheck — no auth
+      if (req.method === "GET" && pathname === "/health") {
+        return finish(json(200, { status: "ok", version: VERSION, uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000) }));
+      }
+
+      // auth gate before any body parsing
+      const denied = requireAuth(req);
+      if (denied) return finish(denied);
+
+      for (const route of all) {
+        const params = match(route, req.method, segs);
+        if (!params) continue;
+        const ctx: RouteCtx = { req, enteredAt, params, query: url.searchParams };
+        if (route.def.body === "json") ctx.jsonBody = await req.json().catch(() => undefined);
+        else if (route.def.body === "text") ctx.textBody = await req.text();
+        else if (route.def.body === "arrayBuffer") ctx.echoBytes = (await req.arrayBuffer()).byteLength;
+        return finish(await route.def.handler(ctx));
+      }
+
+      // static UI + SPA fallback
+      if (req.method === "GET") {
+        const file = uiFiles.get(pathname);
+        if (file) {
+          return finish(new Response(file, { headers: { "Cache-Control": "max-age=3600", "Content-Type": mimeFor(pathname) } }));
+        }
+        if (indexHtml && !/^\/(api|soap|admin|health)\b/.test(pathname) && (req.headers.get("accept") ?? "").includes("text/html")) {
+          return finish(new Response(indexHtml, { headers: { "Content-Type": "text/html" } }));
+        }
+      }
+
+      if (pathname === "/") {
+        return finish(new Response("dashboard not built — run the UI build first (packages/ui → dist).", { status: 503 }));
+      }
+      return finish(json(404, { error: "not found" }));
+    } catch (err) {
+      console.error("[apigw-tester] request failed:", err);
+      // a body Bun refused to parse is the caller's fault, not ours
+      if (err instanceof SyntaxError) {
+        return finish(json(400, { error: "request body could not be parsed" }));
+      }
+      return finish(json(500, { error: "internal error" }));
+    }
+  };
+
+  return {
+    fetch: fetchHandler,
+    listen: (port: number) => Bun.serve({ port, fetch: fetchHandler, idleTimeout: 35 }),
+    store,
+    driver,
+    sampler
+  };
+}
+
+function mimeFor(path: string): string {
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".js")) return "text/javascript";
+  if (path.endsWith(".css")) return "text/css";
+  if (path.endsWith(".svg")) return "image/svg+xml";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".ico")) return "image/x-icon";
+  if (path.endsWith(".json")) return "application/json";
+  if (path.endsWith(".map")) return "application/json";
+  return "application/octet-stream";
 }
 
 export interface RunningServer {
-  server: ReturnType<Express["listen"]>;
+  server: ReturnType<typeof Bun.serve>;
   store: MetricsStore;
   driver: DriverType;
   sampler: SystemSampler;
@@ -583,10 +588,20 @@ export function startServer(): RunningServer {
     process.exit(1);
   }
   const cfg = readConfig();
-  const { app, store, driver, sampler } = buildApp(cfg);
-  const server = app.listen(cfg.port, () => {
-    console.log(`[apigw-tester] http://localhost:${cfg.port}  (dashboard, petstore, load driver + metrics) — auth enabled`);
-    console.log(`[apigw-tester] API definitions: /api/definitions/openapi.json · /api/definitions/petservice.wsdl`);
+  const { fetch, store, driver, sampler } = buildApp(cfg);
+  // idleTimeout must clear LIMITS.delayMs (30s) or the chaos-timeout probe and
+  // /api/slow sever early; maxRequestBodySize's 128MiB default already covers
+  // the 12MB echo limit
+  const server = Bun.serve({
+    port: cfg.port,
+    fetch,
+    idleTimeout: 35,
+    error(err) {
+      console.error("[apigw-tester] request failed:", err);
+      return json(500, { error: "internal error" });
+    }
   });
+  console.log(`[apigw-tester] http://localhost:${cfg.port}  (dashboard, petstore, load driver + metrics) — auth enabled`);
+  console.log(`[apigw-tester] API definitions: /api/definitions/openapi.json · /api/definitions/petservice.wsdl`);
   return { server, store, driver, sampler };
 }

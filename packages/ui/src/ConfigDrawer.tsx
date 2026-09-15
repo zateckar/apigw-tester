@@ -245,13 +245,18 @@ export default function ConfigDrawer({ gw, profile, onClose }: Props) {
   const saveSlo = useMutation({ mutationFn: (s: SloThresholds) => api.saveSlo(s) });
   const savePolicy = useMutation({ mutationFn: (c: PolicyConfig) => api.savePolicy(c) });
 
-  // Escape closes; focus starts inside the dialog rather than behind it
+  // Escape closes; focus starts inside the dialog rather than behind it.
+  // Runs only on mount: re-running on every onClose identity change would
+  // re-focus the drawer container and steal focus from the field being edited
+  // (App re-renders every couple of seconds due to polling queries).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onCloseRef.current(); };
     window.addEventListener("keydown", onKey);
     drawerRef.current?.focus();
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   async function handleSave() {
     setSaving(true);

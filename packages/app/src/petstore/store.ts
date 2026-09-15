@@ -310,6 +310,12 @@ export class PetStore {
     return this.pets.size;
   }
 
+  /** Number of boot-seeded pets. They occupy ids 1..seedCount and are never
+   *  evicted, which is what the response-serialization caches key on. */
+  get seedPetCount(): number {
+    return this.seedCount;
+  }
+
   orderCount(): number {
     return this.orders.size;
   }

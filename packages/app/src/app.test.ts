@@ -1,5 +1,4 @@
-import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { type AddressInfo } from "node:net";
+import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { buildApp } from "./app.js";
 import { readConfig } from "./config.js";
 import { POLICY_LIMITS, type RequestResult, type SystemMetrics } from "@apigw/shared";
@@ -9,7 +8,7 @@ process.env["APP_BASIC_AUTH"] = "test:pw-123";
 const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 let base: string;
-let server: ReturnType<ReturnType<typeof buildApp>["app"]["listen"]>;
+let server: ReturnType<ReturnType<typeof buildApp>["listen"]>;
 
 async function authed(path: string, init?: RequestInit): Promise<Response> {
   return fetch(`${base}${path}`, {
@@ -42,15 +41,13 @@ function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", c
 }
 
 beforeAll(async () => {
-  const { app } = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
-  server = app.listen(0);
-  await new Promise<void>((r) => server.once("listening", r));
-  const addr = server.address() as AddressInfo;
-  base = `http://127.0.0.1:${addr.port}`;
+  const built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
+  server = built.listen(0);
+  base = `http://127.0.0.1:${server.port}`;
 });
 
-afterAll(async () => {
-  await new Promise<void>((r) => server.close(() => r()));
+afterAll(() => {
+  server.stop(true);
 });
 
 describe("apigw-tester app (auth protected)", () => {

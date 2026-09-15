@@ -27,10 +27,15 @@ export function addToStatusHistogram(h: StatusHistogram, status: number, count =
 
 export function bucketIndex(latencyMs: number): number {
   const edges = HISTOGRAM_EDGES_MS;
-  for (let i = 0; i < edges.length; i++) {
-    if (latencyMs <= (edges[i] as number)) return i;
+  // binary search: ~35 edges × 2 calls/request made the linear scan show up
+  let lo = 0;
+  let hi = edges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (latencyMs <= (edges[mid] as number)) hi = mid - 1;
+    else lo = mid + 1;
   }
-  return edges.length; // overflow bucket
+  return lo; // first edge >= latencyMs, or edges.length (overflow bucket)
 }
 
 export function addToHistogram(h: Histogram, latencyMs: number, count = 1): void {

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, spyOn } from "bun:test";
 import { LIMITS, type ScenarioClass } from "@apigw/shared";
 import { Driver } from "./driver.js";
 
@@ -127,7 +127,7 @@ describe("Driver config hardening", () => {
       rest: { baseUrl: "http://rest-gw:9000", apiKey: "rest-key", apiKeyHeader: "X-Rest-Key", pathPrefix: "/r" },
       soap: { baseUrl: "http://soap-gw:9001", apiKey: "soap-key", apiKeyHeader: "X-Soap-Key", pathPrefix: "" }
     });
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       hits.push({
         url: String(input),
         key: (init?.headers as Record<string, string> | undefined)?.["X-Rest-Key"]
@@ -205,7 +205,7 @@ describe("GW-overhead pairing (X-Server-Ms)", () => {
 
   it("probes record transport-only baselines when the SUT emits the header", async () => {
     const d = new Driver();
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () => {
       await sleep(105);
       return new Response("{}", { status: 200, headers: { "x-server-ms": "100" } });
     });
@@ -236,7 +236,7 @@ describe("Driver credential containment", () => {
     if (selfUrl) d.setBaselineUrl(selfUrl);
     d.setGw(gw);
     d.setProfile({ soapRatioPct: 0, invalidRatioPct: 0 });
-    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_i, init) => {
+    const spy = spyOn(globalThis, "fetch").mockImplementation(async (_i, init) => {
       seen.push((init?.headers ?? {}) as Record<string, string>);
       return new Response("{}", { status: 200 });
     });
@@ -306,7 +306,7 @@ describe("Driver credential containment", () => {
       return { ingested: batch.results.length };
     });
     d.setProfile({ soapRatioPct: 0, invalidRatioPct: 0 });
-    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", { status: 200 }));
+    const spy = spyOn(globalThis, "fetch").mockImplementation(async () => new Response("{}", { status: 200 }));
     try {
       d.start("run-ids");
       for (let i = 0; i < 25; i++) await priv(d).fire();
@@ -333,7 +333,7 @@ describe("Driver outcome accounting", () => {
       return { ingested: batch.results.length };
     });
     d.setProfile(profile as never);
-    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => res());
+    const spy = spyOn(globalThis, "fetch").mockImplementation(async () => res());
     try {
       d.start("run-outcome");
       for (let i = 0; i < n; i++) await priv(d).fire();
@@ -529,7 +529,7 @@ describe("Driver fire() response byte accounting", () => {
       for (const r of batch.results) sizes.push(r.bytesResp);
       return { ingested: batch.results.length };
     });
-    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => makeRes());
+    const spy = spyOn(globalThis, "fetch").mockImplementation(async () => makeRes());
     try {
       d.start("run-bytes");
       await priv(d).fire();

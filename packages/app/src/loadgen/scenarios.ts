@@ -79,7 +79,12 @@ function existingPetId(ctx: SpecContext, rand: () => number = Math.random): numb
 function deletablePetId(ctx: SpecContext, rand: () => number = Math.random): number {
   if (ctx.createdIds.length > 0) {
     const idx = Math.floor(rand() * ctx.createdIds.length);
-    return ctx.createdIds.splice(idx, 1)[0] as number;
+    // swap-with-last-pop: the array is only sampled randomly, so order is
+    // irrelevant and O(1) removal beats splice's O(n) at 100+ rps of deletes
+    const id = ctx.createdIds[idx] as number;
+    ctx.createdIds[idx] = ctx.createdIds[ctx.createdIds.length - 1] as number;
+    ctx.createdIds.pop();
+    return id;
   }
   return ctx.seedId + 1 + Math.floor(rand() * 10_000);
 }

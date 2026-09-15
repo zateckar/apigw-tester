@@ -1,5 +1,4 @@
-import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { type AddressInfo } from "node:net";
+import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { DEFAULT_LOAD_PROFILE, LIMITS, type LoadProfile, type ScenarioWeights } from "@apigw/shared";
 import { buildApp } from "../app.js";
 import { readConfig } from "../config.js";
@@ -14,7 +13,7 @@ process.env["APP_BASIC_AUTH"] = "test:pw-123";
 const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 let base: string;
-let server: ReturnType<ReturnType<typeof buildApp>["app"]["listen"]>;
+let server: ReturnType<ReturnType<typeof buildApp>["listen"]>;
 
 const ctx = (): SpecContext => ({ seedId: 120, createdIds: [] });
 
@@ -28,14 +27,13 @@ async function fire(spec: ReqSpec): Promise<{ status: number; body: string }> {
 }
 
 beforeAll(async () => {
-  const { app } = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
-  server = app.listen(0);
-  await new Promise<void>((r) => server.once("listening", r));
-  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
+  server = built.listen(0);
+  base = `http://127.0.0.1:${server.port}`;
 });
 
-afterAll(async () => {
-  await new Promise<void>((r) => server.close(() => r()));
+afterAll(() => {
+  server.stop(true);
 });
 
 const only = (key: keyof ScenarioWeights): LoadProfile => ({

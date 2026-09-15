@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { peakTargetRps, targetRpsAt, TokenBucket } from "./scheduler.js";
 import type { LoadProfile } from "@apigw/shared";
 import { DEFAULT_LOAD_PROFILE } from "@apigw/shared";

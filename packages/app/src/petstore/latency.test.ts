@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { sampleLatency, decideChaos, DEFAULT_CHAOS } from "./latency.js";
 
 describe("sampleLatency", () => {

@@ -17,14 +17,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version-file: .nvmrc
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
+          bun-version-file: .bun-version
+      - run: bun install --frozen-lockfile
+      - run: bunx eslint .
       - run: npm run typecheck
-      - run: npm test
+      - run: bun test packages/app/src
       # the image build compiles the UI; make sure that path works on PRs too
       - run: npm run build
 

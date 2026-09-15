@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { HISTOGRAM_EDGES_MS } from "@apigw/shared";
 import {
   bucketIndex,

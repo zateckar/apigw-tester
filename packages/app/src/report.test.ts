@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import {
   DEFAULT_GW_TARGETS, DEFAULT_LOAD_PROFILE, DEFAULT_POLICY_CONFIG, DEFAULT_SLO,
   type MetricSummary, type PolicyResult, type RunEvent, type SloThresholds,
