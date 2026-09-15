@@ -1,3 +1,5 @@
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ForwardBasicAuth, GwConfig, GwTargets, LoadProfile } from "@apigw/shared";
 import { DEFAULT_LOAD_PROFILE, FORWARD_BASIC_AUTH_MODES } from "@apigw/shared";
 
@@ -17,6 +19,9 @@ function env(name: string): string | undefined {
 }
 
 const DEFAULT_PORT = 8080;
+
+/** packages/app — src/config.ts is always one level under it (no build step). */
+const PKG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 export interface AppConfig {
   port: number;
@@ -61,7 +66,10 @@ export function readConfig(): AppConfig {
   return {
     port,
     dbPath: env("DB_PATH") ?? "data/metrics.db",
-    publicDir: env("PUBLIC_DIR") ?? "dist/public",
+    // default is anchored at the package dir, not the caller's cwd: the image
+    // bakes the UI at packages/app/public and runs from /app, dev runs from
+    // the repo root — both resolve to the same absolute path this way
+    publicDir: env("PUBLIC_DIR") ?? join(PKG_DIR, "public"),
     selfUrl,
     defaultGateway: {
       rest: side("REST"),

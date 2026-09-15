@@ -7,8 +7,8 @@
     "packages/*"
   ],
   "scripts": {
-    "clean": "npm run clean --workspaces --if-present",
-    "build": "npm run build -w @apigw/ui",
+    "clean": "bun run --cwd packages/ui clean 2>/dev/null || true",
+    "build": "bun run --cwd packages/ui build",
     "test": "bun test packages/app/src",
     "lint": "eslint .",
     "typecheck": "npm run typecheck --workspaces --if-present",

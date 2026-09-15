@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "bun:test";
 import { readConfig } from "./config.js";
 
@@ -28,7 +29,7 @@ describe("readConfig", () => {
     const cfg = readConfig();
     expect(cfg.port).toBe(8080);
     expect(cfg.dbPath).toBe("data/metrics.db");
-    expect(cfg.publicDir).toBe("dist/public");
+    expect(cfg.publicDir.endsWith(join("packages", "app", "public"))).toBe(true);
     expect(cfg.defaultGateway.rest.baseUrl).toBe(cfg.selfUrl);
     expect(cfg.defaultGateway.soap.baseUrl).not.toBe("");
     expect(cfg.defaultGateway.rest.apiKeyHeader).toBe("X-API-Key");

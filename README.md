@@ -10,7 +10,7 @@ It ships the **OpenAPI and WSDL definitions of its own Petstore**, so you can im
 │  ┌──────────────────────────────────────────────────┐ │
 │  │  React dashboard (served from / , poll /api/*)    │ │
 │  ├──────────────────────────────────────────────────┤ │
-│  │  Metrics store (node:sqlite, minute+hour roll-ups)│ │
+│  │  Metrics store (bun:sqlite, minute+hour roll-ups) │ │
 │  │         baseline: direct-to-SUT vs through-GW     │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │  Load driver  ── class-tagged requests            │ │
@@ -168,7 +168,7 @@ Full runbook: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**. In brief, the compos
 
 - **Authentication is mandatory.** The container exits at startup with a FATAL if `APP_BASIC_AUTH` (`name:password`) is unset. Every route — UI, petstore, admin, metrics, definitions — requires the same `Authorization: Basic …` header, checked with a constant-time comparison **before** any request body is parsed. Only `/health` is public, deliberately, for load-balancer probes (status, version and uptime only).
 - **Security headers on every response.** CSP, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Cross-Origin-Opener-Policy`; `X-Powered-By` disabled; HSTS added only when the request arrived over TLS. CI asserts these on the built image.
-- **Single bounded port.** `EXPOSE 8080`, `no-new-privileges` — one listener, and the server process runs as `node`, never root. The entrypoint holds root only long enough to `chown /app/data`, then `su-exec`s down to `node`, which becomes PID 1 and receives SIGTERM directly.
+- **Single bounded port.** `EXPOSE 8080`, `no-new-privileges` — one listener, and the server process runs as `bun`, never root. The entrypoint holds root only long enough to `chown /app/data`, then `su-exec`s down to `bun`, which becomes PID 1 and receives SIGTERM directly.
 - **Persistent state.** `/app/data` is a named volume with the SQLite file and the `config` table (GW + load-profile settings survive restarts). SIGTERM flushes pending metrics and checkpoints the WAL before exiting. Docker seeds a named volume's ownership from the image only when the volume is empty, so a volume carried over from an older image — or a host bind mount — can arrive owned by root; `docker-entrypoint.sh` repairs that on every start rather than letting SQLite fail with `unable to open database file` in a restart loop.
 - **Bounded by construction.** Every operator-supplied number — load profile, query ranges, `X-Test-*` headers, admin latency profiles — is clamped to a documented range, so neither a saved config nor a crafted URL can wedge or OOM the process.
 - **Credentials via env or secret store only.** Never commit `APP_BASIC_AUTH` to git. For a real deployment source it from `APP_BASIC_AUTH=$(pass show apigw)` / Docker secrets / your orchestrator's secret mount.
@@ -200,7 +200,7 @@ You can also pull the image built by CI directly:
 ├── eslint.config.mjs
 └── packages/
     ├── shared/             types + config sanitizers (server, driver and UI share them)
-    ├── app/                the single Node process
+    ├── app/                the single Bun process
     │   └── src/
     │       ├── index.ts    entrypoint: startup, graceful shutdown
     │       ├── app.ts      composition root: auth, headers, routes, wiring
@@ -221,7 +221,7 @@ and from the Docker context.
 | Petstore SUT | `packages/app/src/petstore/` | REST CRUD + SOAP; per-endpoint latency distributions, response padding, optional chaos via `/admin/*`. Stress endpoints: `GET /api/big/:size`, `GET /api/slow/:ms`, `POST /api/echo`. Bounded in-memory store with FIFO eviction and a per-status index, so the SUT does not slow down over a long run |
 | API contract | `packages/app/src/petstore/openapi.ts`, `soap.ts` | Hand-written OpenAPI 3.0.3 + WSDL, served as downloads and asserted against the live routes in `contract.test.ts` |
 | Load driver | `packages/app/src/loadgen/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily / real`; weighted scenario + stress-class mix; per-class baseline (direct-to-SUT) probes |
-| Metrics store | `packages/app/src/metrics/` | `node:sqlite` (no native deps), WAL mode, transactional ingest, 24h raw ring + minute + hour histogram roll-ups with per-class use |
+| Metrics store | `packages/app/src/metrics/` | `bun:sqlite` (no native deps), WAL mode, transactional ingest, 24h raw ring + minute + hour histogram roll-ups with per-class use |
 | Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme; "GW overhead" is the headline metric |
 | Status dimension | `packages/shared/` (`STATUS_BUCKETS`) | Every response is bucketed by status, so 401/403/429 and 502/503/504 are visible instead of folded away — see below |
 | Policy probes | `packages/app/src/loadgen/policy.ts` | Eight deliberate probes (auth, quota, payload cap, upstream timeout, cache, route allowlist, CORS) with `pass` / `not-enforced` / `fail` / `error` outcomes |
@@ -232,20 +232,20 @@ and from the Docker context.
 ## Development
 
 ```bash
-npm install        # needs Node >= 22.5 (node:sqlite); .nvmrc pins 22
-npm run build      # shared → app → ui (each cleans its own dist first)
-npm test           # 238 tests across the monorepo, ~17s
-npm run verify     # lint + typecheck + test, i.e. what CI gates on
-npm run compose:up # one container on :8080 (must set APP_BASIC_AUTH first)
+bun install          # needs Bun >= 1.4 (.bun-version pins it)
+bun run build        # builds the UI bundle (the app itself ships as TS)
+bun test packages/app/src   # 241 tests, ~20s
+bun run verify       # lint + typecheck + test, i.e. what CI gates on
+bun run compose:up   # one container on :8080 (must set APP_BASIC_AUTH first)
 ```
 
 Run locally without Docker:
 
 ```bash
 $env:APP_BASIC_AUTH = "admin:dev-local"   # or export on Linux/macOS
-npm run build
-cp -r packages/ui/dist packages/app/dist/public
-npm start          # serves on http://localhost:8080 with auth
+bun run build                             # packages/ui/dist
+$env:PUBLIC_DIR = "$PWD/packages/ui/dist" # or point PUBLIC_DIR at your UI build
+bun start          # serves on http://localhost:8080 with auth
 ```
 
 **What the gateway answered, and whose fault it was.** Every response is bucketed by status (`STATUS_BUCKETS` in `packages/shared`), which keeps three questions apart that a plain "error rate" conflates:
@@ -321,5 +321,5 @@ curl -u admin:your-strong-password -X POST http://localhost:8080/api/run/stop
 
 `.github/workflows/ci.yml`:
 
-1. `build-test` (fast) — lint, `tsc --noEmit`, the unit suite, and a full `npm run build`.
+1. `build-test` (fast) — lint, `tsc --noEmit`, the unit suite, and a full `bun run build`.
 2. `image` (`needs: build-test`, push only) — multi-stage docker build from `Dockerfile`, push to `ghcr.io/<owner>/apigw-tester:<sha>` and `:latest`, then a **smoke test**: asserts the container does not run as root, that unauthorized requests get 401 and authorized get 200, that `/health` reports a version and every response carries the security headers with no `X-Powered-By`, downloads and structurally validates the OpenAPI/YAML/WSDL, fires a **bounded** load run with a 10% invalid slice and checks that `durationMinutes` stopped it by itself, that metrics flow, that the per-endpoint and per-class breakdowns reconcile with the headline total, that no invalid request was wrongly accepted, that the `validity` block is populated and agrees with its own reasons, that the policy probes report *not measured* rather than a verdict when there is no gateway in the path, that the run report renders as JSON and Markdown with a verdict that is **never a pass** in that situation, that an unknown run id 404s, that a hostile `timeseries` range is clamped rather than fatal, and that the container is still healthy afterwards.

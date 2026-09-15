@@ -102,7 +102,7 @@ jobs:
           # The server must not run as root. Check PID 1 itself, not `docker exec
           # id -u`: exec sessions inherit the image's USER, and the entrypoint
           # deliberately starts as root to chown /app/data before su-exec'ing
-          # down to `node`. /proc/1 is owned by the uid the process runs as.
+          # down to `bun`. /proc/1 is owned by the uid the process runs as.
           pid1_uid=$(docker exec apigw-tester-ci awk '/^Uid:/{print $2}' /proc/1/status)
           test -n "$pid1_uid" && test "$pid1_uid" != "0"
 

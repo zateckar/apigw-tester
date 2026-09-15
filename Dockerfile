@@ -9,7 +9,7 @@ COPY packages/ui/package.json packages/ui/
 RUN bun install --frozen-lockfile
 COPY packages/shared packages/shared
 COPY packages/ui packages/ui
-RUN bun run build -w @apigw/ui
+RUN bun run --cwd packages/ui build
 
 # App stage: no emit step — the app is TypeScript run directly by Bun at
 # runtime. Only the workspace manifests + source need to ship.
