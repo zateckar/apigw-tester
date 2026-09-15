@@ -526,6 +526,12 @@ export function buildApp(cfg: AppConfig): BuiltApp {
         if (route.def.body === "json") ctx.jsonBody = await req.json().catch(() => undefined);
         else if (route.def.body === "text") ctx.textBody = await req.text();
         else if (route.def.body === "arrayBuffer") ctx.echoBytes = (await req.arrayBuffer()).byteLength;
+        // server time starts once the body is fully in: bodies (a 12MB echo
+        // upload, a fat SOAP envelope) arriving slowly are transport, not SUT
+        // processing — Express's old order (body parsers before the petstore
+        // router) excluded them too, and counting them would understate
+        // gateway overhead exactly on the classes that measure it
+        if (route.def.body) ctx.enteredAt = Date.now();
         return finish(await route.def.handler(ctx));
       }
 
