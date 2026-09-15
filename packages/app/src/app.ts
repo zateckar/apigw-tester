@@ -451,12 +451,12 @@ export function buildApp(cfg: AppConfig): BuiltApp {
 
   /** Run the probes now rather than waiting for the next interval. */
   app.post("/api/policy/run", (_req, res) => {
-    if (policyRunning) return res.status(409).json({ error: "a policy pass is already running" });
     // without this the caller gets a 202 and then waits forever for results
     // that were never going to be produced
     if (!store.readPolicyConfig().enabled) {
       return res.status(409).json({ error: "policy probing is disabled — enable it first" });
     }
+    if (policyRunning) return res.status(409).json({ error: "a policy pass is already running" });
     void runPolicies().then(() => undefined);
     res.status(202).json({ started: true });
   });
