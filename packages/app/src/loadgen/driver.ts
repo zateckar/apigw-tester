@@ -201,6 +201,9 @@ export class Driver {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private baselineTimer: ReturnType<typeof setInterval> | null = null;
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  /** arm-only deadline for the Go path: tickTimer does not run there, so a one-
+   *  shot watchdog is what enforces durationMinutes for Go-driven runs */
+  private durationTimer: ReturnType<typeof setTimeout> | null = null;
 
   private inFlight = 0;
   private activeRequests = new Set<AbortController>();
@@ -453,6 +456,20 @@ export class Driver {
       this.startedAt = Date.now();
       this.stoppedAt = null;
       this.goLastStatus = null;
+      // tickTimer doesn't run in the Go path — the Go worker owns pacing — but
+      // durationMinutes still has to end the run; enforce it with a watchdog.
+      if (this.durationTimer) { clearTimeout(this.durationTimer); this.durationTimer = null; }
+      const limitMin = this.profile.durationMinutes ?? 0;
+      if (limitMin > 0) {
+        this.durationTimer = setTimeout(() => {
+          this.durationTimer = null;
+          if (this.state !== "running" || this.startedAt === null) return;
+          console.log(`[driver] run ${this.runId} reached its ${limitMin} minute limit — stopping`);
+          this.onDurationReached?.(this.runId);
+          this.stop();
+        }, limitMin * 60_000);
+        this.durationTimer.unref?.();
+      }
       console.log(`[driver] run ${runId} started, mode=${this.profile.mode}, target=${this.gw.rest.baseUrl} (go backend)`);
       return { ok: true, runId };
     }
@@ -513,6 +530,7 @@ export class Driver {
   stop(): { stopped: true; runId: string | null } {
     const runId = this.runId;
     if (this.goClient && this.state !== "idle") {
+      if (this.durationTimer) { clearTimeout(this.durationTimer); this.durationTimer = null; }
       this.goClient.stop();
       this.state = "stopping";
       this.stoppedAt = Date.now();
@@ -956,6 +974,7 @@ export class Driver {
   }
 
   async shutdown(): Promise<void> {
+    if (this.durationTimer) { clearTimeout(this.durationTimer); this.durationTimer = null; }
     if (this.goClient) {
       // stop the timers the ts path may have armed before the client came up
       if (this.tickTimer) clearInterval(this.tickTimer);

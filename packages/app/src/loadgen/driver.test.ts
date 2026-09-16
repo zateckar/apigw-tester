@@ -528,6 +528,35 @@ describe("Driver bounded runs", () => {
     expect(priv(d).state).toBe("running");
     await d.shutdown();
   });
+
+  it("stops a Go-backend run at durationMinutes even though tickTimer never arms", async () => {
+    // regression: the Go path in start() returns before the tick interval is
+    // installed, and the worker treats durationMinutes as inert metadata — a
+    // bounded Go-driven run used to run forever
+    const d = new Driver();
+    const stopped: (string | null)[] = [];
+    d.setIngest((batch) => ({ ingested: batch.results.length }));
+    d.onAutoStop((runId) => stopped.push(runId));
+    const go = {
+      ensureStarted: async () => {},
+      configure: () => {},
+      start: () => {},
+      stop: () => {},
+      shutdown: async () => {}
+    };
+    priv(d).go = () => go;
+    // one-hundredth of a minute is 600ms — long enough to prove the watchdog
+    // fires, short enough to not stall the suite
+    d.setProfile({ mode: "constant", rps: 0, durationMinutes: 0.01 });
+    d.start("run-go-bounded");
+    expect(priv(d).state).toBe("running");
+    expect(priv(d).durationTimer).not.toBeNull();
+
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(stopped).toEqual(["run-go-bounded"]);
+    expect(priv(d).state).not.toBe("running");
+    await d.shutdown();
+  });
 });
 
 describe("Driver fire() response byte accounting", () => {
