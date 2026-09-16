@@ -419,15 +419,24 @@ describe("apigw-tester app (auth protected)", () => {
     const probe = async (cfg: Record<string, unknown>) =>
       authed("/api/config/gateway/test", { method: "POST", body: JSON.stringify(cfg) });
 
-    // reachable: point it at ourselves, whose /health is public; protocol selects
-    // which persisted side the probe falls back to and is otherwise inert here
-    const ok = (await (await probe({ protocol: "soap", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
+    // REST probes /health (public); protocol picks which persisted side the
+    // probe falls back to
+    const ok = (await (await probe({ protocol: "rest", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
       ok: boolean; status: number; url: string; latencyMs: number;
     };
     expect(ok.ok).toBe(true);
     expect(ok.status).toBe(200);
     expect(ok.url).toBe(`${base}/health`);
     expect(typeof ok.latencyMs).toBe("number");
+
+    // SOAP has no GET /health — the probe issues a real getPetById envelope,
+    // and a 200 proves the envelope round-trips through the gateway
+    const okSoap = (await (await probe({ protocol: "soap", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
+      ok: boolean; status: number; url: string; latencyMs: number;
+    };
+    expect(okSoap.ok).toBe(true);
+    expect(okSoap.status).toBe(200);
+    expect(okSoap.url).toBe(`${base}/soap/petservice`);
 
     // the probe walks the same base+prefix path the driver will use
     const prefixed = (await (await probe({ baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "/v1" })).json()) as {

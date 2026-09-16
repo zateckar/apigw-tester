@@ -338,9 +338,16 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const persisted = sanitizeGwTargets(await store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
       const probe = sanitizeGwConfig(body, persisted[protocol]);
       const prefix = probe.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
-      const url = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}/health`;
+      // a SOAP endpoint answers POSTs, not GET /health — probe it with a real
+      // getPetById call so a healthy route is not reported as down
+      const isSoap = protocol === "soap";
+      const url = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}${isSoap ? "/soap/petservice" : "/health"}`;
 
       const headers: Record<string, string> = {};
+      if (isSoap) {
+        headers["Content-Type"] = "text/xml; charset=utf-8";
+        headers["SOAPAction"] = '"getPetById"';
+      }
       if (forwardsBasicAuth(probe, cfg.selfUrl)) {
         const creds = readBasicAuthCreds();
         if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
@@ -351,10 +358,18 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const timer = setTimeout(() => ac.abort(), GATEWAY_PROBE_TIMEOUT_MS);
       const started = Date.now();
       const sentBasicAuth = headers["authorization"] !== undefined;
+      const soapProbeBody = '<?xml version="1.0" encoding="utf-8"?>' +
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="http://petstore.apigw.test/soap">' +
+        '<soap:Body><tns:getPetByIdRequest><petId>1</petId></tns:getPetByIdRequest></soap:Body></soap:Envelope>';
       try {
-        const upstream = await fetch(url, { method: "GET", headers, signal: ac.signal });
+        const upstream = await fetch(url, isSoap
+          ? { method: "POST", headers, body: soapProbeBody, signal: ac.signal }
+          : { method: "GET", headers, signal: ac.signal });
         await upstream.arrayBuffer();
-        return json(200, { ok: upstream.ok, status: upstream.status, url, sentBasicAuth, latencyMs: Date.now() - started });
+        // SOAP faults are 400 but still prove the service is reachable and
+        // speaking SOAP — only a routing-level miss (404) is a failure
+        const ok = isSoap ? upstream.status !== 404 : upstream.ok;
+        return json(200, { ok, status: upstream.status, url, sentBasicAuth, latencyMs: Date.now() - started });
       } catch (e) {
         const reason = ac.signal.aborted
           ? `no response within ${GATEWAY_PROBE_TIMEOUT_MS / 1000}s`

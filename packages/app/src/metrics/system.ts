@@ -369,9 +369,15 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
     },
     sampleNow: tick,
     qualityBetween(from, to) {
-      // Samples describe the interval since the previous read, not one instant.
-      const overlap = samples.filter(s => s.intervalStartTs !== undefined && s.ts >= from && s.intervalStartTs <= to);
-      if (!overlap.length || overlap[0]!.intervalStartTs! > from || overlap[overlap.length - 1]!.ts < to - 1) return "health coverage unavailable";
+      // Samples describe the interval since the previous read, not one
+      // instant: a sample with intervalStartTs <= from and ts >= to covers
+      // the whole window. Cover the left edge with the newest sample that
+      // starts at/before `from` and the right edge with any sample that
+      // reaches `to`; a not-yet-closed window is reported as unavailable.
+      const tillTo = samples.filter(s => s.intervalStartTs !== undefined && s.ts >= from && s.ts <= to);
+      if (tillTo.length === 0 || tillTo[0]!.intervalStartTs! > from) return "health coverage unavailable";
+      const overlap = tillTo.filter(s => s.intervalStartTs! <= to);
+      if (!overlap.length || overlap[overlap.length - 1]!.ts < to - 1) return "health coverage unavailable";
       for (const s of overlap) {
         if (s.cpuCorePct === null || s.cpuCorePct === undefined || s.eventLoopMaxMs == null) return "health unavailable";
         if ((s.cpuThrottledMs ?? 0) > 0) return "local CPU throttling";
