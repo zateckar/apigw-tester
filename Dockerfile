@@ -15,14 +15,14 @@ RUN bun run --cwd packages/ui build
 # pinned native stage so cross-builds (`--platform=linux/arm64`) stay cheap:
 # TARGETOS/TARGETARCH fan out to the running platform's toolchain output.
 FROM golang:1.24-alpine AS worker
-WORKDIR /src
-COPY packages/worker/go.mod packages/worker/
-COPY packages/worker/internal packages/worker/internal
-COPY packages/worker/cmd packages/worker/cmd
+WORKDIR /src/packages/worker
+COPY packages/worker/go.mod ./
+COPY packages/worker/internal ./internal
+COPY packages/worker/cmd ./cmd
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
-      -o /out/gwtester-worker ./packages/worker/cmd/gwtester-worker
+      -o /out/gwtester-worker ./cmd/gwtester-worker
 
 # App stage: no emit step — the app is TypeScript run directly by Bun at
 # runtime. Only the workspace manifests + source need to ship.
