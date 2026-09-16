@@ -36,7 +36,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await built.shutdown();
   server.stop(true);
-});
+}, 30_000);
 
 const only = (key: keyof ScenarioWeights): LoadProfile => ({
   ...DEFAULT_LOAD_PROFILE,

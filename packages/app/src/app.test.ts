@@ -52,7 +52,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await built.shutdown();
   server.stop(true);
-});
+}, 30_000);
 
 describe("apigw-tester app (auth protected)", () => {
   it("anon requests get 401 with Basic realm", async () => {
