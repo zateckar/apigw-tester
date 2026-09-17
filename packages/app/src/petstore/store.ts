@@ -167,6 +167,8 @@ export class PetStore {
   private readonly capacity: number;
   private orders = new Map<number, Order>();
   private readonly maxOrders: number;
+  /** bumped by every change to the pet collection; see the `version` getter */
+  private mutations = 0;
 
   constructor(seedCount = 120, capacity = LIMITS.petStoreSize) {
     this.seedCount = seedCount;
@@ -195,12 +197,14 @@ export class PetStore {
   private insert(pet: Pet): void {
     this.pets.set(pet.id, pet);
     this.byStatus.get(pet.status)?.add(pet.id);
+    this.mutations++;
   }
 
   private remove(id: number): boolean {
     const pet = this.pets.get(id);
     if (!pet) return false;
     this.byStatus.get(pet.status)?.delete(id);
+    this.mutations++;
     return this.pets.delete(id);
   }
 
@@ -267,6 +271,7 @@ export class PetStore {
       this.byStatus.get(merged.status)?.add(id);
     }
     this.pets.set(id, merged);
+    this.mutations++;
     return merged;
   }
 
@@ -314,6 +319,23 @@ export class PetStore {
    *  evicted, which is what the response-serialization caches key on. */
   get seedPetCount(): number {
     return this.seedCount;
+  }
+
+  /**
+   * Monotonic counter over every change to the pet collection — create, update,
+   * delete and eviction alike.
+   *
+   * The server caches serialized listings, and a listing spans pets it cannot
+   * enumerate cheaply, so it needs one value that changes whenever any of them
+   * might have. Pet count is not that value: an update leaves it identical, and
+   * a delete paired with a create restores it. Caching against the count
+   * therefore served the pre-update body of an updated pet for the lifetime of
+   * the process — on a rig whose whole purpose is to compare a gateway's
+   * responses against the origin's, a silently stale origin is the one defect
+   * that cannot be allowed to stand.
+   */
+  get version(): number {
+    return this.mutations;
   }
 
   orderCount(): number {

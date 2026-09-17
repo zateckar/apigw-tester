@@ -1,4 +1,4 @@
-import type { ChaosConfig, EndpointLatencyProfile, PetStatus } from "@apigw/shared";
+import type { ChaosConfig, EndpointLatencyProfile, Pet, PetStatus } from "@apigw/shared";
 import { LIMITS, PET_STATUSES, isPetStatus } from "@apigw/shared";
 import {
   DEFAULT_CHAOS,
@@ -149,29 +149,40 @@ export function createPetstoreRoutes(): { routes: Record<string, RouteDef>; stor
     return new Response(body, { status, headers: { "Content-Type": "application/json" } });
   };
 
-  const listBaseByKey = new Map<string, { base: string; petCount: number }>();
+  // Both caches are keyed on something that changes whenever the answer could,
+  // never on a proxy for it. A cache that outlives its subject on a reference
+  // origin is worse than no cache: the gateway under test would be compared
+  // against a body this process stopped believing in.
+  const listBaseByKey = new Map<string, { base: string; version: number }>();
   const listBaseFor = (status: PetStatus | undefined, page: number, size: number): string | null => {
     const key = `${status ?? ""}|${page}|${size}`;
     const hit = listBaseByKey.get(key);
-    if (hit && hit.petCount === store.count()) return hit.base;
+    // store.version and not store.count(): an update leaves the count identical
+    // and a delete paired with a create restores it, so counting served the
+    // pre-update body of every updated pet for the lifetime of the process
+    if (hit && hit.version === store.version) return hit.base;
     const { items, total } = store.list(status, page, size);
     // a listing that includes (or could total) runtime pets is not cacheable
     if (total !== seedTotalByStatus.get(status ?? "") || items.some((p) => p.id > seedCount)) return null;
-    const entry = { base: JSON.stringify({ items, total, page, size }), petCount: store.count() };
+    const entry = { base: JSON.stringify({ items, total, page, size }), version: store.version };
     listBaseByKey.set(key, entry);
     return entry.base;
   };
 
-  const petBaseById = new Map<number, string>();
+  // One pet is cheap to check exactly: update() replaces the object rather than
+  // mutating it, so identity is the invalidation signal and this survives an
+  // update, a delete and a re-create without a version generation of its own —
+  // which matters, because a global version would empty this on every create,
+  // and creates are 10% of the generated traffic.
+  const petBaseById = new Map<number, { pet: Pet; base: string }>();
   const petBaseFor = (id: number): string | null => {
-    if (id > seedCount) return null;
-    let base = petBaseById.get(id);
-    if (base === undefined) {
-      const pet = store.get(id);
-      if (!pet) return null;
-      base = JSON.stringify(pet);
-      petBaseById.set(id, base);
-    }
+    if (id > seedCount) return null; // bounds the map: seed pets are never evicted
+    const pet = store.get(id);
+    if (!pet) return null;
+    const hit = petBaseById.get(id);
+    if (hit && hit.pet === pet) return hit.base;
+    const base = JSON.stringify(pet);
+    petBaseById.set(id, { pet, base });
     return base;
   };
 
