@@ -62,10 +62,12 @@ type LoadProfile struct {
 
 // Configure is the payload of the {"op":"configure"} control message.
 type Configure struct {
-	Gw          GwTargets   `json:"gw"`
-	Profile     LoadProfile `json:"profile"`
-	BaselineURL string      `json:"baselineUrl"`
-	SelfOrigin  string      `json:"selfOrigin"`
+	Gw      GwTargets   `json:"gw"`
+	Profile LoadProfile `json:"profile"`
+	// SelfOrigin is where the SUT answers with no gateway in front of it. No
+	// traffic is sent there; it is what makes forwardBasicAuth "auto" able to
+	// tell "this target is us" from "this target is somebody else's gateway".
+	SelfOrigin string `json:"selfOrigin"`
 	// BasicAuth is the base64 "user:pass" credential, empty when absent.
 	BasicAuth string `json:"basicAuth"`
 }

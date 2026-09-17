@@ -7,7 +7,6 @@ import {
   RAW_TAIL_PER_FLUSH,
   STATUS_BUCKETS,
   VALIDITY_LIMITS,
-  minSamplesForPercentile,
   sanitizePolicyConfig,
   sanitizeSlo
 } from "@apigw/shared";
@@ -23,7 +22,6 @@ import type {
   IngestBatch,
   LoadProfile,
   MetricSummary,
-  OverheadDelta,
   PolicyConfig,
   PolicyResult,
   RequestResult,
@@ -226,106 +224,6 @@ function statusCount(h: StatusHistogram, buckets: readonly StatusBucket[]): numb
   return n;
 }
 
-const OVERHEAD_CLASSES: ReadonlySet<string> = new Set(["small-rest", "concurrency", "soap"]);
-
-// ---- residual distributions and the gateway Δ ------------------------------
-
-/** Which side of the comparison a residual distribution belongs to. */
-type ResidualPath = "gw" | "direct";
-
-/** One arm: the residuals of one path, over one class, over one window. */
-interface ResidualArm {
-  hist: ResidualHistogram;
-  count: number;
-  sumMs: number;
-}
-
-function emptyArm(): ResidualArm {
-  return { hist: emptyResidualHistogram(), count: 0, sumMs: 0 };
-}
-
-interface ResidualPair { gw: ResidualArm; direct: ResidualArm }
-
-function emptyPair(): ResidualPair {
-  return { gw: emptyArm(), direct: emptyArm() };
-}
-
-function mergeArm(into: ResidualArm, from: ResidualArm): void {
-  mergeHistograms(into.hist, from.hist);
-  into.count += from.count;
-  into.sumMs += from.sumMs;
-}
-
-function mergePair(into: ResidualPair, from: ResidualPair): void {
-  mergeArm(into.gw, from.gw);
-  mergeArm(into.direct, from.direct);
-}
-
-/**
- * The headline number: how much worse the gateway path's residual distribution
- * is than the direct path's, read at matching percentiles.
- *
- * Every percentile is gated on the *thinner* of the two arms, because a
- * difference is only as sound as its weaker side — and the direct arm is
- * deliberately a small fraction of the load, so it is nearly always the one
- * that runs out first. A gated percentile comes back null with a reason rather
- * than as a confident number drawn from three samples.
- */
-function overheadDelta(pair: ResidualPair): OverheadDelta {
-  const { gw, direct } = pair;
-  const support = Math.min(gw.count, direct.count);
-  const thin: number[] = [];
-  const at = (p: number): number | null => {
-    if (support < minSamplesForPercentile(p)) {
-      thin.push(p);
-      return null;
-    }
-    const a = residualPercentile(gw.hist, p);
-    const b = residualPercentile(direct.hist, p);
-    return a === null || b === null ? null : a - b;
-  };
-  // fixed order so `thin` reads low-to-high in the message below
-  const p50 = at(50);
-  const p90 = at(90);
-  const p95 = at(95);
-  const p99 = at(99);
-
-  let unavailable: string | null = null;
-  if (gw.count === 0 && direct.count === 0) {
-    unavailable = "no residuals recorded in this window";
-  } else if (direct.count === 0) {
-    unavailable =
-      "no direct reference traffic in this window — there is nothing to compare the gateway path against";
-  } else if (gw.count === 0) {
-    unavailable =
-      "no request through the gateway carried backend timing (X-Server-Ms), so none of them has a residual; " +
-      "a gateway that strips the header, or that answered everything itself, cannot be measured this way";
-  } else if (thin.length > 0) {
-    // One requirement per percentile. They differ by an order of magnitude —
-    // p90 wants 100, p99 wants 1,000 — and collapsing them onto the largest
-    // told a window 31 samples short of p90 that it was 931 short, which sends
-    // anyone trying to fix it after the wrong number by a factor of ten.
-    const needs = thin.map((p) => `p${p} needs ${minSamplesForPercentile(p).toLocaleString()}`).join(", ");
-    unavailable =
-      `${needs} residuals on each side; this window has ` +
-      `${gw.count.toLocaleString()} through the gateway and ${direct.count.toLocaleString()} direct` +
-      // naming the thinner arm matters: the reference stream is a fixed small
-      // share of the load, so it is almost always the binding constraint, and
-      // "run it longer or faster" is the only thing that moves it
-      (direct.count <= gw.count ? " (the direct reference stream is the thinner arm)" : "");
-  }
-
-  return {
-    p50, p90, p95, p99,
-    // the mean is far more sample-efficient than a tail percentile, but one
-    // observation still does not make a mean — hold it to the p50 bar
-    avg: support >= minSamplesForPercentile(50) ? gw.sumMs / gw.count - direct.sumMs / direct.count : null,
-    gwSamples: gw.count,
-    directSamples: direct.count,
-    unavailable
-  };
-}
-
 const CLIENT_ERROR_BUCKETS: readonly StatusBucket[] =
   STATUS_BUCKETS.filter((b) => b === "4xx" || /^4\d\d$/.test(b));
 const SERVER_ERROR_BUCKETS: readonly StatusBucket[] =
@@ -391,8 +289,8 @@ function parseHist(s: string): Histogram {
   }
 }
 
-const RAW_COLS = `(ts, run_id, request_id, protocol, endpoint, class, method, status, latency_ms, ttfb_ms, server_ms, connect_ms, conn_reused, timing_reason, measurement_version, bytes_req, bytes_resp, reached_backend, error)`;
-const RAW_NCOLS = 19;
+const RAW_COLS = `(ts, run_id, request_id, protocol, endpoint, class, method, status, latency_ms, ttfb_ms, server_ms, connect_ms, conn_reused, measurement_version, bytes_req, bytes_resp, reached_backend, error)`;
+const RAW_NCOLS = 18;
 
 /** build one multi-row INSERT for `rows` raw results */
 function rawInsertSql(rows: number): string {
@@ -404,7 +302,7 @@ function rawInsertParams(r: RequestResult): (string | number | null)[] {
   return [r.ts, r.runId, r.requestId ?? "", r.protocol, r.endpoint, r.class, r.method, r.status,
     r.latencyMs, r.ttfbMs ?? null, r.serverMs ?? null,
     r.connectMs ?? null, r.connectMs == null ? null : (r.connReused === true ? 1 : 0),
-    r.timingReason ?? null, r.measurementVersion ?? 1, r.bytesReq, r.bytesResp,
+    r.measurementVersion ?? 1, r.bytesReq, r.bytesResp,
     r.reachedBackend === true ? 1 : 0, r.error ?? null];
 }
 
@@ -456,22 +354,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   const upsertMinute = db.prepare(layer("rollup_minute"));
   const upsertHour = db.prepare(layer("rollup_hour"));
 
-  // Residual layers. Far fewer rows than rollup_* — one per (bucket, class,
-  // path), so at most 14 a minute — which is why these get a plain
-  // select-merge-upsert with no cross-flush cache: the read they would save is
-  // already cheap enough not to show up.
-  const selectResidual = (table: string): string =>
-    `SELECT count, sum_ms, hist FROM ${table} WHERE bucket_ts = ? AND cls = ? AND path = ?`;
-  const upsertResidual = (table: string): string => `
-     INSERT INTO ${table} (bucket_ts, cls, path, count, sum_ms, hist) VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(bucket_ts, cls, path) DO UPDATE SET
-       count = excluded.count,
-       sum_ms = excluded.sum_ms,
-       hist = excluded.hist`;
-  const selectResidualMinute = db.prepare(selectResidual("residual_minute"));
-  const selectResidualHour = db.prepare(selectResidual("residual_hour"));
-  const upsertResidualMinute = db.prepare(upsertResidual("residual_minute"));
-  const upsertResidualHour = db.prepare(upsertResidual("residual_hour"));
   const upsertRunMinute = db.prepare(
     `INSERT INTO run_minute (bucket_ts, run_id, count) VALUES (?, ?, ?)
      ON CONFLICT(bucket_ts, run_id) DO UPDATE SET count = count + excluded.count`
@@ -518,34 +400,13 @@ export function createMetricsStore(dbPath: string): MetricsStore {
        FROM ${table} WHERE bucket_ts >= ? AND bucket_ts <= ?`
     ).all(fromBucket, toBucket) as unknown as RollupRow[];
 
-  interface ResidualRow { bucket_ts: number; cls: string; path: string; count: number; sum_ms: number; hist: string }
-
-  const readResidualRows = (table: "residual_minute" | "residual_hour", fromBucket: number, toBucket: number): ResidualRow[] =>
-    db.prepare(
-      `SELECT bucket_ts, cls, path, count, sum_ms, hist FROM ${table} WHERE bucket_ts >= ? AND bucket_ts <= ?`
-    ).all(fromBucket, toBucket) as unknown as ResidualRow[];
-
-  /** Fold residual rows into one pair of arms per class. */
-  function armsByClass(rows: ResidualRow[]): Map<string, ResidualPair> {
-    const out = new Map<string, ResidualPair>();
-    for (const r of rows) {
-      let pair = out.get(r.cls);
-      if (!pair) out.set(r.cls, (pair = emptyPair()));
-      const arm = r.path === "direct" ? pair.direct : pair.gw;
-      arm.count += Number(r.count) || 0;
-      arm.sumMs += Number(r.sum_ms) || 0;
-      mergeHistograms(arm.hist, parseHist(r.hist));
-    }
-    return out;
-  }
-
   const readRawRecent = (limit: number): RequestResult[] => {
     const n = Number(limit);
     // guard both NaN and negatives: SQLite reads LIMIT -1 as "no limit"
     const safe = Number.isFinite(n) ? Math.min(LIMITS.recentLimit, Math.max(1, Math.trunc(n))) : 100;
     const rows = db.prepare(
       `SELECT ts, run_id AS runId, request_id AS requestId, protocol, endpoint, class, method, status,
-              latency_ms AS latencyMs, ttfb_ms AS ttfbMs, server_ms AS serverMs, timing_reason AS timingReason, measurement_version AS measurementVersion,
+              latency_ms AS latencyMs, ttfb_ms AS ttfbMs, server_ms AS serverMs, measurement_version AS measurementVersion,
               bytes_req AS bytesReq, bytes_resp AS bytesResp, reached_backend AS reachedBackend, error
        FROM requests_raw ORDER BY ts DESC LIMIT ?`
     ).all(safe) as unknown as (Omit<RequestResult, "reachedBackend"> & { reachedBackend: number })[];
@@ -578,15 +439,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       return readRows("rollup_minute", Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS, Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS);
     }
     return readRows("rollup_hour", Math.floor(from / HOUR_BUCKETS) * HOUR_BUCKETS, Math.floor(to / HOUR_BUCKETS) * HOUR_BUCKETS);
-  }
-
-  /** Residual arms over the same span, from whichever layer windowRows used —
-   *  so the Δ always covers exactly the buckets the rest of the summary does. */
-  function windowResidualRows(from: number, to: number): ResidualRow[] {
-    if (to - from <= MINUTE_LAYER_MAX_MS) {
-      return readResidualRows("residual_minute", Math.floor(from / MINUTE_BUCKETS) * MINUTE_BUCKETS, Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS);
-    }
-    return readResidualRows("residual_hour", Math.floor(from / HOUR_BUCKETS) * HOUR_BUCKETS, Math.floor(to / HOUR_BUCKETS) * HOUR_BUCKETS);
   }
 
   /**
@@ -798,14 +650,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       if (Array.isArray(c.nonBackendHist)) mergeHistograms(b.nb_hist, c.nonBackendHist);
     };
 
-    /** Residual arms this batch touches, keyed bucket|class|path per layer. */
-    interface ResidualBucket {
-      bucket_ts: number; cls: string; path: ResidualPath;
-      count: number; sum_ms: number; hist: ResidualHistogram;
-    }
-    const residualMinute = new Map<string, ResidualBucket>();
-    const residualHour = new Map<string, ResidualBucket>();
-
     let ingested = 0;
     for (const c of agg.cells) {
       if (!c || !Number.isFinite(c.bucketTs) || !Array.isArray(c.hist) || !Array.isArray(c.statusHist)) {
@@ -814,25 +658,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       foldCell(minute, Math.floor(c.bucketTs / MINUTE_BUCKETS) * MINUTE_BUCKETS, c);
       foldCell(hour, Math.floor(c.bucketTs / HOUR_BUCKETS) * HOUR_BUCKETS, c);
       ingested += c.count;
-    }
-    // Residual cells arrive keyed by health window — finer than a minute, so the
-    // control plane could drop only the contaminated ones — and are re-keyed to
-    // the storage layers here, where that distinction has already been used up.
-    for (const rc of agg.residuals ?? []) {
-      if (!rc || !Number.isFinite(rc.windowTs) || !Array.isArray(rc.hist)) continue;
-      if (rc.path !== "gw" && rc.path !== "direct") continue;
-      for (const [width, table] of [[MINUTE_BUCKETS, residualMinute], [HOUR_BUCKETS, residualHour]] as const) {
-        const bucketTs = Math.floor(rc.windowTs / width) * width;
-        const key = `${bucketTs}|${rc.cls}|${rc.path}`;
-        let b = table.get(key);
-        if (!b) {
-          b = { bucket_ts: bucketTs, cls: rc.cls, path: rc.path, count: 0, sum_ms: 0, hist: emptyResidualHistogram() };
-          table.set(key, b);
-        }
-        b.count += rc.count;
-        b.sum_ms += rc.sumMs;
-        mergeHistograms(b.hist, rc.hist);
-      }
     }
 
     // One transaction for the whole batch: raw rows, both roll-up layers and the
@@ -924,27 +749,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       mergeIntoAndUpsert(minute, selectMinute, upsertMinute, minuteRollupCache, MINUTE_BUCKETS);
       mergeIntoAndUpsert(hour, selectHour, upsertHour, hourRollupCache, HOUR_BUCKETS);
 
-      // Residual rows carry no SQL-side deltas: count and sum travel with the
-      // histogram so all three always describe the same set of observations,
-      // which means each touched row is read, merged and written whole.
-      const flushResiduals = (
-        buckets: Map<string, ResidualBucket>,
-        select: typeof selectResidualMinute,
-        upsert: typeof upsertResidualMinute
-      ): void => {
-        for (const b of buckets.values()) {
-          const row = select.get(b.bucket_ts, b.cls, b.path) as
-            { count: number; sum_ms: number; hist: string } | undefined;
-          if (row) {
-            b.count += Number(row.count) || 0;
-            b.sum_ms += Number(row.sum_ms) || 0;
-            mergeHistograms(b.hist, parseHist(row.hist));
-          }
-          upsert.run(b.bucket_ts, b.cls, b.path, b.count, b.sum_ms, JSON.stringify(b.hist));
-        }
-      };
-      flushResiduals(residualMinute, selectResidualMinute, upsertResidualMinute);
-      flushResiduals(residualHour, selectResidualHour, upsertResidualHour);
       // shed rows ride the same transaction as the requests they explain, so a
       // window can never show the load we issued without the load we did not
       for (const s of agg.shed ?? []) {
@@ -995,7 +799,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const rows = windowRows(from, to);
     const byEndpointCls = rowsToCombined(rows, "endpoint");
     const byClass = rowsToCombined(rows, "class");
-    const residualByClass = armsByClass(windowResidualRows(from, to));
 
     let total = 0;
     let errors = 0;
@@ -1042,16 +845,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     // Every request that did not return 2xx/3xx, minus the invalid slice's
     // rejections — those are the point of that slice, not a failure.
     let unexpectedFailures = 0;
-    // The headline Δ pools the latency-sensitive classes. Pooling percentiles
-    // across classes is only legitimate because both arms are drawn from the
-    // same scenario mix — the reference stream is built by the same spec
-    // generator as the load — so the pooled distributions differ by the
-    // gateway and not by what they are made of.
-    const headline = emptyPair();
-    for (const cls of OVERHEAD_CLASSES) {
-      const pair = residualByClass.get(cls);
-      if (pair) mergePair(headline, pair);
-    }
     for (const [cls, c] of byClass.entries()) {
       if (c.count === 0) continue;
       const notOk = c.count - statusCount(c.statusHist, OK_BUCKETS);
@@ -1073,7 +866,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           avg: meanFromRollup(c.latencySumMs, c.count)
         },
         nonBackendMs: nonBackendStats([c]),
-        overheadMs: overheadDelta(residualByClass.get(cls) ?? emptyPair()),
         avgBytesReq: c.bytesReq / c.count,
         avgBytesResp: c.bytesResp / c.count
       });
@@ -1118,7 +910,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         max: rows.reduce((m, r) => Math.max(m, r.max_latency_ms), 0)
       },
       nonBackendMs: nonBackendStats(byEndpointCls.values()),
-      overheadMs: overheadDelta(headline),
       connSetup: connSetupStats(byEndpointCls.values()),
       bytes: { req: bytesReq, resp: bytesResp, respPerSec: perSec(bytesResp) },
       status,
@@ -1155,24 +946,15 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const table = bucketSec === 60 ? "rollup_minute" : "rollup_hour";
     const rows = readRows(table, startB, toB);
 
-    // Per-bucket Δ arms, pooled over the same classes as the headline KPI so
-    // the chart and the tile describe the same measurement.
-    const residualByBucket = new Map<number, ResidualPair>();
-    for (const r of readResidualRows(bucketSec === 60 ? "residual_minute" : "residual_hour", startB, toB)) {
-      if (!OVERHEAD_CLASSES.has(r.cls)) continue;
-      let pair = residualByBucket.get(r.bucket_ts);
-      if (!pair) residualByBucket.set(r.bucket_ts, (pair = emptyPair()));
-      const arm = r.path === "direct" ? pair.direct : pair.gw;
-      arm.count += Number(r.count) || 0;
-      arm.sumMs += Number(r.sum_ms) || 0;
-      mergeHistograms(arm.hist, parseHist(r.hist));
-    }
-
     interface Acc {
       ts: number; total: number; errors: number; clientErrors: number; gatewayErrors: number;
       bytesResp: number;
       restTotal: number; soapTotal: number; restErrors: number; soapErrors: number;
       hist: Histogram;
+      /** non-backend time for the bucket, pooled over every class exactly as
+       *  the headline KPI pools it, so the chart and the tile agree */
+      nbCount: number;
+      nbHist: ResidualHistogram;
     }
     const points = new Map<number, Acc>();
     for (const r of rows) {
@@ -1181,7 +963,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         p = {
           ts: r.bucket_ts, total: 0, errors: 0, clientErrors: 0, gatewayErrors: 0, bytesResp: 0,
           restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0,
-          hist: emptyHistogram()
+          hist: emptyHistogram(),
+          nbCount: 0, nbHist: emptyResidualHistogram()
         };
         points.set(r.bucket_ts, p);
       }
@@ -1191,6 +974,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       p.gatewayErrors += statusCount(parseHist(r.status_hist), GATEWAY_FAULT_BUCKETS);
       p.bytesResp += r.bytes_resp;
       mergeHistograms(p.hist, parseHist(r.hist));
+      p.nbCount += r.nb_count ?? 0;
+      mergeHistograms(p.nbHist, parseResidualHist(r.nb_hist));
       if (r.protocol === "soap") {
         p.soapTotal += r.count;
         p.soapErrors += r.errors;
@@ -1216,14 +1001,19 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     for (let t = startB; t <= toB; t += sizeMs) {
       const p = points.get(t);
       if (!p) {
-        const zero: TimePoint = { ts: t, total: 0, errors: 0, clientErrors: 0, gatewayErrors: 0, rps: 0, p50: 0, p90: 0, p99: 0, overheadP50: null, overheadP95: null, overheadP99: null, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 };
+        const zero: TimePoint = { ts: t, total: 0, errors: 0, clientErrors: 0, gatewayErrors: 0, rps: 0, p50: 0, p90: 0, p99: 0, nonBackendP50: null, nonBackendP95: null, nonBackendP99: null, bytesResp: 0, restTotal: 0, soapTotal: 0, restErrors: 0, soapErrors: 0 };
         if (windowIsCurrent && live && (t === toB || (lastDataTs !== null && t > lastDataTs))) {
           zero.partial = true;
         }
         out.push(zero);
         continue;
       }
-      const delta = overheadDelta(residualByBucket.get(t) ?? emptyPair());
+      // Null when nothing in the bucket carried a backend clock, which is a
+      // different statement from zero and has to stay one: a gateway that
+      // strips X-Server-Ms draws no line at all rather than a flat one at the
+      // floor.
+      const nbAt = (q: number): number | null =>
+        p.nbCount === 0 ? null : residualPercentile(p.nbHist, q);
       const point: TimePoint = {
         ts: p.ts, total: p.total, errors: p.errors,
         clientErrors: p.clientErrors, gatewayErrors: p.gatewayErrors,
@@ -1231,9 +1021,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         p50: percentile(p.hist, 50),
         p90: percentile(p.hist, 90),
         p99: percentile(p.hist, 99),
-        overheadP50: delta.p50,
-        overheadP95: delta.p95,
-        overheadP99: delta.p99,
+        nonBackendP50: nbAt(50),
+        nonBackendP95: nbAt(95),
+        nonBackendP99: nbAt(99),
         bytesResp: p.bytesResp,
         restTotal: p.restTotal, soapTotal: p.soapTotal,
         restErrors: p.restErrors, soapErrors: p.soapErrors
@@ -1255,10 +1045,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       deleted += Number(db.prepare(`DELETE FROM rollup_minute WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
       const hourCutoff = Math.floor((Date.now() - HOUR_RETENTION_MS) / HOUR_BUCKETS) * HOUR_BUCKETS;
       deleted += Number(db.prepare(`DELETE FROM rollup_hour WHERE bucket_ts < ?`).run(hourCutoff).changes) || 0;
-      // residual layers age out with the layer they are read alongside, so a
-      // window can never keep its latency roll-up and lose its Δ
-      deleted += Number(db.prepare(`DELETE FROM residual_minute WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
-      deleted += Number(db.prepare(`DELETE FROM residual_hour WHERE bucket_ts < ?`).run(hourCutoff).changes) || 0;
       // validity inputs are minute-granular and only ever read alongside the
       // minute layer, so they age out on the same schedule as it
       deleted += Number(db.prepare(`DELETE FROM load_shed WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
@@ -1347,8 +1133,6 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         db.exec("DELETE FROM requests_raw");
         db.exec("DELETE FROM rollup_minute");
         db.exec("DELETE FROM rollup_hour");
-        db.exec("DELETE FROM residual_minute");
-        db.exec("DELETE FROM residual_hour");
         db.exec("DELETE FROM run_minute");
         db.exec("DELETE FROM load_shed");
         db.exec("DELETE FROM host_health");
@@ -1454,7 +1238,6 @@ function migrate(db: DbHandle): void {
   // time, and reading "0 ms of backend" off it would hand every one of those
   // requests its whole TTFB as a residual.
   ensureColumn(db, "requests_raw", "server_ms", "REAL");
-  ensureColumn(db, "requests_raw", "timing_reason", "TEXT");
   // Nullable for the same reason: null is "connection setup was not observable
   // on this row", which is not the same claim as "it cost nothing".
   ensureColumn(db, "requests_raw", "connect_ms", "REAL");

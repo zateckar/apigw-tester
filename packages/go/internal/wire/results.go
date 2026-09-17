@@ -20,25 +20,20 @@ type RequestResult struct {
 	Status    int     `json:"status"`
 	LatencyMs float64 `json:"latencyMs"`
 	// TTFBMs and ServerMs are recorded as observed and never combined here.
-	// Their difference is the request's residual — everything that was not the
-	// backend — and the control plane reads the gateway's cost from how that
-	// distribution differs from the reference stream's, not per request.
+	// Their difference, less ConnectMs, is the request's non-backend time —
+	// everything the response waited on that was not the backend handler — and
+	// that is the quantity the gateway is read from.
 	TTFBMs   *float64 `json:"ttfbMs"`
 	ServerMs *float64 `json:"serverMs"`
 	// ConnectMs is time spent acquiring a socket — a pool wait, or a DNS
 	// lookup, TCP handshake and TLS handshake on a miss. It sits inside TTFBMs
-	// and is not per-request gateway cost, so the residual subtracts it. Nil
+	// and is not per-request gateway cost, so non-backend time subtracts it. Nil
 	// means "not measured" (the TS backend's fetch exposes no such hook), which
 	// is distinct from measured-and-zero.
 	ConnectMs          *float64 `json:"connectMs"`
 	ConnReused         bool     `json:"connReused"`
 	MeasurementVersion int      `json:"measurementVersion"`
-	// TimingReason is filled by the control plane, which applies the verdict.
-	// The evidence behind that verdict now comes from here — see HealthCell —
-	// but the stamping stays over there, so this is always nil on the wire out
-	// of the worker.
-	TimingReason   *string `json:"timingReason"`
-	BytesReq       int64   `json:"bytesReq"`
+	BytesReq           int64    `json:"bytesReq"`
 	BytesResp      int64   `json:"bytesResp"`
 	ReachedBackend bool    `json:"reachedBackend"`
 	Error          *string `json:"error"`
@@ -50,20 +45,9 @@ type RequestResult struct {
 }
 
 // MeasurementVersion must match MEASUREMENT_VERSION in
-// packages/shared/src/index.ts: the store ignores residuals from any older
-// schema, since measurement 2's overhead is a different quantity.
+// packages/shared/src/index.ts: the store ignores non-backend time from any
+// older schema, since measurement 2's overhead is a different quantity.
 const MeasurementVersion = 3
-
-// BaselineSample is one observation from the direct-to-SUT reference stream:
-// the control arm of the overhead comparison. Mirrors the TS BaselineSample.
-type BaselineSample struct {
-	TS    int64  `json:"ts"`
-	Class string `json:"class"`
-	// ResidualMs is ttfb - serverMs, signed. Negative values are kept: the two
-	// clocks are read at different layers, and dropping the low side would
-	// shift the reference distribution up and understate the gateway.
-	ResidualMs float64 `json:"residualMs"`
-}
 
 // LoadShedSample mirrors the TS LoadShedSample interface: per-minute
 // scheduler accounting flushed alongside the results it explains.
@@ -104,9 +88,9 @@ type AggCell struct {
 	BytesResp      int64   `json:"bytesResp"`
 	// ConnSetups counts requests that opened a connection rather than reusing
 	// one, and ConnSetupSumMs their total acquisition time. Not a correction —
-	// the residual already subtracts acquisition per request — but the evidence
+	// NonBackend* already subtracts acquisition per request — but the evidence
 	// for whether it mattered: a gateway that churns connections shows up here
-	// instead of hiding inside a Δ nobody can explain.
+	// instead of vanishing into a subtraction.
 	// ConnMeasured is what makes the share readable: 0 on a producer that cannot
 	// see connection events, where a bare ConnSetups of 0 would otherwise be
 	// indistinguishable from perfect reuse.
@@ -118,27 +102,12 @@ type AggCell struct {
 	// NonBackend* is time spent anywhere other than the backend, per request:
 	// ttfb − serverMs − connectMs. Every request carrying both clocks
 	// contributes, so it is readable at any percentile over any window, unlike
-	// the two-arm Δ whose control stream was 2% of the load. It includes the
-	// network to the gateway and is not the gateway's processing cost alone.
-	// NonBackendHist is positional over hist.ResidualEdges.
+	// the two-arm Δ it replaced whose control stream was 2% of the load. It
+	// includes the network to the gateway and is not the gateway's processing
+	// cost alone. NonBackendHist is positional over hist.ResidualEdges.
 	NonBackendCount int64   `json:"nonBackendCount"`
 	NonBackendSumMs float64 `json:"nonBackendSumMs"`
 	NonBackendHist  []int64 `json:"nonBackendHist"`
-}
-
-// ResidualCell is one health window's residuals for one class on one arm
-// ("gw" through the gateway, "direct" from the reference stream).
-//
-// Keyed by health window rather than by minute because only the control plane
-// samples local health: shipping at that granularity lets it drop exactly the
-// contaminated windows instead of choosing between a whole minute and a stall.
-type ResidualCell struct {
-	WindowTS int64   `json:"windowTs"`
-	Class    string  `json:"cls"`
-	Path     string  `json:"path"`
-	Count    int64   `json:"count"`
-	SumMs    float64 `json:"sumMs"`
-	Hist     []int64 `json:"hist"`
 }
 
 // RunCell is how many requests a run contributed to a minute — the roll-ups
@@ -154,33 +123,30 @@ type RunCell struct {
 // raw tail for the recent-requests table. Its size is a function of the
 // endpoint and class mix, not of the request rate.
 //
-// Shed accounting and the reference arm ride the same line as the requests they
-// cover, so a window can never commit issued load without the load it failed to
-// issue, or one arm of the overhead comparison without the other.
+// Shed accounting rides the same line as the requests it covers, so a window
+// can never commit issued load without the load it failed to issue.
 type AggBatch struct {
-	BatchID   string           `json:"batchId"`
-	Cells     []AggCell        `json:"cells"`
-	Residuals []ResidualCell   `json:"residuals"`
-	Runs      []RunCell        `json:"runs"`
-	Tail      []RequestResult  `json:"tail"`
-	Shed      []LoadShedSample `json:"shed,omitempty"`
-	// Health is always present, never omitted, even when empty: its absence is
-	// how the control plane recognises a worker too old to report its own
-	// health and falls back to judging windows by its own. An omitempty here
-	// would make a quiet second indistinguishable from an old binary, and the
-	// control plane would silently apply the wrong gate.
+	BatchID string           `json:"batchId"`
+	Cells   []AggCell        `json:"cells"`
+	Runs    []RunCell        `json:"runs"`
+	Tail    []RequestResult  `json:"tail"`
+	Shed    []LoadShedSample `json:"shed,omitempty"`
+	// Health is always present, never omitted, even when empty: an empty array
+	// means the window was quiet, and its absence means the producer cannot see
+	// itself at all. Those are different claims and collapsing them loses the
+	// distinction.
 	Health []HealthCell `json:"health"`
 }
 
 // HealthCell is one health window's evidence about the process that took the
 // measurements, produced by internal/health.
 //
-// This travels with the residual cells for the same window because it is what
-// decides whether they can be trusted. Scheduling latency is the error term
-// that matters here: a response arrives, its goroutine is ready to read the
-// clock, and any delay between those two events is added to the request's
-// measured TTFB without being added to the SUT's self-reported server time —
-// so it lands whole inside the residual and reads as gateway overhead.
+// Scheduling latency is the error term that matters: a response arrives, its
+// goroutine is ready to read the clock, and any delay between those two events
+// is added to the request's measured TTFB without being added to the SUT's
+// self-reported server time — so it lands whole inside non-backend time and
+// reads as gateway cost that never happened. Reported, never used to withhold:
+// the control plane surfaces it in the run's validity verdict.
 type HealthCell struct {
 	WindowTS int64 `json:"windowTs"`
 	// the span actually covered by samples, so an unobserved window is

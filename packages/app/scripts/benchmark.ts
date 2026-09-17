@@ -51,7 +51,7 @@ try {
     cpuSeconds: (used.user + used.system) / 1e6,
     averageCpuCores: (used.user + used.system) / 1e6 / elapsed,
     issuedRps: counters.sent / elapsed, counters,
-    overhead: summary.overheadMs,
+    nonBackend: summary.nonBackendMs,
     note: "Loopback, default mixed workload, fresh disk DB, metrics polling every 5s; excludes external gateway/TLS."
   }, null, 2));
 } finally {

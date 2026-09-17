@@ -1,7 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type {
   AggregateBatch,
-  BaselineSample,
   GwConfig,
   GwTargets,
   LoadProfile,
@@ -19,7 +18,6 @@ import {
   MEASUREMENT_VERSION,
   isGatewayFault,
   isSuccess,
-  referenceRps,
   sanitizeGwTargets,
   sanitizeLoadProfile
 } from "@apigw/shared";
@@ -28,7 +26,6 @@ import {
   buildSpec, bigRequestBytes, type ReqSpec, type SpecContext
 } from "./scenarios.js";
 import { GoWorkerClient, workerBinaryPath, type GoStatusMsg } from "./goClient.js";
-import { filterHealthyResiduals, stampHealthWindows, windowHealth } from "./health.js";
 import { aggregateBatch } from "../metrics/aggregate.js";
 import { expectedAuthHeader } from "../auth.js";
 import { SERVER_MS_HEADER } from "../petstore/server.js";
@@ -112,10 +109,7 @@ function originOf(url: string): string | null {
  * gateway is offered `rps × TICK_MS/1000` arrivals simultaneously and then
  * nothing until the next tick. At the old 20ms that was 100 at once at 5k rps —
  * an impulse train, not an arrival process — and the queueing it caused at the
- * burst front was measured as the gateway's latency. Worse for the overhead Δ:
- * the reference stream runs at 2% of the load and so never bursts, so the
- * self-inflicted queueing landed on the gateway arm alone and was reported as
- * the gateway's cost, growing with the rate.
+ * burst front was measured as the gateway's latency, growing with the rate.
  *
  * 5ms here against 1ms in the Go worker, deliberately. This driver issues every
  * request on the event loop it is also measuring, so a 1ms interval would be
@@ -176,29 +170,6 @@ async function readOrDrain(res: Response, wantBody: boolean): Promise<{ bytes: n
 }
 
 const MAX_SPOOL = 50_000;
-/**
- * Reference observations held before a flush.
- *
- * Generous next to the rate the stream actually runs at — tens of seconds of
- * buffer even at its ceiling — so this only fills when ingest is already
- * wedged, at which point the load's own spool is being shed too. Overflow drops
- * the oldest and is not counted: unlike a lost request measurement, a thinner
- * reference arm is not silent, it shows up directly as `directSamples` in the
- * reported Δ.
- */
-const MAX_REFERENCE_SPOOL = 5_000;
-/**
- * Concurrent reference probes. The reference arm must never queue behind
- * itself: a slow SUT would otherwise accumulate probes whose measured residual
- * is mostly our own backlog, and that inflated reference would be subtracted
- * from the gateway arm — flattering the gateway exactly when things are worst.
- * Hitting this ceiling thins the arm instead, which the Δ reports.
- *
- * Sized off the stream's own rate: the declared share needs 200 probes a second
- * at LIMITS.rps, so the old 64 would have bound on any SUT answering in much
- * over 300ms and thinned the control arm for a reason unrelated to the SUT.
- */
-export const MAX_REFERENCE_INFLIGHT = 256;
 /** how long stop() waits for in-flight requests before giving up on them */
 const DRAIN_TIMEOUT_MS = 10_000;
 const DRAIN_POLL_MS = 250;
@@ -206,9 +177,9 @@ const DRAIN_POLL_MS = 250;
  * How long the Go path waits for the worker's "stopped" ack before ending the
  * run anyway.
  *
- * The worker's own stop is bounded — its request drain and its reference drain
- * each get DrainTimeout — so an ack that has not arrived by now is not late,
- * it is not coming: a wedged flush, a dead child, a lost line. Without this the
+ * The worker's own stop is bounded — its request drain gets DrainTimeout — so an
+ * ack that has not arrived by now is not late, it is not coming: a wedged
+ * flush, a dead child, a lost line. Without this the
  * run sits at "stopping" until the process restarts, and the operator cannot
  * start the next one.
  */
@@ -258,12 +229,11 @@ function readBackend(): LoadgenBackend {
 }
 
 /**
- * In-process load driver. One Driver per app: scheduler, scenario emitters,
- * the direct-to-SUT reference stream (the control arm of the overhead
- * measurement), and batched ingest.
+ * In-process load driver. One Driver per app: scheduler, scenario emitters and
+ * batched ingest.
  * Backend "go" delegates generation to the Go worker process (goClient.ts);
  * this class stays the control plane: config push, run lifecycle, status,
- * health-stamping of incoming batches, ingest.
+ * ingest.
  */
 export class Driver {
   private gw: GwTargets = { rest: { ...defaultGwTargets.rest }, soap: { ...defaultGwTargets.soap } };
@@ -290,11 +260,6 @@ export class Driver {
   private counters: RunCounters = { ...EMPTY_RUN_COUNTERS };
   private ids = new RequestIds();
   private spool: RequestResult[] = [];
-  /** direct-to-SUT reference observations awaiting the next flush */
-  private referenceSpool: BaselineSample[] = [];
-  private referenceTokens = 0;
-  private referenceLastMs: number | null = null;
-  private referenceInFlight = 0;
   /** per-minute scheduler accounting awaiting the next flush */
   private shed = new Map<number, LoadShedSample>();
   /** called when durationMinutes elapses, so the run can be closed out */
@@ -306,7 +271,6 @@ export class Driver {
   private lastThrottleWarnMs = 0;
   private droppedTokens = 0;          // load the cap kept us from issuing, per run
   private errLogBudget = 30; // log first N request errors per run
-  private healthCheck: (from: number, to: number) => string | null = () => "health unavailable";
 
   /** Resolved at construction; tests pin LOADGEN_BACKEND=ts explicitly.
    *  Flips to "ts" if the worker binary is missing or fails to start. */
@@ -315,8 +279,6 @@ export class Driver {
   private goClient: GoWorkerClient | null = null;
   /** last status broadcast from the worker (arrives ~every 10s while running) */
   private goLastStatus: GoStatusMsg | null = null;
-
-  setHealthCheck(check: (from: number, to: number) => string | null): void { this.healthCheck = check; }
 
   private flushing = false;
   private ingestAttempts = 0;
@@ -341,19 +303,18 @@ export class Driver {
    *  and was charged to a few thousand requests */
   private authHeader: string | null = null;
 
-  // Where the SUT answers with no gateway in front of it: the target of the
-  // reference stream. Doubles as "which origin is us", for
-  // forwardBasicAuth: "auto".
-  private baselineUrl = "http://127.0.0.1:8080";
+  // Where the SUT answers with no gateway in front of it. No traffic is sent
+  // here; it is what "which origin is us" means, for forwardBasicAuth: "auto".
+  private sutUrl = "http://127.0.0.1:8080";
 
   private ingestFn: IngestFn | null = null;
 
-  /** Redirect the reference stream (useful in tests and custom setups). Also
-   *  defines "us" for forwardBasicAuth: "auto", so it must be re-resolved. */
-  setBaselineUrl(url: string): void {
-    this.baselineUrl = url.replace(/\/+$/, "");
+  /** Tell the driver where the SUT is. Defines "us" for
+   *  forwardBasicAuth: "auto", so the prefixes must be re-resolved. */
+  setSutUrl(url: string): void {
+    this.sutUrl = url.replace(/\/+$/, "");
     this.refreshUrlPrefixes();
-    this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
+    this.goClient?.configure(this.gw, this.profile, this.sutUrl);
   }
 
   get currentGw(): GwTargets {
@@ -364,18 +325,17 @@ export class Driver {
   setGw(gw: unknown): void {
     this.gw = sanitizeGwTargets(gw, this.gw);
     this.refreshUrlPrefixes();
-    this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
+    this.goClient?.configure(this.gw, this.profile, this.sutUrl);
   }
 
   setProfile(profile: Partial<LoadProfile>): void {
     this.profile = sanitizeLoadProfile({ ...this.profile, ...profile }, this.profile);
-    this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
+    this.goClient?.configure(this.gw, this.profile, this.sutUrl);
   }
 
   /** Lazily create the Go worker control client and wire its events into the
    *  plain Driver surface: batches arrive already rolled up by the worker and
-   *  health-qualified by the client (the same window grouping the ts flush path
-   *  uses, over both arms of the overhead comparison), and land in ingestFn. */
+   *  land in ingestFn. */
   private go(): GoWorkerClient | null {
     if (this.backend !== "go") return null;
     if (workerBinaryPath() === null) {
@@ -408,13 +368,12 @@ export class Driver {
           this.stoppedAt = null;
         }
       });
-      client.setHealthCheck((from, to) => this.healthCheck(from, to));
       void client.ensureStarted().catch((e) => {
         console.error("[driver] go worker failed to start — falling back to ts:", (e as Error).message);
         this.goClient = null;
         this.backend = "ts";
       });
-      client.configure(this.gw, this.profile, this.baselineUrl);
+      client.configure(this.gw, this.profile, this.sutUrl);
       this.goClient = client;
     }
     return this.goClient;
@@ -441,87 +400,11 @@ export class Driver {
   async init(): Promise<void> {
     if (this.go()) {
       // the flush timer exists only for the ts backend: the worker streams its
-      // own batches — reference observations included — and pushes them as
-      // events instead
+      // own batches and pushes them as events instead
       return;
     }
     this.flushTimer = setInterval(() => void this.flush(), FLUSH_MS);
     this.flushTimer.unref?.();
-  }
-
-  /**
-   * Issue this tick's share of the direct-to-SUT reference stream.
-   *
-   * The control arm of the overhead measurement: the same scenario generator,
-   * so the class mix matches the load's by construction, aimed straight at the
-   * SUT. Matching mixes is what makes it legitimate to pool residuals across
-   * classes and still read the difference as the gateway's cost.
-   *
-   * It is paced continuously alongside the load rather than run as a probe
-   * cycle, for three reasons. Its connections stay warm, so it is not measuring
-   * TCP setup the load path has long since amortised. It covers the same
-   * minutes as the traffic it is compared against, so a comparison is never
-   * made across different machine conditions. And it scales with the load, so
-   * it neither perturbs a small run nor runs too thin to support a p99 on a
-   * large one.
-   */
-  private pumpReference(nowMs: number, targetRps: number): void {
-    const rps = referenceRps(targetRps);
-    if (this.referenceLastMs === null) {
-      this.referenceLastMs = nowMs;
-      return;
-    }
-    const dtSec = Math.max(0, (nowMs - this.referenceLastMs) / 1000);
-    this.referenceLastMs = nowMs;
-    this.referenceTokens = Math.min(rps, this.referenceTokens + dtSec * rps);
-    const whole = Math.floor(this.referenceTokens);
-    this.referenceTokens -= whole;
-    const due = Math.min(whole, Math.max(0, MAX_REFERENCE_INFLIGHT - this.referenceInFlight));
-    for (let i = 0; i < due; i++) void this.fireReference();
-  }
-
-  /** One reference observation: same request shape as the load, gateway
-   *  bypassed, residual recorded as measured. */
-  private async fireReference(): Promise<void> {
-    if (this.state !== "running") return;
-    const spec = buildSpec(this.profile, this.ctx);
-    const ac = new AbortController();
-    const timeout = setTimeout(() => ac.abort(), requestBudgetMs(spec));
-    this.activeRequests.add(ac);
-    this.referenceInFlight++;
-    const started = Date.now();
-    const t0 = performance.now();
-    try {
-      const headers: Record<string, string> = { ...spec.headers };
-      // straight to the SUT, so this rig's own credential is the right one and
-      // the gateway's API key is not
-      const auth = expectedAuthHeader();
-      if (auth) headers["authorization"] = auth.toString("utf-8");
-      const res = await fetch(`${this.baselineUrl}${spec.path}`, {
-        method: spec.method, headers, body: spec.body, signal: ac.signal
-      });
-      const ttfbMs = performance.now() - t0;
-      const serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
-      await readOrDrain(res, false);
-      // no backend clock means no residual — the same rule the gateway arm is
-      // held to, so neither side is filtered more leniently than the other
-      if (serverMs === null) return;
-      this.recordReference({ ts: started, class: spec.class, residualMs: ttfbMs - serverMs });
-    } catch {
-      // a reference probe that never answered contributes nothing; it is not
-      // an error of the gateway's and must not be reported as one
-    } finally {
-      clearTimeout(timeout);
-      this.activeRequests.delete(ac);
-      this.referenceInFlight--;
-    }
-  }
-
-  private recordReference(s: BaselineSample): void {
-    if (this.referenceSpool.length >= MAX_REFERENCE_SPOOL) {
-      this.referenceSpool.splice(0, Math.ceil(MAX_REFERENCE_SPOOL / 10));
-    }
-    this.referenceSpool.push(s);
   }
 
   start(runId: string): { ok: true; runId: string } {
@@ -531,7 +414,7 @@ export class Driver {
       // a stop still waiting on its ack is superseded by this run
       if (this.goStopTimer) { clearTimeout(this.goStopTimer); this.goStopTimer = null; }
       void goClient.ensureStarted().then(() => {
-        goClient.configure(this.gw, this.profile, this.baselineUrl);
+        goClient.configure(this.gw, this.profile, this.sutUrl);
         goClient.start(runId);
       });
       this.state = "running";
@@ -575,9 +458,6 @@ export class Driver {
     this.lastThrottleWarnMs = 0;
     this.droppedTokens = 0;
     this.shed.clear();
-    this.referenceSpool.length = 0;
-    this.referenceTokens = 0;
-    this.referenceLastMs = null;
     this.refreshUrlPrefixes();
     // the creds are constant for the run; refresh them here instead of per request
     this.authHeader = expectedAuthHeader()?.toString("utf-8") ?? null;
@@ -603,7 +483,7 @@ export class Driver {
     // hand it the dashboard credential. Say so once per run rather than doing
     // it silently.
     for (const side of ["rest", "soap"] as const) {
-      if (this.forwardAuth[side] && originOf(this.gw[side].baseUrl) !== originOf(this.baselineUrl)) {
+      if (this.forwardAuth[side] && originOf(this.gw[side].baseUrl) !== originOf(this.sutUrl)) {
         console.warn(
           `[driver] forwarding this rig's Basic credential to the external ${side.toUpperCase()} target` +
           ` ${this.gw[side].baseUrl} (forwardBasicAuth="${this.gw[side].forwardBasicAuth}")`
@@ -689,9 +569,6 @@ export class Driver {
     const { due, targetRps, missed } = this.bucket.tick(now, this.profile, this.startedAt);
     this.targetRps = targetRps;
     this.noteSchedulerTick(now, targetRps);
-    // the reference arm is paced off the same tick as the load, so the two
-    // distributions always cover the same moments
-    this.pumpReference(now, targetRps);
     const headroom = Math.max(0, this.effectiveMaxConcurrency - this.inFlight);
     const cap = Math.min(due, headroom);
     const dropped = due - cap + (missed ?? 0);
@@ -868,13 +745,11 @@ export class Driver {
 
     const latencyMs = performance.now() - timerStarted;
 
-    // TTFB and the SUT's own time are both recorded raw. The residual between
-    // them — everything that was not the backend — is what the store compares
-    // against the reference stream. Deliberately not reduced to a single
-    // "overhead" number here: a per-request overhead would need a direct call
-    // this request never made, and inventing one from a running median is what
-    // the previous measurement did. Body transfer after headers stays out of
-    // it, and in total latency, where it belongs.
+    // TTFB and the SUT's own time are both recorded raw, and the store reads
+    // the gap between them as this request's non-backend time. Recorded as two
+    // clocks rather than one derived number so the derivation stays in one
+    // place and stays inspectable. Body transfer after headers is not in TTFB;
+    // it is in total latency, where it belongs.
     this.record({
       runId,
       requestId,
@@ -889,12 +764,11 @@ export class Driver {
       serverMs,
       // Null, not 0: `fetch` exposes no connection-level hook, so this driver
       // genuinely cannot tell a pool hit from a fresh TLS handshake. Claiming
-      // zero would let the residual subtract a setup cost it never measured.
-      // Both arms are equally blind here, so the Δ stays internally consistent
-      // — it just carries setup on both sides. The Go worker uses httptrace and
+      // zero would let non-backend time subtract a setup cost it never
+      // measured; null leaves the handshake inside the number, which is at
+      // least honest about what was observed. The Go worker uses httptrace and
       // does separate them, which is one more reason it is the default.
       connectMs: null,
-      timingReason: null,
       measurementVersion: MEASUREMENT_VERSION,
       bytesReq: spec.class === "big-request" ? bigRequestBytes(spec.body) : Buffer.byteLength(spec.body ?? ""),
       bytesResp,
@@ -955,27 +829,17 @@ export class Driver {
     // scheduler accounting must flush even with no results: a fully throttled
     // tick issues nothing, and that is precisely the case worth recording
     const shed = this.takeShed(final);
-    if (this.spool.length === 0 && shed.length === 0 && this.referenceSpool.length === 0) return;
+    if (this.spool.length === 0 && shed.length === 0) return;
     if (!this.ingestFn) {
       this.restoreShed(shed); // metrics module not wired yet
       return;
     }
     this.flushing = true;
     const chunk = this.spool.splice(0, this.spool.length);
-    const baseline = this.referenceSpool.splice(0, this.referenceSpool.length);
-    // One verdict source for the whole flush, so a row and its own residual can
-    // never be judged differently at the window boundary.
-    const health = windowHealth(this.healthCheck);
-    if (chunk.length > 0) stampHealthWindows(chunk, health);
     // Roll up here rather than shipping every result: what crosses into the
-    // store is then a few dozen cells plus a capped tail regardless of the rate,
-    // instead of one object per request on the event loop whose stalls are the
-    // very thing this rig withholds measurements over.
-    const batch = aggregateBatch({ batchId: randomUUID(), results: chunk, shed, baseline });
-    // both arms are filtered by the same health rule: keeping contaminated
-    // reference samples while withholding contaminated gateway ones would
-    // shift the reference up and understate the gateway by our own stalls
-    batch.residuals = filterHealthyResiduals(batch.residuals, health);
+    // store is then a few dozen cells plus a capped tail regardless of the
+    // rate, instead of one object per request on the event loop.
+    const batch = aggregateBatch({ batchId: randomUUID(), results: chunk, shed });
     try {
       await this.ingestFn(batch);
       this.ingestAttempts = 0;
@@ -998,9 +862,6 @@ export class Driver {
           this.spool = this.spool.slice(lost);
           this.noteResultsLost(lost);
         }
-        // the reference arm goes back too: retrying the gateway arm without it
-        // would leave that minute's Δ comparing full traffic against a gap
-        this.referenceSpool = baseline.concat(this.referenceSpool).slice(-MAX_REFERENCE_SPOOL);
         this.restoreShed(shed);
       }
     } finally {
@@ -1099,7 +960,7 @@ export class Driver {
 
   /** True when this target is our own origin — no gateway in the path. */
   private isSelf(target: GwConfig): boolean {
-    const self = originOf(this.baselineUrl);
+    const self = originOf(this.sutUrl);
     const theirs = originOf(target.baseUrl);
     return self !== null && theirs !== null && self === theirs;
   }

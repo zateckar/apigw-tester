@@ -26,13 +26,12 @@ type Message struct {
 
 // envelope is the on-the-wire union of all control messages.
 type envelope struct {
-	Op          string           `json:"op"`
-	Gw          config.GwTargets `json:"gw"`
-	Profile     json.RawMessage  `json:"profile"`
-	BaselineURL string           `json:"baselineUrl"`
-	SelfOrigin  string           `json:"selfOrigin"`
-	BasicAuth   string           `json:"basicAuth"`
-	RunID       string           `json:"runId"`
+	Op         string           `json:"op"`
+	Gw         config.GwTargets `json:"gw"`
+	Profile    json.RawMessage  `json:"profile"`
+	SelfOrigin string           `json:"selfOrigin"`
+	BasicAuth  string           `json:"basicAuth"`
+	RunID      string           `json:"runId"`
 }
 
 // Handler receives decoded control messages. Returning an error stops the
@@ -77,11 +76,10 @@ func ReadLines(r io.Reader, h Handler) error {
 				}
 			}
 			cfg := &config.Configure{
-				Gw:          env.Gw,
-				Profile:     p,
-				BaselineURL: env.BaselineURL,
-				SelfOrigin:  env.SelfOrigin,
-				BasicAuth:   env.BasicAuth,
+				Gw:         env.Gw,
+				Profile:    p,
+				SelfOrigin: env.SelfOrigin,
+				BasicAuth:  env.BasicAuth,
 			}
 			if err := h.Handle(Message{Op: "configure", Configure: cfg}); err != nil {
 				return err

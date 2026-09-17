@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import {
-  HEALTH_WINDOW_MS,
   HISTOGRAM_EDGES_MS,
   MEASUREMENT_VERSION,
   RAW_TAIL_PER_FLUSH,
@@ -18,7 +17,7 @@ function mk(over: Partial<RequestResult> = {}): RequestResult {
     runId: "r1", requestId: `req${++seq}`, ts: 1_800_000_000_000, protocol: "rest",
     endpoint: "GET /api/pets", class: "small-rest", method: "GET", status: 200,
     latencyMs: 100, ttfbMs: 40, serverMs: 10,
-    measurementVersion: MEASUREMENT_VERSION, timingReason: null,
+    measurementVersion: MEASUREMENT_VERSION,
     bytesReq: 10, bytesResp: 100, reachedBackend: true, error: null,
     ...over
   };
@@ -71,56 +70,63 @@ describe("source-side aggregation", () => {
     expect(c.statusHist).toHaveLength(STATUS_BUCKETS.length);
   });
 
-  it("keys residuals by health window, not by minute", () => {
-    // the control plane withholds contaminated windows. At minute grain that
-    // choice would be between discarding a whole minute and keeping a stall.
+  it("carries non-backend time in the same cell as everything else", () => {
+    // In the cell rather than in a table of its own, which is what makes it
+    // readable per endpoint, per class and per minute off the same rows the
+    // latency numbers come from.
     const t = 1_800_000_000_000;
     const agg = aggregateBatch({
       batchId: "b3",
-      results: [mk({ ts: t }), mk({ ts: t + HEALTH_WINDOW_MS })]
+      results: [mk({ ts: t }), mk({ ts: t + 1_000 })]
     });
-    const gw = agg.residuals.filter((r) => r.path === "gw").map((r) => r.windowTs).sort();
-    expect(gw).toEqual([t, t + HEALTH_WINDOW_MS]);
-    expect(agg.residuals[0]!.hist).toHaveLength(RESIDUAL_EDGES_MS.length + 1);
+    const c = agg.cells[0]!;
+    expect(c.nonBackendCount).toBe(2);
+    expect(c.nonBackendSumMs).toBe(60);
+    expect(c.nonBackendHist).toHaveLength(RESIDUAL_EDGES_MS.length + 1);
+    expect(total(c.nonBackendHist)).toBe(2);
   });
 
-  it("admits a residual only when both clocks are present and the schema matches", () => {
+  it("measures non-backend time only when both clocks are present and the schema matches", () => {
     const agg = aggregateBatch({
       batchId: "b4",
       results: [
-        mk(),                                              // counted
-        mk({ serverMs: null }),                            // gateway answered it
-        mk({ ttfbMs: null }),                              // no headers arrived
-        mk({ timingReason: "local event-loop stall" }),    // generator unwell
-        mk({ measurementVersion: 2 })                      // a different quantity
-      ],
-      baseline: [{ ts: 1_800_000_000_000, class: "small-rest", residualMs: 0.25 }]
+        mk(),                           // measured
+        mk({ serverMs: null }),         // gateway answered it
+        mk({ ttfbMs: null }),           // no headers arrived
+        mk({ measurementVersion: 2 })   // a different quantity
+      ]
     });
-    const gw = agg.residuals.filter((r) => r.path === "gw");
-    expect(gw).toHaveLength(1);
-    expect(gw[0]!.count).toBe(1);
-    expect(gw[0]!.sumMs).toBe(30);
-    // the direct arm rides the same batch, so a window's two distributions
-    // always commit over matching time
-    const direct = agg.residuals.filter((r) => r.path === "direct");
-    expect(direct).toHaveLength(1);
-    expect(direct[0]!.sumMs).toBe(0.25);
-    // and all five requests still count toward throughput and latency
-    expect(agg.cells[0]!.count).toBe(5);
+    const c = agg.cells[0]!;
+    expect(c.nonBackendCount).toBe(1);
+    expect(c.nonBackendSumMs).toBe(30);
+    // and all four requests still count toward throughput and latency
+    expect(c.count).toBe(4);
   });
 
-  it("takes connection acquisition out of the residual", () => {
+  it("keeps a negative non-backend time rather than flooring it", () => {
+    // the two clocks are read at different layers, so a fast local hop lands
+    // slightly below zero; clamping those lifts every percentile above them
+    const agg = aggregateBatch({
+      batchId: "b4n",
+      results: [mk({ ttfbMs: 9.75, serverMs: 10 })]
+    });
+    const c = agg.cells[0]!;
+    expect(c.nonBackendCount).toBe(1);
+    expect(c.nonBackendSumMs).toBeCloseTo(-0.25, 10);
+    expect(total(c.nonBackendHist)).toBe(1);
+  });
+
+  it("takes connection acquisition out of non-backend time", () => {
     // a DNS lookup, a TCP handshake and a TLS handshake all sit inside ttfb and
     // none of them is per-request gateway cost. Left in, a gateway is charged
-    // for every connection the pool failed to keep — and the reference stream,
-    // running a near-idle pool of its own, pays that on a different schedule
-    // entirely, so the difference would land squarely in the Δ.
+    // for every connection the pool failed to keep — a real cost, but one that
+    // belongs in connSetups where it can be read on its own.
     const agg = aggregateBatch({
       batchId: "c1",
       results: [mk({ ttfbMs: 40, serverMs: 10, connectMs: 12, connReused: false })]
     });
-    expect(agg.residuals[0]!.sumMs).toBe(18);
     const c = agg.cells[0]!;
+    expect(c.nonBackendSumMs).toBe(18);
     expect(c.connSetups).toBe(1);
     expect(c.connSetupSumMs).toBe(12);
     expect(c.connMeasured).toBe(1);
@@ -128,13 +134,13 @@ describe("source-side aggregation", () => {
 
   it("counts a pool hit as measured but not as a setup", () => {
     // a hit that waited on the pool waited on *us*, so its cost still comes off
-    // the residual — it is simply not evidence of the gateway churning sockets
+    // the number — it is simply not evidence of the gateway churning sockets
     const agg = aggregateBatch({
       batchId: "c2",
       results: [mk({ ttfbMs: 40, serverMs: 10, connectMs: 0.05, connReused: true })]
     });
-    expect(agg.residuals[0]!.sumMs).toBeCloseTo(29.95, 10);
     const c = agg.cells[0]!;
+    expect(c.nonBackendSumMs).toBeCloseTo(29.95, 10);
     expect(c.connMeasured).toBe(1);
     expect(c.connSetups).toBe(0);
     expect(c.connSetupSumMs).toBe(0);
@@ -148,7 +154,7 @@ describe("source-side aggregation", () => {
       batchId: "c3",
       results: [mk({ ttfbMs: 40, serverMs: 10, connectMs: null })]
     });
-    expect(agg.residuals[0]!.sumMs).toBe(30);
+    expect(agg.cells[0]!.nonBackendSumMs).toBe(30);
     expect(agg.cells[0]!.connMeasured).toBe(0);
     expect(agg.cells[0]!.connSetups).toBe(0);
   });

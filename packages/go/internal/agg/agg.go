@@ -2,34 +2,21 @@
 // stores, so the wire payload stops scaling with the request rate.
 //
 // Shipping one JSON object per request put the cost of every request on the
-// control plane's event loop three times over — parse, health-stamp, structured
-// clone into the metrics thread — and the control plane withholds measurements
-// precisely when its event loop stalls. At 10k rps that is a rig disqualifying
-// its own windows. The worker already visits every result once on its flush
-// goroutine; folding them here costs that same visit and ships a few dozen
-// cells instead of ten thousand objects.
-//
-// Residual cells are keyed by health window and held back until that window has
-// closed. The verdict on a window is formed from this process's own scheduling
-// health (see internal/health) and travels in the same batch, so a residual and
-// the evidence about whether to trust it are never separated — and a window is
-// never judged while it could still turn out to contain a stall.
+// control plane's event loop three times over — parse, stamp, structured clone
+// into the metrics thread — at the very moment that loop is busiest. At 10k rps
+// that is the rig degrading its own measurements. The worker already visits
+// every result once on its flush goroutine; folding them here costs that same
+// visit and ships a few dozen cells instead of ten thousand objects.
 package agg
 
 import (
 	"sort"
-	"time"
 
 	"github.com/apigw-tester/go/internal/hist"
 	"github.com/apigw-tester/go/internal/wire"
 )
 
 const minuteMS = 60_000
-
-// HealthWindowMS mirrors HEALTH_WINDOW_MS in packages/shared/src/index.ts: the
-// cadence the control plane samples local health at, and therefore the finest
-// interval a residual can be qualified against.
-const HealthWindowMS = 2_000
 
 // TailPerFlush mirrors RAW_TAIL_PER_FLUSH. The recent-requests table shows a
 // few hundred rows; everything above this is written, indexed, retained and
@@ -40,12 +27,10 @@ const TailPerFlush = 200
 // owned by the flush goroutine, which is single-threaded by construction, and
 // a mutex here would put lock contention on the one path that must not stall.
 type Aggregator struct {
-	cells     map[cellKey]*wire.AggCell
-	residuals map[residualKey]*wire.ResidualCell
-	runs      map[runKey]*wire.RunCell
-	notable   []wire.RequestResult
-	plain     []wire.RequestResult
-	nowMS     func() int64
+	cells   map[cellKey]*wire.AggCell
+	runs    map[runKey]*wire.RunCell
+	notable []wire.RequestResult
+	plain   []wire.RequestResult
 }
 
 type cellKey struct {
@@ -55,30 +40,15 @@ type cellKey struct {
 	class    string
 }
 
-type residualKey struct {
-	windowTS int64
-	class    string
-	path     string
-}
-
 type runKey struct {
 	bucketTS int64
 	runID    string
 }
 
 func New() *Aggregator {
-	return NewWithClock(func() int64 { return time.Now().UnixMilli() })
-}
-
-// NewWithClock is New with an injectable clock. Residual release depends on
-// wall time, so a test that cannot move the clock can only assert on the
-// present.
-func NewWithClock(nowMS func() int64) *Aggregator {
 	return &Aggregator{
-		cells:     make(map[cellKey]*wire.AggCell, 64),
-		residuals: make(map[residualKey]*wire.ResidualCell, 32),
-		runs:      make(map[runKey]*wire.RunCell, 4),
-		nowMS:     nowMS,
+		cells: make(map[cellKey]*wire.AggCell, 64),
+		runs:  make(map[runKey]*wire.RunCell, 4),
 	}
 }
 
@@ -167,8 +137,6 @@ func (a *Aggregator) Add(r *wire.RequestResult) {
 		c.NonBackendCount++
 		c.NonBackendSumMs += nonBackend
 		hist.Add(c.NonBackendHist, hist.ResidualEdges, nonBackend)
-		// the gateway arm of the two-arm Δ, same quantity at a coarser key
-		a.addResidual(r.TS, r.Class, "gw", nonBackend)
 	}
 
 	if notable(r) {
@@ -190,26 +158,6 @@ func (a *Aggregator) Add(r *wire.RequestResult) {
 // display of what is happening, not a measurement; every number that is a
 // measurement comes from the cells, which stay exact.
 const tailReservoir = 4 * TailPerFlush
-
-// AddDirect folds in one reference observation — the control arm, deliberately
-// outside the cells and therefore outside every rate, status and contract
-// number this run reports.
-func (a *Aggregator) AddDirect(s wire.BaselineSample) {
-	a.addResidual(s.TS, s.Class, "direct", s.ResidualMs)
-}
-
-func (a *Aggregator) addResidual(ts int64, class, path string, ms float64) {
-	windowTS := ts / HealthWindowMS * HealthWindowMS
-	k := residualKey{windowTS, class, path}
-	b := a.residuals[k]
-	if b == nil {
-		b = &wire.ResidualCell{WindowTS: windowTS, Class: class, Path: path, Hist: hist.NewResidual()}
-		a.residuals[k] = b
-	}
-	b.Count++
-	b.SumMs += ms
-	hist.Add(b.Hist, hist.ResidualEdges, ms)
-}
 
 // notable marks the rows worth keeping in the tail whatever the rate: anything
 // that failed, and the classes rare enough that uniform sampling erases them.
@@ -237,38 +185,24 @@ func spread(items []wire.RequestResult, take int) []wire.RequestResult {
 
 // Empty reports whether anything has been folded in since the last drain.
 func (a *Aggregator) Empty() bool {
-	return len(a.cells) == 0 && len(a.residuals) == 0
+	return len(a.cells) == 0
 }
 
 // Drain returns everything accumulated and resets. Failures and the rarer
 // classes fill the tail first — they are what anyone opens the recent-requests
 // table to look at — and ordinary traffic takes whatever is left, so a healthy
 // run still shows a timeline.
+//
+// Nothing is held back. Residual cells used to wait here until their health
+// window closed, so the control plane could drop the ones taken while this
+// process was stalled; that filter is gone, and with it every reason for a
+// measurement to sit in memory waiting to be judged.
 func (a *Aggregator) Drain(batchID string, shed []wire.LoadShedSample) *wire.AggBatch {
-	return a.DrainAt(batchID, shed, a.nowMS())
-}
-
-// DrainAt is Drain against a caller-supplied clock reading, so the health
-// sampler can be drained against the same instant. Two separate readings can
-// straddle a window boundary, releasing residuals whose health cell is still
-// held — and those residuals would then be dropped for want of evidence.
-func (a *Aggregator) DrainAt(batchID string, shed []wire.LoadShedSample, nowMS int64) *wire.AggBatch {
-	return a.drain(batchID, shed, false, nowMS)
-}
-
-// DrainAll is Drain without the closed-window rule, for shutdown: holding a
-// window back there means losing it rather than qualifying it later.
-func (a *Aggregator) DrainAll(batchID string, shed []wire.LoadShedSample) *wire.AggBatch {
-	return a.drain(batchID, shed, true, a.nowMS())
-}
-
-func (a *Aggregator) drain(batchID string, shed []wire.LoadShedSample, releaseOpen bool, now int64) *wire.AggBatch {
 	b := &wire.AggBatch{
-		BatchID:   batchID,
-		Cells:     make([]wire.AggCell, 0, len(a.cells)),
-		Residuals: make([]wire.ResidualCell, 0, len(a.residuals)),
-		Runs:      make([]wire.RunCell, 0, len(a.runs)),
-		Shed:      shed,
+		BatchID: batchID,
+		Cells:   make([]wire.AggCell, 0, len(a.cells)),
+		Runs:    make([]wire.RunCell, 0, len(a.runs)),
+		Shed:    shed,
 	}
 	for _, c := range a.cells {
 		b.Cells = append(b.Cells, *c)
@@ -277,26 +211,12 @@ func (a *Aggregator) drain(batchID string, shed []wire.LoadShedSample, releaseOp
 		b.Runs = append(b.Runs, *r)
 	}
 
-	// Throughput, status and latency describe what the run delivered and ship
-	// immediately. Only residuals wait: they are the one output whose validity
-	// depends on how this process was scheduled, and that is not known until
-	// the window they belong to has closed.
-	held := make(map[residualKey]*wire.ResidualCell, len(a.residuals))
-	for k, r := range a.residuals {
-		if releaseOpen || r.WindowTS+HealthWindowMS <= now {
-			b.Residuals = append(b.Residuals, *r)
-		} else {
-			held[k] = r
-		}
-	}
-
 	tail := spread(a.notable, TailPerFlush)
 	b.Tail = append(make([]wire.RequestResult, 0, TailPerFlush), tail...)
 	b.Tail = append(b.Tail, spread(a.plain, TailPerFlush-len(tail))...)
 	sort.Slice(b.Tail, func(i, j int) bool { return b.Tail[i].TS < b.Tail[j].TS })
 
 	a.cells = make(map[cellKey]*wire.AggCell, len(a.cells))
-	a.residuals = held
 	a.runs = make(map[runKey]*wire.RunCell, len(a.runs))
 	a.notable = a.notable[:0]
 	a.plain = a.plain[:0]

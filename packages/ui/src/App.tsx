@@ -313,39 +313,41 @@ export default function App() {
           className="kpi"
           style={{ borderColor: "var(--accent)" }}
           title={
-            "The 95th percentile of ttfb − serverMs for traffic through the gateway, minus the 95th percentile of " +
-            "the same quantity for a reference stream sent straight to the backend over the same minutes in the " +
-            "same scenario mix. It is a difference between two distributions, not a per-request overhead: no " +
-            "request here was ever sent both ways. A negative value means the two differ by less than this rig " +
-            "can resolve. Connection setup is measured per request and subtracted from both sides, so a gateway " +
-            "is not charged here for handshakes — see the reuse line below for whether it caused any."
+            "ttfb − serverMs − connectMs, measured on every request that came back carrying the backend's own " +
+            "X-Server-Ms header, read at the 95th percentile. It is everything the request spent outside the " +
+            "backend: the gateway's work AND the network to it and back. It is not the gateway's processing cost " +
+            "on its own — nothing in a single stream can separate those — so read it as a ceiling on what the " +
+            "gateway costs. Connection setup is measured per request and taken out, so a gateway is not charged " +
+            "here for handshakes; see the reuse line below for whether it caused any. A negative value means the " +
+            "two clocks differ by less than this rig can resolve, and is reported rather than floored at zero."
           }
         >
-          <div className="label">Added TTFB vs direct, p95 ({range.label})</div>
+          <div className="label">Non-backend time, p95 ({range.label})</div>
           <div className="value" style={{ color: "var(--accent)" }}>
-            {stat(summary?.overheadMs.p95, fmtMs)}
+            {stat(summary?.nonBackendMs.p95, fmtMs)}
           </div>
           <div className="sub">
             {noGateway
               ? "no gateway configured — this is loopback slop"
-              : `p50 ${stat(summary?.overheadMs.p50, fmtMs)} · p99 ${stat(summary?.overheadMs.p99, fmtMs)}`}
+              : `p50 ${stat(summary?.nonBackendMs.p50, fmtMs)} · p90 ${stat(summary?.nonBackendMs.p90, fmtMs)} · p99 ${stat(summary?.nonBackendMs.p99, fmtMs)}`}
           </div>
           <div className="sub">
-            Small REST, concurrency and SOAP: {(summary?.overheadMs.gwSamples ?? 0).toLocaleString()} through GW
-            {" vs "}{(summary?.overheadMs.directSamples ?? 0).toLocaleString()} direct
+            {(summary?.nonBackendMs.count ?? 0).toLocaleString()} of {(summary?.total ?? 0).toLocaleString()} requests
+            {" measured"}
+            {summary != null && summary.total > 0 && summary.nonBackendMs.count === 0 &&
+              " — no response carried X-Server-Ms, so there is no backend time to subtract"}
           </div>
-          {summary?.overheadMs.unavailable != null && (
-            <div className="sub">{summary.overheadMs.unavailable}</div>
-          )}
+          {/* the per-class table below is the number to compare between runs:
+              this tile pools every class, so it moves with the scenario mix */}
           {summary != null && summary.connSetup.measured > 0 && (
             <div
               className="sub"
               style={{ color: (summary.connSetup.pct ?? 0) > 5 ? "var(--err)" : undefined }}
               title={
                 "Requests that had to open a connection rather than reuse a pooled one. This cost is measured " +
-                "per request and taken out of the added-TTFB figure above, so it is reported here instead of " +
-                "inflating that number. A high share against a real gateway means it is refusing or capping " +
-                "keep-alive, which every caller pays for in handshakes."
+                "per request and taken out of the figure above, so it is reported here instead of inflating " +
+                "that number. A high share against a real gateway means it is refusing or capping keep-alive, " +
+                "which every caller pays for in handshakes."
               }
             >
               {(100 - (summary.connSetup.pct ?? 0)).toFixed(1)}% connections reused
@@ -511,7 +513,7 @@ export default function App() {
       {/* ---------- Charts grid ---------- */}
       <div className="grid-2">
         <div className="section">
-          <h2>Added TTFB vs direct — small REST, concurrency and SOAP</h2>
+          <h2>Non-backend time — ttfb − serverMs − connectMs, all traffic</h2>
           <Panel height={240}>
             {({ width, height }) => (
               <AreaChart width={width} height={height} data={points}>
@@ -520,9 +522,9 @@ export default function App() {
                 <YAxis stroke="#8b949e" fontSize={11} />
                 <Tooltip contentStyle={{ background: "#161b22", border: "1px solid #2d333b" }} formatter={(v: number) => fmtMs(v)} />
                 <Legend />
-                <Area type="monotone" dataKey="overheadP50" stroke="#3fb950" fillOpacity={0.12} fill="#3fb950" name="p50" />
-                <Area type="monotone" dataKey="overheadP95" stroke="#d29922" fillOpacity={0.15} fill="#d29922" name="p95" />
-                <Area type="monotone" dataKey="overheadP99" stroke="#f85149" fillOpacity={0.12} fill="#f85149" name="p99" />
+                <Area type="monotone" dataKey="nonBackendP50" stroke="#3fb950" fillOpacity={0.12} fill="#3fb950" name="p50" />
+                <Area type="monotone" dataKey="nonBackendP95" stroke="#d29922" fillOpacity={0.15} fill="#d29922" name="p95" />
+                <Area type="monotone" dataKey="nonBackendP99" stroke="#f85149" fillOpacity={0.12} fill="#f85149" name="p99" />
               </AreaChart>
             )}
           </Panel>
@@ -705,8 +707,8 @@ export default function App() {
             <tr>
               <th>Class</th><th>Calls</th><th>Err %</th><th>4xx</th><th>GW faults</th>
               <th>Latency p50</th><th>Latency p95</th><th>Latency p99</th>
-              <th className="accent" title="Difference against the direct reference stream restricted to this same class, at matched percentiles.">Δ vs direct p50</th>
-              <th className="accent">Δ p95</th><th className="accent">Δ p99</th><th className="accent">Δ mean</th>
+              <th className="accent" title="ttfb − serverMs − connectMs for this class alone: everything the request spent outside the backend, network included. This is the number to compare between runs — unlike the headline tile, it is not diluted by the profile's class mix.">Non-backend p50</th>
+              <th className="accent">p95</th><th className="accent">p99</th><th className="accent">mean</th>
               <th>avg req</th><th>avg resp</th>
             </tr>
           </thead>
@@ -726,12 +728,12 @@ export default function App() {
                 <td>{fmtMs(c.latencyMs.p50)}</td>
                 <td>{fmtMs(c.latencyMs.p95)}</td>
                 <td>{fmtMs(c.latencyMs.p99)}</td>
-                <td className="accent-cell">{fmtMs(c.overheadMs.p50)}</td>
-                <td className="accent-cell">{fmtMs(c.overheadMs.p95)}</td>
-                <td className="accent-cell">{fmtMs(c.overheadMs.p99)}</td>
-                <td className="accent-cell" title={c.overheadMs.unavailable ?? undefined}>
-                  {fmtMs(c.overheadMs.avg)}
-                  <small className="hint"> · {c.overheadMs.gwSamples.toLocaleString()} vs {c.overheadMs.directSamples.toLocaleString()} direct</small>
+                <td className="accent-cell">{fmtMs(c.nonBackendMs.p50)}</td>
+                <td className="accent-cell">{fmtMs(c.nonBackendMs.p95)}</td>
+                <td className="accent-cell">{fmtMs(c.nonBackendMs.p99)}</td>
+                <td className="accent-cell">
+                  {fmtMs(c.nonBackendMs.avg)}
+                  <small className="hint"> · {c.nonBackendMs.count.toLocaleString()} of {c.total.toLocaleString()} measured</small>
                 </td>
                 <td>{fmtBytes(c.avgBytesReq)}</td>
                 <td>{fmtBytes(c.avgBytesResp)}</td>
@@ -792,7 +794,7 @@ export default function App() {
             <tr>
               <th>Time</th><th>Request id</th><th>Proto</th><th>Method</th><th>Endpoint</th>
               <th>Status</th><th>Answered by</th><th>Latency</th><th>TTFB</th><th>Body</th>
-              <th title="ttfb − serverMs: everything that was not the backend, for this one request. Not the gateway's cost on its own — it also carries the hop to the gateway and back. The headline figure compares this against the same quantity measured straight to the backend.">Residual</th>
+              <th title="ttfb − serverMs for this one request: everything that was not the backend. Not the gateway's cost on its own — it also carries the hop to the gateway and back. This is the raw pair of clocks; the headline figure additionally subtracts each request's connection setup, which is not recorded on this row.">Non-backend</th>
               <th>Resp</th><th>Error</th>
             </tr>
           </thead>
@@ -819,9 +821,8 @@ export default function App() {
                 <td>{fmtMs(r.latencyMs)}</td>
                 <td>{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(r.ttfbMs)}</td>
                 <td className="hint">{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(Math.max(0, r.latencyMs - r.ttfbMs))}</td>
-                <td title={r.timingReason ?? (r.serverMs == null ? "no backend timing on this response" : undefined)}>
+                <td title={r.serverMs == null ? "no backend timing on this response" : undefined}>
                   {r.ttfbMs == null || r.serverMs == null ? "—" : fmtMs(r.ttfbMs - r.serverMs)}
-                  {r.timingReason && <small className="hint"> {r.timingReason}</small>}
                 </td>
                 <td>{fmtBytes(r.bytesResp)}</td>
                 <td className="hint">{r.error ?? ""}</td>

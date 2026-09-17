@@ -16,7 +16,7 @@ function summary(over: Partial<MetricSummary> = {}): MetricSummary {
     windowSec: 600, total: 1000, errors: 0, errorPct: 0,
     unexpectedFailures: 0, unexpectedFailurePct: 0, rps: 1.7,
     latencyMs: { p50: 10, p90: 20, p95: 25, p99: 40, avg: 12, max: 90 },
-    overheadMs: { p50: 2, p90: 5, p95: 6, p99: 9, avg: 3, gwSamples: 900, directSamples: 400, unavailable: null },
+    nonBackendMs: { p50: 2, p90: 5, p95: 6, p99: 9, avg: 3, count: 1000 },
     connSetup: { setups: 12, measured: 1000, pct: 1.2, avgMs: 4 },
     bytes: { req: 1, resp: 1, respPerSec: 1 },
     status: {
@@ -114,7 +114,7 @@ describe("run verdict", () => {
     // a green tick that checked nothing is worse than an honest shrug
     const r = build({
       slo: {
-        maxOverheadP95Ms: null, maxUnexpectedFailurePct: null,
+        maxNonBackendP95Ms: null, maxUnexpectedFailurePct: null,
         maxLeakedToBackend: null, maxGatewayErrorPct: null, requirePolicies: false
       }
     });
@@ -201,23 +201,19 @@ describe("report rendering", () => {
 });
 
 
-it("cannot pass overhead acceptance without a Δ to judge", () => {
-  // A thin reference arm leaves p95 null. Treating "we could not measure it" as
-  // "it was within budget" is the one failure mode an acceptance gate must not
-  // have, so the verdict is inconclusive and says which side ran out.
+it("cannot pass non-backend acceptance when nothing carried a backend clock", () => {
+  // A gateway that strips X-Server-Ms, or answers everything itself, leaves
+  // p95 null. Treating "we could not measure it" as "it was within budget" is
+  // the one failure mode an acceptance gate must not have, so the verdict is
+  // inconclusive and says what was missing.
   const report = buildRunReport({
-    run: { id: 1, runId: "thin", startedAt: 0, stoppedAt: 60_000, profile: DEFAULT_LOAD_PROFILE },
+    run: { id: 1, runId: "stripped", startedAt: 0, stoppedAt: 60_000, profile: DEFAULT_LOAD_PROFILE },
     summary: summary({
-      overheadMs: {
-        p50: 1, p90: null, p95: null, p99: null, avg: 1,
-        gwSamples: 900, directSamples: 30,
-        unavailable: "p90 needs 100, p95 needs 200, p99 needs 1,000 residuals on each side; " +
-          "this window has 900 through the gateway and 30 direct (the direct reference stream is the thinner arm)"
-      }
+      nonBackendMs: { p50: null, p90: null, p95: null, p99: null, avg: null, count: 0 }
     }),
     scope: { totalRequests: 100, foreignRequests: 0, foreignPct: 0 },
-    gateway: DEFAULT_GW_TARGETS, policies: [], policyConfig: DEFAULT_POLICY_CONFIG, slo: { ...DEFAULT_SLO, maxOverheadP95Ms: 10 }
+    gateway: DEFAULT_GW_TARGETS, policies: [], policyConfig: DEFAULT_POLICY_CONFIG, slo: { ...DEFAULT_SLO, maxNonBackendP95Ms: 10 }
   });
   expect(report.verdict.state).toBe("inconclusive");
-  expect(report.verdict.reasons[0]).toContain("30 direct");
+  expect(report.verdict.reasons[0]).toContain("X-Server-Ms");
 });

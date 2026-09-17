@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { LIMITS, MEASUREMENT_VERSION, type AggregateBatch } from "@apigw/shared";
-import { Driver, MAX_REFERENCE_INFLIGHT, THROTTLE_TICKS_TO_WARN } from "./driver.js";
+import { Driver, THROTTLE_TICKS_TO_WARN } from "./driver.js";
 
 // The default backend flipped to "go" once the worker shipped; these tests
 // exercise the in-process driver's internals directly and must not switch.
@@ -134,7 +134,6 @@ describe("Driver config hardening", () => {
       rest: { baseUrl: "http://rest-gw:9000", apiKey: "rest-key", apiKeyHeader: "X-Rest-Key", pathPrefix: "/r" },
       soap: { baseUrl: "http://soap-gw:9001", apiKey: "soap-key", apiKeyHeader: "X-Soap-Key", pathPrefix: "" }
     });
-    d.setHealthCheck(() => null);
     const fetchSpy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async (input, init) => {
       hits.push({
         url: String(input),
@@ -169,140 +168,80 @@ describe("Driver config hardening", () => {
   });
 });
 
-describe("the direct reference stream", () => {
-  /** Mock every fetch with one canned response; returns the URLs requested. */
-  const withFetch = (res: () => Promise<Response>): { urls: string[]; restore: () => void } => {
+describe("non-backend time on the load path", () => {
+  it("measures every request that carried both clocks, with no control stream", async () => {
+    // The point of the change: one observation per request rather than a
+    // difference against a 2% reference stream, so a percentile is drawn from
+    // the traffic itself and exists at any rate.
+    const d = new Driver();
+    const batches: AggregateBatch[] = [];
+    d.setIngest((batch) => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
+    const now = Date.now() - 100;
+    priv(d).record({ runId: "r", ts: now, latencyMs: 50, ttfbMs: 40, serverMs: 10, measurementVersion: MEASUREMENT_VERSION });
+    priv(d).record({ runId: "r", ts: now, latencyMs: 50, ttfbMs: 40, serverMs: 10, measurementVersion: MEASUREMENT_VERSION });
+    await priv(d).flush(true);
+    const c = batches[0]!.cells[0]!;
+    expect(c.count).toBe(2);
+    expect(c.nonBackendCount).toBe(2);
+    expect(c.nonBackendSumMs).toBe(60);
+    await d.shutdown();
+  });
+
+  it("sends no traffic of its own to the SUT", async () => {
+    // The reference stream used to fire a share of the load straight at the
+    // SUT on every tick. It is gone; the only requests this driver issues are
+    // the load's, so nothing it reports is diluted by traffic the gateway never
+    // saw.
+    const d = new Driver();
+    d.setSutUrl("http://sut.test:8080");
+    d.setIngest((batch) => ({ ingested: ingestedCount(batch) }));
     const urls: string[] = [];
     const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch")
-      .mockImplementation(async (input) => { urls.push(String(input)); return res(); });
-    return { urls, restore: () => spy.mockRestore() };
-  };
-
-  it("records the residual as observed, including when it comes out negative", async () => {
-    // A residual below zero is not an error to be swallowed: TTFB and the SUT's
-    // self-reported time are read at different layers, so the low tail of the
-    // reference distribution legitimately crosses zero. Clamping it — which the
-    // retired per-request estimate did — lifts the reference and understates
-    // the gateway by exactly the amount clamped away.
-    const d = new Driver();
-    d.setBaselineUrl("http://sut.test:8080");
-    d.setProfile({ soapRatioPct: 0, invalidRatioPct: 0 });
-    const f = withFetch(async () => new Response("{}", { status: 200, headers: { "x-server-ms": "5000" } }));
+      .mockImplementation(async (input) => { urls.push(String(input)); return new Response("{}", { status: 200 }); });
     try {
-      d.start("run-ref");
-      await priv(d).fireReference();
-      const spool = priv(d).referenceSpool as { class: string; residualMs: number }[];
-      expect(spool).toHaveLength(1);
-      expect(spool[0]!.residualMs).toBeLessThan(0);
-      expect(spool[0]!.residualMs).toBeGreaterThan(-5_100);
-      expect(f.urls[0]).toStartWith("http://sut.test:8080/");
+      d.setGw({
+        rest: { baseUrl: "http://rest-gw:9000", apiKey: "", apiKeyHeader: "X-K", pathPrefix: "" },
+        soap: { baseUrl: "http://rest-gw:9000", apiKey: "", apiKeyHeader: "X-K", pathPrefix: "" }
+      });
+      // a rate high enough that a handful of 1ms ticks each owe a request —
+      // the reference stream used to ride this same tick
+      d.setProfile({ rps: 1_000, maxConcurrency: 100, soapRatioPct: 0, invalidRatioPct: 0 });
+      d.start("run-no-ref");
+      for (let i = 0; i < 20; i++) priv(d).tick();
+      await Bun.sleep(100);
+      expect(urls.length).toBeGreaterThan(0);
+      expect(urls.some((u) => u.startsWith("http://sut.test:8080"))).toBe(false);
     } finally {
-      f.restore();
+      spy.mockRestore();
       await d.shutdown();
     }
   });
 
-  it("records nothing when the backend does not report its own time", async () => {
-    // the same rule the gateway arm is held to: no backend clock, no residual.
-    // Filtering one arm more leniently than the other is what biases a Δ.
+  it("keeps a negative value rather than flooring it at zero", async () => {
+    // TTFB and the SUT's self-reported time are read at different layers, so a
+    // fast local hop legitimately lands below zero. Clamping those lifts every
+    // percentile above them by exactly the amount clamped away.
     const d = new Driver();
-    d.setBaselineUrl("http://sut.test:8080");
-    const f = withFetch(async () => new Response("{}", { status: 200 }));
-    try {
-      d.start("run-ref-silent");
-      await priv(d).fireReference();
-      expect(priv(d).referenceSpool).toHaveLength(0);
-    } finally {
-      f.restore();
-      await d.shutdown();
-    }
-  });
-
-  it("paces at the configured share of the load and never queues behind itself", async () => {
-    const d = new Driver();
-    d.setBaselineUrl("http://sut.test:8080");
-    let fired = 0;
-    priv(d).fireReference = () => { fired++; return Promise.resolve(); };
-    d.start("run-pace");
-    const t0 = Date.now();
-    // the first pump only establishes the clock — minting from a zero epoch
-    // would release a run's worth of probes at once
-    priv(d).pumpReference(t0, 1_000);
-    expect(fired).toBe(0);
-    // 2% of 1000 rps = 20 rps, so one second is 20 probes
-    priv(d).pumpReference(t0 + 1_000, 1_000);
-    expect(fired).toBe(20);
-
-    // with the in-flight ceiling already reached, a tick issues nothing rather
-    // than piling probes onto a SUT that is not keeping up — a backlogged
-    // reference measures our own queue and would flatter the gateway
-    fired = 0;
-    priv(d).referenceInFlight = MAX_REFERENCE_INFLIGHT;
-    priv(d).pumpReference(t0 + 2_000, 1_000);
-    expect(fired).toBe(0);
-    await d.shutdown();
-  });
-
-  it("holds the declared share at the top of the supported rate range", async () => {
-    // regression: the ceiling was 50 rps, so above 2,500 rps of load the
-    // control arm silently thinned relative to the gateway arm and became the
-    // binding constraint on every percentile the Δ could report
-    const d = new Driver();
-    d.setBaselineUrl("http://sut.test:8080");
-    let fired = 0;
-    priv(d).fireReference = () => { fired++; return Promise.resolve(); };
-    d.start("run-pace-high");
-    const t0 = Date.now();
-    priv(d).pumpReference(t0, 10_000);
-    priv(d).pumpReference(t0 + 1_000, 10_000);
-    expect(fired).toBe(200); // 2% of 10k, not a ceiling
-    await d.shutdown();
-  });
-
-  it("rides the batch alongside the results it is to be compared against", async () => {
-    const d = new Driver();
-    d.setHealthCheck(() => null);
     const batches: AggregateBatch[] = [];
     d.setIngest((batch) => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
-    priv(d).recordReference({ ts: Date.now() - 100, class: "small-rest", residualMs: 0.4 });
+    priv(d).record({ runId: "r", ts: Date.now() - 100, latencyMs: 50, ttfbMs: 9.75, serverMs: 10, measurementVersion: MEASUREMENT_VERSION });
     await priv(d).flush(true);
-    const direct = batches[0]!.residuals.filter((r) => r.path === "direct");
-    expect(direct).toHaveLength(1);
-    expect(direct[0]!.sumMs).toBe(0.4);
-    expect(direct[0]!.count).toBe(1);
-    // and it flushes even with no results of its own to carry
-    expect(batches[0]!.cells).toHaveLength(0);
+    expect(batches[0]!.cells[0]!.nonBackendSumMs).toBeCloseTo(-0.25, 10);
     await d.shutdown();
   });
 
-  it("keys reference residuals by health window, so a stall taints only its own", async () => {
-    // the whole reason a residual cell is not minute-grained: the control plane
-    // withholds contaminated windows, and at minute grain that choice would be
-    // between discarding a whole minute and keeping a stall inside it
+  it("measures nothing when the response carried no backend clock", async () => {
+    // a gateway that answered the request itself, or stripped X-Server-Ms, has
+    // nothing to subtract — which shows up as a smaller count, never as a
+    // substituted number
     const d = new Driver();
-    d.setHealthCheck(() => null);
     const batches: AggregateBatch[] = [];
     d.setIngest((batch) => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
-    const base = Math.floor(Date.now() / 2_000) * 2_000;
-    priv(d).recordReference({ ts: base - 4_000, class: "small-rest", residualMs: 0.4 });
-    priv(d).recordReference({ ts: base - 2_000, class: "small-rest", residualMs: 0.5 });
+    priv(d).record({ runId: "r", ts: Date.now() - 100, latencyMs: 50, ttfbMs: 40, serverMs: null, measurementVersion: MEASUREMENT_VERSION });
     await priv(d).flush(true);
-    const windows = batches[0]!.residuals.map((r) => r.windowTs).sort();
-    expect(windows).toEqual([base - 4_000, base - 2_000]);
-    await d.shutdown();
-  });
-
-  it("drops reference samples taken while the generator was unwell", async () => {
-    // both arms get the same health filter. Keeping a contaminated reference
-    // sample while withholding the contaminated gateway ones would subtract our
-    // own stall from the gateway's cost.
-    const d = new Driver();
-    d.setHealthCheck(() => "local event-loop stall");
-    const batches: AggregateBatch[] = [];
-    d.setIngest((batch) => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
-    priv(d).recordReference({ ts: Date.now() - 100, class: "small-rest", residualMs: 0.4 });
-    await priv(d).flush(true);
-    expect(batches[0]!.residuals).toHaveLength(0);
+    const c = batches[0]!.cells[0]!;
+    expect(c.count).toBe(1);
+    expect(c.nonBackendCount).toBe(0);
     await d.shutdown();
   });
 });
@@ -313,7 +252,7 @@ describe("Driver credential containment", () => {
     const seen: Record<string, string>[] = [];
     const d = new Driver();
     d.setIngest((batch) => ({ ingested: ingestedCount(batch) }));
-    if (selfUrl) d.setBaselineUrl(selfUrl);
+    if (selfUrl) d.setSutUrl(selfUrl);
     d.setGw(gw);
     d.setProfile({ soapRatioPct: 0, invalidRatioPct: 0 });
     const spy = spyOn(globalThis as { fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response> }, "fetch").mockImplementation(async (_i, init) => {
@@ -751,66 +690,26 @@ describe("Driver concurrency ceiling", () => {
 
 
 
-describe("timing qualification", () => {
-  it("retains a request and its elapsed time when overlapping health is bad", async () => {
-    // The row still counts toward throughput, status and latency — that is what
-    // the run delivered. Only its residual is withheld, because a generator
-    // stall delays when we see the response headers but not the SUT's own
-    // clock, so the whole stall would land inside ttfb − serverMs.
+describe("flush accounting", () => {
+  it("ships every measurement it took, however the generator was scheduled", async () => {
+    // A health verdict used to withhold a stalled window's measurements here.
+    // It now reports rather than deletes: a stall shows up as a fat tail in the
+    // same histogram and in the run's validity verdict, both of which an
+    // operator can see and argue with.
     const d = new Driver();
-    d.setHealthCheck(() => "local CPU throttling");
     const batches: any[] = [];
     d.setIngest(batch => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
-    priv(d).record({ runId: "r", ts: Date.now() - 100, latencyMs: 50, ttfbMs: 40, serverMs: 10, timingReason: null, measurementVersion: MEASUREMENT_VERSION });
+    priv(d).record({ runId: "r", ts: Date.now() - 100, latencyMs: 50, ttfbMs: 40, serverMs: 10, measurementVersion: MEASUREMENT_VERSION });
     await priv(d).flush(true);
     // the request is in the roll-up in full
     expect(batches[0].cells[0].count).toBe(1);
     expect(batches[0].cells[0].latencySumMs).toBe(50);
-    // and in the tail, with its clocks intact and the reason on it
+    expect(batches[0].cells[0].nonBackendCount).toBe(1);
+    expect(batches[0].cells[0].nonBackendSumMs).toBe(30);
+    // and in the tail, with its clocks intact
     expect(batches[0].tail).toHaveLength(1);
     expect(batches[0].tail[0].ttfbMs).toBe(40);
     expect(batches[0].tail[0].serverMs).toBe(10);
-    expect(batches[0].tail[0].timingReason).toBe("local CPU throttling");
-    // only the residual is withheld
-    expect(batches[0].residuals).toHaveLength(0);
-    await d.shutdown();
-  });
-
-  it("stamps health per 2s sample window — a stall taints only its own window", async () => {
-    // a healthy request must not be disqualified for sharing a flush with a
-    // stalled one; and each distinct window is checked exactly once
-    const d = new Driver();
-    const now = Date.now();
-    const w = (ts: number) => Math.floor(ts / 2_000) * 2_000;
-    const stalled = w(now);            // window containing "now"
-    const healthy = stalled - 2_000;   // previous window
-    const checked: [number, number][] = [];
-    d.setHealthCheck((from, to) => {
-      checked.push([from, to]);
-      return from === stalled ? "local event-loop stall" : null;
-    });
-    const batches: any[] = [];
-    d.setIngest(batch => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
-    const base = { runId: "r", latencyMs: 50, ttfbMs: 40, serverMs: 10, timingReason: null, measurementVersion: MEASUREMENT_VERSION };
-    priv(d).record({ ...base, ts: healthy + 100 });
-    priv(d).record({ ...base, ts: healthy + 900 });
-    priv(d).record({ ...base, ts: stalled + 100 });
-    await priv(d).flush(true);
-    const results = batches[0].tail;
-    expect(results).toHaveLength(3);
-    expect(results[0].timingReason).toBeNull();
-    expect(results[1].timingReason).toBeNull();
-    expect(results[2].timingReason).toBe("local event-loop stall");
-    // the healthy window keeps its residuals; the stalled one loses its own
-    expect(batches[0].residuals.map((r: any) => r.windowTs)).toEqual([healthy]);
-    expect(batches[0].residuals[0].count).toBe(2);
-    // one check per distinct window, closed windows asked about in full and
-    // the still-open one only up to now — the sampler cannot cover the rest
-    expect(checked).toHaveLength(2);
-    expect(checked[0]).toEqual([healthy, healthy + 2_000]);
-    expect(checked[1]![0]).toBe(stalled);
-    expect(checked[1]![1]).toBeGreaterThanOrEqual(now);
-    expect(checked[1]![1]).toBeLessThanOrEqual(stalled + 2_000);
     await d.shutdown();
   });
 
@@ -819,12 +718,11 @@ describe("timing qualification", () => {
     // gateway served — invisible loss here makes a truncated sample look like
     // a complete one, and it is the busiest moments that overflow.
     const d = new Driver();
-    d.setHealthCheck(() => null);
     const batches: any[] = [];
     d.setIngest(batch => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
     const now = Date.now();
     for (let i = 0; i < 50_001; i++) {
-      priv(d).record({ runId: "r", ts: now, latencyMs: 1, overheadMs: 1, overheadReason: null });
+      priv(d).record({ runId: "r", ts: now, latencyMs: 1 });
     }
     expect(d.status().counters.resultsLost).toBe(5_000);
 
@@ -832,28 +730,6 @@ describe("timing qualification", () => {
     const shed = batches.flatMap((b: any) => b.shed ?? []);
     // the loss rides the shed accounting so the window it thinned can report it
     expect(shed.reduce((n: number, s: any) => n + (s.resultsLost ?? 0), 0)).toBe(5_000);
-    await d.shutdown();
-  });
-
-  it("never asks about a window that has not elapsed — the open tail of a batch stays qualified", async () => {
-    // the newest 2s window of every batch is still open; asking the sampler
-    // about its future half is always "coverage unavailable", which would
-    // exclude the tail of every flush and keep the verdict inconclusive
-    const d = new Driver();
-    const now = Date.now();
-    const asked: [number, number][] = [];
-    d.setHealthCheck((from, to) => {
-      asked.push([from, to]);
-      return to > Date.now() ? "health coverage unavailable" : null;
-    });
-    const batches: any[] = [];
-    d.setIngest(batch => { batches.push(batch); return { ingested: ingestedCount(batch) }; });
-    priv(d).record({ runId: "r", ts: now, latencyMs: 50, ttfbMs: 40, serverMs: 10, timingReason: null, measurementVersion: MEASUREMENT_VERSION });
-    await priv(d).flush(true);
-    expect(asked[0]![1]).toBeLessThanOrEqual(Date.now());
-    expect(batches[0].tail[0].timingReason).toBeNull();
-    expect(batches[0].residuals).toHaveLength(1);
-    expect(batches[0].residuals[0].sumMs).toBe(30);
     await d.shutdown();
   });
 });

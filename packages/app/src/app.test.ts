@@ -28,7 +28,7 @@ function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", c
   const latencyMs = 50 + (i % 100);
   return {
     runId: "test-run", requestId: `r-${i}`, ttfbMs: latencyMs, serverMs: 40,
-    reachedBackend: true, measurementVersion: MEASUREMENT_VERSION, timingReason: null,
+    reachedBackend: true, measurementVersion: MEASUREMENT_VERSION,
     ts,
     protocol,
     endpoint: protocol === "soap" ? "SOAP getPetById" : "GET /api/pets",
@@ -147,12 +147,7 @@ describe("apigw-tester app (auth protected)", () => {
     const results = Array.from({ length: 40 }, (_, i) =>
       makeResult(i, now - i * 100, i % 4 === 0 ? "soap" : "rest", i % 4 === 0 ? "soap" : "small-rest")
     );
-    // reference observations ride the same batch; without a direct arm the
-    // summary has nothing to difference the gateway residuals against
-    const baseline = Array.from({ length: 40 }, (_, i) => ({
-      ts: now - i * 100, class: i % 4 === 0 ? "soap" as const : "small-rest" as const, residualMs: 5
-    }));
-    const batch = { batchId: "batch-1", results, baseline };
+    const batch = { batchId: "batch-1", results };
     const r = await authed("/api/ingest", {
       method: "POST",
       body: JSON.stringify(batch)
@@ -165,7 +160,10 @@ describe("apigw-tester app (auth protected)", () => {
     const s = await (await authed("/api/summary?window=1h")).json();
     expect(s.total).toBeGreaterThanOrEqual(40);
     expect(s.latencyMs.p50).toBeGreaterThan(0);
-    expect(s.overheadMs.p50).toBeGreaterThanOrEqual(0);
+    // every request carried both clocks, so every one of them is measured —
+    // no control stream, no sample-count gate, no null
+    expect(s.nonBackendMs.count).toBe(40);
+    expect(s.nonBackendMs.p99).toBeGreaterThan(0);
     expect(s.perEndpoint.length).toBeGreaterThan(0);
     expect(s.perClass.length).toBeGreaterThan(0);
     expect(s.perProtocol.find((p: { protocol: string }) => p.protocol === "soap")).toBeTruthy();
@@ -523,10 +521,10 @@ describe("apigw-tester app (auth protected)", () => {
   it("round-trips SLO thresholds and keeps 'not asserted' distinct from zero", async () => {
     const r = await authed("/api/config/slo", {
       method: "PUT",
-      body: JSON.stringify({ maxOverheadP95Ms: null, maxUnexpectedFailurePct: 0, maxLeakedToBackend: 5 })
+      body: JSON.stringify({ maxNonBackendP95Ms: null, maxUnexpectedFailurePct: 0, maxLeakedToBackend: 5 })
     });
     const slo = (await r.json()).slo;
-    expect(slo.maxOverheadP95Ms).toBeNull();
+    expect(slo.maxNonBackendP95Ms).toBeNull();
     expect(slo.maxUnexpectedFailurePct).toBe(0);
     expect(slo.maxLeakedToBackend).toBe(5);
     expect((await (await authed("/api/config/slo")).json()).maxLeakedToBackend).toBe(5);

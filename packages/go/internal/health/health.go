@@ -18,7 +18,7 @@
 // response arrives, its goroutine is ready to read the clock, and anything
 // between those two events is added to the request's measured TTFB without
 // being added to the SUT's self-reported server time. It therefore lands whole
-// inside the residual and reads as gateway overhead that never happened.
+// inside non-backend time and reads as gateway cost that never happened.
 //
 // Two deliberate choices, both learned from the metric this replaces:
 //
@@ -221,16 +221,13 @@ func (s *Sampler) float64(name string) (float64, bool) {
 //
 // A window is closed once the clock has moved past its end: still-open windows
 // are held back so the control plane is never handed a verdict on a window that
-// could still turn out to contain a stall. The residual cells for that window
-// are held by the aggregator on the same rule, so the two stay in step.
+// could still turn out to contain a stall.
 func (s *Sampler) Drain() []wire.HealthCell {
 	return s.DrainAt(s.now().UnixMilli())
 }
 
-// DrainAt is Drain against a caller-supplied clock reading. The worker passes
-// the same instant to the aggregator, so the two cannot disagree about whether
-// a window has closed — a window released by one and held by the other would
-// strand residuals with no evidence to qualify them, and they would be dropped.
+// DrainAt is Drain against a caller-supplied clock reading, which is what makes
+// the hold-back rule testable without sleeping.
 func (s *Sampler) DrainAt(nowMS int64) []wire.HealthCell {
 	var out []wire.HealthCell
 	for w, acc := range s.open {

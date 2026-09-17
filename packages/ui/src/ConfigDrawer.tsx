@@ -401,8 +401,8 @@ export default function ConfigDrawer({ gw, profile, onClose }: Props) {
                     value={slo.maxUnexpectedFailurePct} onChange={(v) => setSlo({ ...slo, maxUnexpectedFailurePct: v })} />
           <SloField id="slo-gwerr" label="Max gateway faults" unit="% — 502/503/504 and outright connection failures"
                     value={slo.maxGatewayErrorPct} onChange={(v) => setSlo({ ...slo, maxGatewayErrorPct: v })} />
-          <SloField id="slo-oh" label="Max GW overhead p95" unit="ms the gateway may add at the 95th percentile"
-                    value={slo.maxOverheadP95Ms} onChange={(v) => setSlo({ ...slo, maxOverheadP95Ms: v })} />
+          <SloField id="slo-oh" label="Max non-backend time p95" unit="ms outside the backend — gateway plus network — at the 95th percentile"
+                    value={slo.maxNonBackendP95Ms} onChange={(v) => setSlo({ ...slo, maxNonBackendP95Ms: v })} />
           <SloField id="slo-leak" label="Max contract leaks" unit="contract violations the gateway may let reach the backend"
                     value={slo.maxLeakedToBackend} onChange={(v) => setSlo({ ...slo, maxLeakedToBackend: v })} />
         </div>

@@ -28,7 +28,7 @@ interface RunOutcome {
   results: RequestResult[];
   /** the generator's own exact tallies, read just before stop */
   counters: RunCounters;
-  /** the store's view of the run, where the overhead Δ is computed */
+  /** the store's view of the run, where the histograms are read back */
   summary: MetricSummary;
 }
 
@@ -44,14 +44,10 @@ async function runOnce(
   profile: Record<string, unknown>
 ): Promise<RunOutcome> {
   process.env["LOADGEN_BACKEND"] = backend;
-  // selfUrl — and with it the direct-to-SUT baseline probe — is where the
-  // reference arm of the overhead comparison is sent, and both drivers
-  // calibrate once at init. Point it anywhere nothing is listening and every
-  // probe fails silently: directSamples stays 0 and no Δ is ever computed.
-  //
-  // It now defaults to the split-out SUT's own port, so pinning PORT is no
-  // longer enough — this run keeps the petstore in-process, so selfUrl has to
-  // be walked back to the app's ephemeral port to match.
+  // selfUrl is what "us" means for forwardBasicAuth: "auto". It defaults to the
+  // split-out SUT's own port, so pinning PORT is not enough — this run keeps the
+  // petstore in-process, so selfUrl has to be walked back to the app's ephemeral
+  // port or the load is issued without the credential the petstore requires.
   const port = freePort();
   process.env["PORT"] = String(port);
   const built = buildApp({
@@ -63,16 +59,6 @@ async function runOnce(
     dbPath: ":memory:",
     publicDir: "nope"
   });
-  // Pin local health to "fine".
-  //
-  // This one process is the load generator, the gateway's stand-in, the SUT and
-  // the store, so at a few hundred rps its own event loop stalls past the
-  // validity limit and the rig correctly disqualifies most of its windows —
-  // there is no residual left to compare. That gate is real and has its own
-  // coverage; what this test is for is proving both generators emit both arms
-  // of the comparison and that the store turns them into a Δ, which a
-  // machine-dependent health verdict would make flaky rather than rigorous.
-  built.driver.setHealthCheck(() => null);
   const server = built.listen(port);
   await built.ready; // config loaded; production ingest wired
   const base = `http://127.0.0.1:${server.port}`;
@@ -208,31 +194,29 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
       expect(go.counters.ok / go.counters.sent).toBeGreaterThan(0.85);
 
       // Whenever the response carried the backend's own clock, both must be
-      // present: their difference is the residual the store differences against
-      // the reference stream, and a missing serverMs on a backend-reached
-      // response would charge the request's whole TTFB to the gateway.
+      // present: their difference is the request's non-backend time, and a
+      // missing serverMs on a backend-reached response would charge the
+      // request's whole TTFB to the gateway.
       for (const r of results) {
         if (!r.reachedBackend) continue;
         expect(r.serverMs).not.toBeNull();
         expect(r.ttfbMs).not.toBeNull();
       }
 
-      // Both backends must run a direct reference stream and produce a Δ from
-      // it. The Go worker previously shipped no overhead measurement at all,
-      // so this is the end-to-end assertion that it does now — and that both
-      // generators reach the same conclusion about measurability.
+      // Both backends must measure non-backend time on the load itself, with no
+      // second stream to difference against. The count is the assertion that
+      // matters: it is per-request now, so it tracks the traffic rather than a
+      // 2% slice of it, and a percentile exists at any rate.
       for (const outcome of [go, ts]) {
-        const d = outcome.summary.overheadMs;
-        expect(d.directSamples).toBeGreaterThan(0);
-        expect(d.gwSamples).toBeGreaterThan(0);
-        // p50 needs 20 observations on the thinner side. The reference stream
-        // runs at 2% of the load, so this is what the run length is sized for.
-        expect(d.p50).not.toBeNull();
+        const nb = outcome.summary.nonBackendMs;
+        expect(nb.count).toBeGreaterThan(outcome.counters.ok * 0.8);
+        expect(nb.p50).not.toBeNull();
+        expect(nb.p99).not.toBeNull();
       }
-      // the target here IS the SUT, so the two paths are the same path and the
-      // difference must be small — a large Δ would mean the measurement is
-      // reading something other than the gateway
-      expect(Math.abs(go.summary.overheadMs.p50!)).toBeLessThan(50);
+      // the target here IS the SUT, so there is no gateway in the path and the
+      // number must be small — a large one would mean the measurement is
+      // reading something other than time spent outside the backend handler
+      expect(Math.abs(go.summary.nonBackendMs.p50!)).toBeLessThan(50);
 
       // invalidRatioPct=2 must actually flow through the Go scheduler
       const invalid = results.filter((r) => r.class === "invalid");
@@ -259,7 +243,6 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
     // asserting the stop call returns 200 does not, because it always did.
     process.env["LOADGEN_BACKEND"] = "go";
     const built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
-    built.driver.setHealthCheck(() => null);
     const server = built.listen(0);
     await built.ready;
     const base = `http://127.0.0.1:${server.port}`;

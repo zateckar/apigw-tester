@@ -327,19 +327,17 @@ func TestResultFieldNamesMatchTS(t *testing.T) {
 	val := 1.5
 	serv := 0.5
 	conn := 0.25
-	reason := "event-loop stall"
 	err := "boom"
 	r := wire.RequestResult{
 		RunID: "run", RequestID: "id", TS: 1, Protocol: "rest", Endpoint: "e", Class: "c", Method: "GET",
 		Status: 200, LatencyMs: 5, TTFBMs: &val, ServerMs: &serv, ConnectMs: &conn, ConnReused: true,
-		TimingReason:       &reason,
 		MeasurementVersion: wire.MeasurementVersion, BytesReq: 10, BytesResp: 20, ReachedBackend: true, Error: &err,
 	}
 	b, _ := json.Marshal(r)
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
 	want := []string{"runId", "requestId", "ts", "protocol", "endpoint", "class", "method", "status",
-		"latencyMs", "ttfbMs", "serverMs", "connectMs", "connReused", "timingReason", "measurementVersion",
+		"latencyMs", "ttfbMs", "serverMs", "connectMs", "connReused", "measurementVersion",
 		"bytesReq", "bytesResp", "reachedBackend", "error"}
 	for _, k := range want {
 		if _, ok := m[k]; !ok {

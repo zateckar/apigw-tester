@@ -52,7 +52,7 @@ function batch(bytesReq: number, bytesResp: number): AggregateBatch {
     results: [{
       runId: "r", requestId: `req-${Math.random()}`, ts: Date.now(), protocol: "rest", endpoint: "GET /x",
       class: "small-rest", method: "GET", status: 200,
-      latencyMs: 1, ttfbMs: 1, serverMs: null, measurementVersion: MEASUREMENT_VERSION, timingReason: null,
+      latencyMs: 1, ttfbMs: 1, serverMs: null, measurementVersion: MEASUREMENT_VERSION,
       bytesReq, bytesResp, reachedBackend: true, error: null
     }]
   });

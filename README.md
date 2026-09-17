@@ -11,7 +11,7 @@ It ships the **OpenAPI and WSDL definitions of its own Petstore**, so you can im
 │  │  React dashboard (served from / , poll /api/*)    │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │  Metrics store (bun:sqlite, minute+hour roll-ups) │ │
-│  │         baseline: direct-to-SUT vs through-GW     │ │
+│  │    non-backend time, per class, per endpoint      │ │
 │  ├──────────────────────────────────────────────────┤ │
 │  │  Load driver  ── class-tagged requests            │ │
 │  │      │  small-rest | soap | big-response          │ │
@@ -154,7 +154,7 @@ Thresholds are configured once (`Configure → Pass/fail thresholds`, or `PUT /a
 
 | Field | Default | Checks |
 |---|---|---|
-| `maxOverheadP95Ms` | `null` | gateway overhead p95, in ms |
+| `maxNonBackendP95Ms` | `null` | non-backend time p95, in ms |
 | `maxUnexpectedFailurePct` | `1` | non-2xx/3xx minus the deliberate invalid slice |
 | `maxLeakedToBackend` | `0` | contract violations that reached the backend |
 | `maxGatewayErrorPct` | `0.5` | 502/503/504 + no-response |
@@ -233,9 +233,9 @@ and from the Docker context.
 |---|---|---|
 | Petstore SUT | `packages/app/src/petstore/` | REST CRUD + SOAP; per-endpoint latency distributions, response padding, optional chaos via `/admin/*`. Stress endpoints: `GET /api/big/:size`, `GET /api/slow/:ms`, `POST /api/echo`. Bounded in-memory store with FIFO eviction and a per-status index, so the SUT does not slow down over a long run |
 | API contract | `packages/app/src/petstore/openapi.ts`, `soap.ts` | Hand-written OpenAPI 3.0.3 + WSDL, served as downloads and asserted against the live routes in `contract.test.ts` |
-| Load driver | `packages/app/src/loadgen/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily / real`; weighted scenario + stress-class mix; per-class baseline (direct-to-SUT) probes |
+| Load driver | `packages/app/src/loadgen/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily / real`; weighted scenario + stress-class mix. Every request it issues goes through the gateway — there is no second stream |
 | Metrics store | `packages/app/src/metrics/` | `bun:sqlite` (no native deps), WAL mode, transactional ingest, 24h raw ring + minute + hour histogram roll-ups with per-class use |
-| Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme; "GW overhead" is the headline metric |
+| Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme; "non-backend time" is the headline metric |
 | Status dimension | `packages/shared/` (`STATUS_BUCKETS`) | Every response is bucketed by status, so 401/403/429 and 502/503/504 are visible instead of folded away — see below |
 | Policy probes | `packages/app/src/loadgen/policy.ts` | Eight deliberate probes (auth, quota, payload cap, upstream timeout, cache, route allowlist, CORS) with `pass` / `not-enforced` / `fail` / `error` outcomes |
 | Validity gate | `packages/app/src/metrics/server.ts` (`validityFor`) | Load shed + generator CPU/event-loop saturation, so a window the rig could not honestly measure is marked as such |
@@ -271,7 +271,15 @@ bun start          # serves on http://localhost:8080 with auth
 
 **Correlating with the gateway's own logs.** Every generated request carries `X-Request-Id` (32 hex chars) and a W3C `traceparent` built from the same id, recorded against the row and shown in the recent-requests table. So "the gateway added 800 ms to some requests" becomes a list of ids you can grep in its access log or open in a trace backend. Ids are drawn from a per-run random prefix plus a counter rather than `randomUUID()` per request — the CPU for that would be charged to the very latency being measured.
 
-**How the "GW overhead" metric works.** The bundled Petstore stamps every response with `X-Server-Ms` — the backend's own entry-to-response time for *that exact request*. The load driver reads it on every through-gateway call and computes `overheadMs = max(0, latencyMs − serverMs − transportMs(class))`, where `transportMs` is a per-class median of direct-to-SUT probes **minus** their own `X-Server-Ms` (i.e. pure client-stack + loopback transport, re-measured once a minute). So per-request backend variability — random sleeps on `/api/slow/:ms`, chaos injection, latency-profile changes mid-run — lands in `baselineMs` and never in the gateway's number. Two cases fall back to the class median as the backend estimate: a gateway-generated rejection (auth wall, contract 4xx) that never touched the SUT, and a real backend that doesn't emit the header.
+**How the "non-backend time" metric works.** The bundled Petstore stamps every response with `X-Server-Ms` — the backend's own entry-to-response time for *that exact request*. For every request the driver records three clocks as observed and never combines them at the source: `ttfbMs` (ours), `serverMs` (the backend's), `connectMs` (socket acquisition — a pool wait, or DNS + TCP + TLS on a miss). Non-backend time is `ttfbMs − serverMs − connectMs`, histogrammed per minute, protocol, endpoint and class in the same roll-up cell as latency.
+
+That is *everything the response waited on that was not the backend handler*: the gateway's own work, plus the network on both sides of it, plus our client stack. It is not "the gateway's cost" — nothing here can separate the gateway from the wire it sits on — and the report says so. What it is: measured on **every** request rather than a sampled slice, so a p99 exists at 10 rps and at 10,000 rps alike, and the number carries its own sample count next to it.
+
+Per-request backend variability — random sleeps on `/api/slow/:ms`, chaos injection, latency-profile changes mid-run — cancels exactly, because `serverMs` is that request's own backend time rather than an estimate. Requests that carry no backend clock (a gateway-generated 401, a contract 4xx the gateway rejected, a real backend that does not emit the header) are **absent from the count**, never given a substituted value; they still count toward throughput, status and latency. The headline pools every class, so it moves with the scenario mix — the per-class rows are what to compare between runs.
+
+The value is kept **signed**. TTFB and the SUT's own clock are read at different layers, so a fast local hop legitimately lands a little below zero; flooring those would lift every percentile above them by exactly the amount floored away.
+
+An earlier version measured this as a *difference of distributions* against a 2%-of-load direct-to-SUT reference stream, which in principle subtracted our own client stack and the loopback out of the number. In practice the thin arm could not support a tail percentile — at 1,000 rps it was 668 samples against 33,458 — so the p95 and p99 an operator actually wanted were withheld on every real run, and where both existed they agreed at p50. The reference stream is gone.
 
 ## Load profiles
 

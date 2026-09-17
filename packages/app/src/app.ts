@@ -244,19 +244,10 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   // ---------------- load driver (in-process) ----------------
   const driver = new Driver();
   sampler.start();
-  driver.setHealthCheck((from, to) => {
-    if (sampler.latest().ts < to) sampler.sampleNow();
-    const reason = sampler.qualityBetween(from, to);
-    if (reason !== null) {
-      const l = sampler.latest();
-      console.log(`[metrics] healthCheck rejected [${from},${to}]: ${reason} (latest.ts=${l.ts}, intervalStart=${l.intervalStartTs}, now=${Date.now()})`);
-    }
-    return reason;
-  });
-  // Batches reach here pre-rolled: a few dozen cells, a few dozen residual
-  // cells and a capped raw tail, whatever the request rate. Everything on this
-  // line — the structured clone into the metrics thread included — is therefore
-  // O(endpoints), not O(requests).
+  // Batches reach here pre-rolled: a few dozen cells and a capped raw tail,
+  // whatever the request rate. Everything on this line — the structured clone
+  // into the metrics thread included — is therefore O(endpoints), not
+  // O(requests).
   driver.setIngest(async (batch) => {
     sampler.noteBatch(batch);
     return await store.ingestAggregate(batch);
@@ -301,7 +292,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     // against a backend that is not listening yet records connection failures
     // and scores them against the gateway.
     if (sutProcess) rebindSut(await sutProcess.start(runtime.sutPort));
-    driver.setBaselineUrl(runtime.selfUrl);
+    driver.setSutUrl(runtime.selfUrl);
 
     await schedulePolicies();
     const savedGw = await store.readGateway();
@@ -690,7 +681,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
         // upload, a fat SOAP envelope) arriving slowly are transport, not SUT
         // processing — Express's old order (body parsers before the petstore
         // router) excluded them too, and counting them would understate
-        // gateway overhead exactly on the classes that measure it
+        // non-backend time exactly on the classes that stress it
         if (route.def.body) ctx.enteredAt = enteredAt = performance.now();
         return finish(await route.def.handler(ctx));
       }

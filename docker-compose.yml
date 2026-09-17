@@ -17,9 +17,9 @@ services:
       NODE_ENV: production
       DB_PATH: /app/data/metrics.db
       # The bundled petstore runs as its own process on 8081. This must follow
-      # it: it is where the reference arm of the overhead comparison is sent,
-      # and pointing it at the control plane — which no longer serves petstore
-      # routes — would leave every run with a Δ of null.
+      # it: no traffic is sent here, but it is what "us" means for
+      # forwardBasicAuth: "auto", so a wrong value either hands this rig's
+      # credential to a third party or withholds it from the bundled SUT.
       PETSTORE_SELF_URL: http://127.0.0.1:8081
       # Point the driver at a real gateway without editing any config.
       # Empty means "target my own built-in petstore". REST and SOAP have their

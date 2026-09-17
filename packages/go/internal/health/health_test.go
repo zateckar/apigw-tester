@@ -120,8 +120,7 @@ func TestSamplesLandInTheWindowTheyEndIn(t *testing.T) {
 
 func TestDrainHoldsTheWindowStillInProgress(t *testing.T) {
 	// A window is only judged once it can no longer turn out to contain a stall.
-	// The aggregator holds that window's residuals on the same rule, so the two
-	// stay in step and a residual never outruns its evidence.
+	// Shipping it early would report a clean half of a window that ended badly.
 	clock, now := fixedClock(t0)
 	s := newWithClock(clock)
 	s.Sample()
@@ -146,9 +145,8 @@ func TestDrainHoldsTheWindowStillInProgress(t *testing.T) {
 }
 
 func TestDrainAtUsesTheCallersClock(t *testing.T) {
-	// The worker reads the clock once and hands the same instant to both drains.
-	// Two readings straddling a boundary would release residuals whose health
-	// cell is still held, and those residuals would be dropped for want of it.
+	// The worker reads the clock once and passes it in, so a window's fate does
+	// not depend on how long the flush took to get here.
 	clock, now := fixedClock(t0)
 	s := newWithClock(clock)
 	s.Sample()

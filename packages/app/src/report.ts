@@ -79,7 +79,7 @@ export function buildRunReport(input: BuildReportInput): RunReport {
     summary.total === 0 ? null : (100 * summary.status.gatewayErrors) / summary.total,
     slo.maxGatewayErrorPct, atMost
   ));
-  push(check("overhead-p95", "Added TTFB at p95 vs direct (ms)", summary.overheadMs.p95, slo.maxOverheadP95Ms, atMost));
+  push(check("non-backend-p95", "Non-backend time at p95 (ms)", summary.nonBackendMs.p95, slo.maxNonBackendP95Ms, atMost));
   // only assert contract leakage when invalid traffic was actually generated —
   // a run with invalidRatioPct = 0 has nothing to say about it either way
   push(check(
@@ -118,14 +118,15 @@ export function buildRunReport(input: BuildReportInput): RunReport {
     // the measurement itself is suspect, so neither pass nor fail is honest
     state = "inconclusive";
     reasons.unshift(...summary.validity.reasons);
-  } else if (slo.maxOverheadP95Ms != null && summary.overheadMs.p95 === null) {
-    // a Δ that could not be computed is not a pass. Unlike the old censored
-    // estimate, this one says exactly what was missing, so the reason is worth
-    // quoting verbatim rather than paraphrasing as "incomplete coverage".
+  } else if (slo.maxNonBackendP95Ms != null && summary.nonBackendMs.p95 === null) {
+    // a threshold that could not be evaluated is not a pass. There is only one
+    // way to get here now: no request in the window carried X-Server-Ms, so
+    // there was nothing to subtract the backend's own time from.
     state = "inconclusive";
     reasons.unshift(
-      `added-TTFB acceptance needs a p95 difference against the direct reference stream, and none was available: ` +
-      `${summary.overheadMs.unavailable ?? "reason unrecorded"}`
+      "non-backend time was asserted on but could not be measured: no request in this window carried the " +
+      "backend's X-Server-Ms header, so none of them has a backend time to subtract. A gateway that strips " +
+      "the header, or that answered everything itself, cannot be measured this way"
     );
   } else if (scope.foreignPct > VALIDITY_LIMITS.foreignPct) {
     // the window is mostly somebody else's traffic: judging this run on it
@@ -245,25 +246,29 @@ export function renderRunReportMarkdown(r: RunReport): string {
   L.push(`| Rate limited | ${s.status.rateLimited.toLocaleString()} |`);
   L.push(`| Unauthorized | ${s.status.unauthorized.toLocaleString()} |`);
   L.push(`| Latency p50 / p95 / p99 | ${ms(s.latencyMs.p50)} / ${ms(s.latencyMs.p95)} / ${ms(s.latencyMs.p99)} |`);
-  L.push(`| Residuals compared | ${s.overheadMs.gwSamples.toLocaleString()} through the gateway vs ${s.overheadMs.directSamples.toLocaleString()} direct |`);
-  if (s.overheadMs.unavailable !== null) L.push(`| Comparison gaps | ${s.overheadMs.unavailable} |`);
+  L.push(`| Requests carrying backend timing | ${s.nonBackendMs.count.toLocaleString()} of ${s.total.toLocaleString()} |`);
   L.push(`| Connection reuse | ${connSetupLine(s.connSetup)} |`);
-  L.push(`| **Added TTFB vs direct, p50 / p95 / p99** | **${ms(s.overheadMs.p50)} / ${ms(s.overheadMs.p95)} / ${ms(s.overheadMs.p99)}** |`);
+  L.push(`| **Non-backend time, p50 / p95 / p99** | **${ms(s.nonBackendMs.p50)} / ${ms(s.nonBackendMs.p95)} / ${ms(s.nonBackendMs.p99)}** |`);
   L.push("");
   L.push(
-    "Added TTFB is the difference between two distributions measured over the same minutes: the residual " +
-    "(`ttfb − serverMs − connect`) of traffic through the gateway, and the residual of a concurrent reference " +
-    "stream sent straight to the backend in the same scenario mix. A value at p95 says how much worse the 95th " +
-    "percentile of the gateway path is — not how much the gateway added to any one request, which is not " +
-    "measurable without a direct call that request never made. A negative value means the two distributions " +
-    "differ by less than this rig can resolve."
+    "Non-backend time is `ttfb − serverMs − connect`, measured on every request that came back carrying the " +
+    "backend's own `X-Server-Ms` header. It is everything that request spent outside the backend: the " +
+    "gateway's work and the network to it and back. It is not the gateway's processing cost in isolation — a " +
+    "single stream has nothing to subtract the path itself against — so read it as a ceiling on what the " +
+    "gateway costs. A negative value means the two clocks differ by less than this rig can resolve, and is " +
+    "reported as measured rather than floored at zero."
   );
   L.push("");
   L.push(
-    "Connection acquisition is measured per request and subtracted from both sides, so a gateway is not " +
-    "charged for handshakes. That makes the reuse rate above a finding in its own right rather than a " +
-    "footnote: a gateway that refuses keep-alive makes every caller pay a handshake this number will show " +
-    "and the added-TTFB figure deliberately will not."
+    "Connection acquisition is measured per request and subtracted, so a gateway is not charged for " +
+    "handshakes. That makes the reuse rate above a finding in its own right rather than a footnote: a gateway " +
+    "that refuses keep-alive makes every caller pay a handshake this number will show and the figure above " +
+    "deliberately will not."
+  );
+  L.push("");
+  L.push(
+    "The headline figure pools every class in the window, so it moves with the scenario mix; the per-class " +
+    "numbers are the ones to compare between runs."
   );
   L.push("");
 

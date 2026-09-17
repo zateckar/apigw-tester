@@ -28,7 +28,6 @@ export function openDb(path: string): DbHandle {
       baseline_ms REAL NOT NULL DEFAULT 0,
       overhead_ms REAL NOT NULL DEFAULT 0,
       server_ms REAL,
-      timing_reason TEXT,
       connect_ms REAL,
       conn_reused INTEGER,
       bytes_req INTEGER NOT NULL,
@@ -119,37 +118,6 @@ export function openDb(path: string): DbHandle {
       ticks INTEGER NOT NULL DEFAULT 0
     );
 
-    -- Residual (ttfb - serverMs) distributions, one row per bucket per class
-    -- per path. 'gw' is the load, through the gateway; 'direct' is the
-    -- concurrent reference stream straight to the SUT. The gateway's cost is
-    -- the difference between the two at matched percentiles, which is only
-    -- sound if both arms cover the same minutes and the same class mix —
-    -- hence the shared key rather than a single table of signed overheads.
-    --
-    -- Its own table, not more columns on rollup_*: the residual histogram has a
-    -- different (signed, sub-millisecond) edge layout, and endpoint granularity
-    -- would multiply these rows for no gain, since the residual tracks payload
-    -- shape — which is what class already names.
-    CREATE TABLE IF NOT EXISTS residual_minute (
-      bucket_ts INTEGER NOT NULL,
-      cls TEXT NOT NULL,
-      path TEXT NOT NULL,
-      count INTEGER NOT NULL DEFAULT 0,
-      sum_ms REAL NOT NULL DEFAULT 0,
-      hist TEXT NOT NULL DEFAULT '[]',
-      PRIMARY KEY (bucket_ts, cls, path)
-    );
-
-    CREATE TABLE IF NOT EXISTS residual_hour (
-      bucket_ts INTEGER NOT NULL,
-      cls TEXT NOT NULL,
-      path TEXT NOT NULL,
-      count INTEGER NOT NULL DEFAULT 0,
-      sum_ms REAL NOT NULL DEFAULT 0,
-      hist TEXT NOT NULL DEFAULT '[]',
-      PRIMARY KEY (bucket_ts, cls, path)
-    );
-
     -- Requests each run contributed to each minute.
     --
     -- The roll-ups deliberately carry no run id — endpoint × class × minute is
@@ -202,6 +170,15 @@ export function openDb(path: string): DbHandle {
       profile TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+  `);
+  // The two-arm overhead Δ is gone and with it its tables. Dropping rather than
+  // leaving them: nothing writes them, nothing reads them, and the retention
+  // sweep no longer prunes them — so on an existing database they would sit
+  // there holding every row they ever took, forever. The measurement they
+  // supported is now a column on rollup_*, which does get swept.
+  db.exec(`
+    DROP TABLE IF EXISTS residual_minute;
+    DROP TABLE IF EXISTS residual_hour;
   `);
   return db;
 }

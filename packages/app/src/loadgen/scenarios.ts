@@ -369,8 +369,9 @@ export function buildSpec(profile: LoadProfile, ctx: SpecContext, rand: () => nu
   }
 }
 
-// There was a buildBaselineProbe() here: seven fixed specs, one per class, run
-// as a cycle every two minutes to calibrate direct transport. The reference
-// stream that replaced it calls buildSpec directly, because the two arms of the
-// overhead comparison are only poolable across classes if they are drawn from
-// the same mix — and a fixed one-of-each set is not the mix the load generates.
+// There was a buildBaselineProbe() here, and then a direct-to-SUT reference
+// stream built from buildSpec: two generations of machinery for measuring what
+// the load path costs when the gateway is taken out of it. Both are gone. Every
+// spec this module builds is now issued through the gateway, and non-backend
+// time is read off the response itself — so there is one traffic mix, and it is
+// the one the operator configured.

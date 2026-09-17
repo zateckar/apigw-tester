@@ -14,7 +14,6 @@ import (
 	"github.com/apigw-tester/go/internal/config"
 	"github.com/apigw-tester/go/internal/fire"
 	"github.com/apigw-tester/go/internal/health"
-	"github.com/apigw-tester/go/internal/probe"
 	"github.com/apigw-tester/go/internal/scen"
 	"github.com/apigw-tester/go/internal/schedule"
 	"github.com/apigw-tester/go/internal/wire"
@@ -30,13 +29,9 @@ import (
 // train, not an arrival process, and the queueing it caused at the burst front
 // was charged to the gateway as latency.
 //
-// It corrupted the overhead Δ worse than it corrupted latency. The reference
-// stream runs at 2% of the load, so it releases at most one probe per tick and
-// never bursts; the self-inflicted queueing therefore landed on the gateway arm
-// alone, and the measurement reported it as the gateway's cost — a bias that
-// grew with the rate. Against a target that was literally the SUT, and so had
-// zero true overhead, the reported Δp50 went 0.02ms at 200 rps, 0.24ms at 1k,
-// 2.32ms at 5k. All of it was this.
+// It showed up worst in the overhead measurement. Against a target that was
+// literally the SUT, and so had zero true overhead, the reported p50 went
+// 0.02ms at 200 rps, 0.24ms at 1k, 2.32ms at 5k. All of it was this.
 //
 // One millisecond: burst depth falls by 20× at every rate, arrivals are spread
 // at the granularity the OS timer can actually honour, and 1000 wakeups a
@@ -84,7 +79,6 @@ type Params struct {
 //   - the tick goroutine (scheduler, exits on stop),
 //   - the flush goroutine (result socket, exits on Shutdown),
 //   - the status goroutine (stdout emitter, exits on Shutdown),
-//   - the reference stream's probe goroutines (owned by probe.Streamer),
 //   - the deadline reaper (owned by schedule.Reaper),
 //   - per-request goroutines (one per in-flight request, exits at completion).
 type Worker struct {
@@ -108,13 +102,12 @@ type Worker struct {
 	sem                     chan struct{} // buffered semaphore for the cap
 	targetRps               atomic.Value  // float64
 
-	bucket    *schedule.TokenBucket
-	reaper    *schedule.Reaper
-	clients   *fire.Clients
-	reference *probe.Streamer
-	firer     *fire.Firer
-	ids       *scen.IDTracker
-	reqIDs    *fire.RequestIds
+	bucket  *schedule.TokenBucket
+	reaper  *schedule.Reaper
+	clients *fire.Clients
+	firer   *fire.Firer
+	ids     *scen.IDTracker
+	reqIDs  *fire.RequestIds
 
 	counters Counters
 
@@ -182,7 +175,6 @@ func New(p Params) *Worker {
 	w.reqIDs = &fire.RequestIds{}
 	w.reqIDs.Reset()
 	w.firer = fire.NewFirer(w.clients, w.reaper, w.ids)
-	w.reference = probe.NewStreamer(w.ids)
 	w.targetRps.Store(0.0)
 	// the flusher and status emitters run for the process lifetime
 	go w.flushLoop()
@@ -207,7 +199,6 @@ func (w *Worker) Configure(c *config.Configure) {
 	}
 	w.forwardAuth.rest = config.SendsBasicAuth(c.Gw.Rest, c.SelfOrigin)
 	w.forwardAuth.soap = config.SendsBasicAuth(c.Gw.Soap, c.SelfOrigin)
-	w.reference.Configure(c.BaselineURL, w.authHeader)
 }
 
 // Start begins a run. Idempotent: a second start while running reports the
@@ -248,7 +239,6 @@ func (w *Worker) Start(runID string) {
 	}
 	w.sem = make(chan struct{}, w.effectiveMaxConcurrency)
 
-	w.reference.Reset()
 	if !w.tickInit {
 		w.tickInit = true
 		// A run's tick loop closes its done channel on the way out, so the next
@@ -297,15 +287,6 @@ func (w *Worker) Stop() {
 		// leaked requests are counted in the flush as they land; proceeding is
 		// the TS driver's behaviour after its drain timeout
 	}
-	// The reference arm drains too: flushing without it would leave the run's
-	// last minute comparing full gateway traffic against a truncated control.
-	// Bounded like the request drain above — it used to be unbounded, and a
-	// single large-class probe with a minute-long budget could hold the whole
-	// stop open, which the control plane sees as a run stuck at "stopping".
-	if !w.reference.WaitFor(DrainTimeout) {
-		fmt.Fprintf(os.Stderr, "[worker] reference drain timed out after %s; stopping anyway\n", DrainTimeout)
-	}
-
 	w.flush(true)
 	// the final tally, after the drain: without it the last status is up to
 	// StatusInterval stale and a run's closing counters never reach the UI
@@ -322,7 +303,6 @@ func (w *Worker) Stop() {
 func (w *Worker) Shutdown() {
 	w.stopAll.Do(func() {
 		w.Stop()
-		w.reference.WaitFor(DrainTimeout)
 		w.reaper.Stop()
 		close(w.done)
 		<-w.flushDone
@@ -370,9 +350,6 @@ func (w *Worker) tick() bool {
 	res := w.bucket.Tick(float64(nowMs), &profile, float64(startedAt))
 	w.targetRps.Store(res.TargetRPS)
 	w.noteTick(nowMs, res.TargetRPS, int64(res.Missed))
-	// the reference arm is paced off the same tick as the load, so the two
-	// residual distributions always cover the same moments
-	w.reference.Pump(nowMs, res.TargetRPS, &profile)
 
 	due := res.Due
 	dropped := int64(res.Missed)
@@ -491,9 +468,8 @@ func (w *Worker) flushLoop() {
 	t := time.NewTicker(FlushInterval)
 	defer t.Stop()
 	// Health is sampled on this goroutine, several times per flush. It has to
-	// be this one: the sampler is not concurrency-safe, and the flush goroutine
-	// is the only one that already owns the aggregator whose residual cells the
-	// samples qualify.
+	// be this one: the sampler is not concurrency-safe, and this is the only
+	// goroutine that touches it.
 	h := time.NewTicker(health.SampleInterval)
 	defer h.Stop()
 	w.healthSampler.Sample() // establish the baseline for the cumulative counters
@@ -517,37 +493,29 @@ func (w *Worker) flushLoop() {
 // One batch per flush, not one per N results: the whole point of rolling up
 // here is that the line's size is a function of the endpoint and class mix
 // rather than of the request rate, so there is nothing left to chunk. Shed
-// accounting and the reference arm ride the same line as the requests they
-// cover, so a window can never commit issued load without the load it failed to
-// issue, or one arm of the overhead comparison without the other.
+// accounting rides the same line as the requests it covers, so a window can
+// never commit issued load without the load it failed to issue.
 func (w *Worker) flush(final bool) {
 	w.noteResultsLost()
 	shed := w.takeShed(final)
-	for _, s := range w.reference.Drain() {
-		w.agg.AddDirect(s)
-	}
 	drained := w.drainResults()
 
-	// Health cells and residual cells are released on the same rule — the
-	// window has closed — so a residual and the evidence about whether to trust
-	// it are never in different batches, and never separated by a restart.
-	var batch *wire.AggBatch
+	// Health windows are still held until closed, because a verdict on a window
+	// that could still contain a stall is not a verdict. Nothing waits on them
+	// any more — measurements ship immediately — so a held window delays only
+	// the evidence about the generator, never the traffic it ran alongside.
 	var cells []wire.HealthCell
 	if final {
 		cells = w.healthSampler.DrainAll()
-		batch = w.agg.DrainAll(uuidV4(), shed)
 	} else {
-		// one clock reading for both: two readings can straddle a window
-		// boundary and strand residuals with no evidence to qualify them
-		now := time.Now().UnixMilli()
-		cells = w.healthSampler.DrainAt(now)
+		cells = w.healthSampler.Drain()
 		if drained == 0 && w.agg.Empty() && len(shed) == 0 && len(cells) == 0 {
 			return
 		}
-		batch = w.agg.DrainAt(uuidV4(), shed, now)
 	}
-	// never nil: an absent `health` key is how the control plane recognises a
-	// worker too old to report its own, and falls back to its own gate
+	batch := w.agg.Drain(uuidV4(), shed)
+	// never nil: an absent `health` key means a producer that cannot see itself,
+	// which is a different claim from a quiet second
 	if cells == nil {
 		cells = []wire.HealthCell{}
 	}

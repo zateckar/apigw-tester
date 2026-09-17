@@ -1,16 +1,12 @@
 import {
-  HEALTH_WINDOW_MS,
   MEASUREMENT_VERSION,
   RAW_TAIL_PER_FLUSH,
   type AggCell,
   type AggregateBatch,
-  type BaselineSample,
   type IngestBatch,
   type LoadShedSample,
   type Protocol,
   type RequestResult,
-  type ResidualArmPath,
-  type ResidualCell,
   type RunCell,
   type ScenarioClass
 } from "@apigw/shared";
@@ -35,36 +31,20 @@ import {
 
 const MINUTE_MS = 60_000;
 
-/** Whether a row's residual is admissible into the gateway arm, and what it is.
- *
- * A row measured by an older build carries a different definition of the same
- * field and is not comparable; one stamped with a timing reason was taken while
- * this generator was unwell; and one missing either clock has no residual at
- * all. None of these are substituted for — they simply reduce the arm's sample
- * count, which the Δ reports.
- *
- * Connection acquisition comes off the residual. Unlike the calibration
- * constant the retired measurement subtracted, this is a value observed on this
- * very request, so no other distribution's variance enters the number — and
- * both arms subtract their own, which they must, since the reference stream
- * runs a near-idle pool and pays setup on a schedule of its own.
- */
-export function residualOf(r: RequestResult): number | null {
-  if (r.timingReason != null) return null;
-  return nonBackendMsOf(r);
-}
-
 /**
  * Time a request spent outside the backend: `ttfb − serverMs − connectMs`.
  *
- * The same quantity {@link residualOf} feeds to the gateway arm, without the
- * health gate. That gate exists to protect a *difference* between two
- * distributions, where a generator stall lands entirely on one side; here every
- * request carries its own observation and a stall shows up as a fat tail in the
- * same histogram, which is a truer thing to look at than a withheld number.
+ * Every request that carried both clocks contributes one observation. There is
+ * no health gate on it: a gate was needed when this fed a *difference* between
+ * two distributions, where a generator stall landed entirely on one side and
+ * moved the answer. Here a stall shows up as a fat tail in the same histogram —
+ * which is a truer thing to put in front of an operator than a withheld number,
+ * and the run's validity verdict says whether the generator was well.
  *
- * Still refused: a row from an older measurement version, because the field
- * meant something else then and mixing the two silently changes the metric.
+ * Refused: a row from an older measurement version, because the field meant
+ * something else then and mixing the two silently changes the metric. A request
+ * with no backend clock contributes nothing rather than a substituted value,
+ * which shows up as a smaller count.
  */
 export function nonBackendMsOf(r: RequestResult): number | null {
   if ((r.measurementVersion ?? 1) < MEASUREMENT_VERSION) return null;
@@ -116,7 +96,6 @@ interface CellKeyed extends AggCell {
  *  supported: a drained aggregator is empty, so nothing can be shipped twice. */
 class Aggregator {
   private readonly cells = new Map<string, CellKeyed>();
-  private readonly residuals = new Map<string, ResidualCell>();
   private readonly runs = new Map<string, RunCell>();
 
   add(r: RequestResult): void {
@@ -182,50 +161,21 @@ class Aggregator {
 
     // Time spent outside the backend, per request, in the same cell as
     // everything else — so it is readable per endpoint and per class at any
-    // percentile. A request the gateway answered itself carries no backend
-    // clock and contributes nothing, which shows up as a smaller
-    // nonBackendCount rather than as a substituted number.
+    // percentile.
     const nonBackend = nonBackendMsOf(r);
     if (nonBackend !== null) {
       c.nonBackendCount++;
       c.nonBackendSumMs += nonBackend;
       addToResidualHistogram(c.nonBackendHist, nonBackend);
     }
-
-    // The gateway arm of the two-arm Δ.
-    const residual = residualOf(r);
-    if (residual !== null) this.addResidual(r.ts, r.class as ScenarioClass, "gw", residual);
-  }
-
-  /** The direct arm: reference traffic that bypassed the gateway. Deliberately
-   *  outside the cells, and therefore outside every rate, status and contract
-   *  number — it is the control, not the experiment. */
-  addDirect(s: BaselineSample): void {
-    if (!s || !Number.isFinite(s.ts) || !Number.isFinite(s.residualMs) || typeof s.class !== "string") return;
-    this.addResidual(s.ts, s.class, "direct", s.residualMs);
-  }
-
-  private addResidual(ts: number, cls: ScenarioClass, path: ResidualArmPath, ms: number): void {
-    const windowTs = Math.floor(ts / HEALTH_WINDOW_MS) * HEALTH_WINDOW_MS;
-    const key = `${windowTs}|${cls}|${path}`;
-    let b = this.residuals.get(key);
-    if (!b) {
-      b = { windowTs, cls, path, count: 0, sumMs: 0, hist: emptyResidualHistogram() };
-      this.residuals.set(key, b);
-    }
-    b.count++;
-    b.sumMs += ms;
-    addToResidualHistogram(b.hist, ms);
   }
 
   drain(batchId: string, tail: RequestResult[], shed?: LoadShedSample[]): AggregateBatch {
     const cells = [...this.cells.values()].map(({ key: _key, ...cell }) => cell);
     this.cells.clear();
-    const residuals = [...this.residuals.values()];
-    this.residuals.clear();
     const runs = [...this.runs.values()];
     this.runs.clear();
-    return { batchId, cells, residuals, runs, tail, ...(shed && shed.length > 0 ? { shed } : {}) };
+    return { batchId, cells, runs, tail, ...(shed && shed.length > 0 ? { shed } : {}) };
   }
 }
 
@@ -242,6 +192,5 @@ export function aggregateBatch(batch: IngestBatch): AggregateBatch {
   }
   const agg = new Aggregator();
   for (const r of batch.results) agg.add(r);
-  for (const s of batch.baseline ?? []) agg.addDirect(s);
   return agg.drain(batch.batchId, selectTail(batch.results), batch.shed);
 }

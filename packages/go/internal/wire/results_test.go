@@ -28,10 +28,8 @@ func TestBatchNDJSONShape(t *testing.T) {
 			Protocol: "rest", Endpoint: "GET /api/pets", Class: "small-rest",
 			Count: 1, OK2xx: 1, ReachedBackend: 1, LatencySumMs: 5.5, MaxLatencyMs: 5.5,
 			BytesResp: 120, Hist: []int64{0, 1}, StatusHist: []int64{0, 0, 1},
+			NonBackendCount: 1, NonBackendSumMs: -0.25, NonBackendHist: []int64{1},
 		}},
-		Residuals: []ResidualCell{
-			{WindowTS: 1730000000000, Class: "small-rest", Path: "direct", Count: 1, SumMs: -0.25, Hist: []int64{1}},
-		},
 		Runs: []RunCell{{BucketTS: 1730000000000, RunID: "run-1", Count: 1}},
 		Tail: []RequestResult{{
 			RunID: "run-1", RequestID: "abc", TS: 1730000000001, Protocol: "rest", Endpoint: "GET /api/pets",
@@ -64,7 +62,8 @@ func TestBatchNDJSONShape(t *testing.T) {
 	c0 := cells[0].(map[string]any)
 	for _, k := range []string{"bucketTs", "firstTs", "lastTs", "protocol", "endpoint", "cls", "count",
 		"errors", "ok2xx", "rejected4xx", "rejected4xxGw", "reachedBackend", "latencySumMs",
-		"maxLatencyMs", "bytesReq", "bytesResp", "hist", "statusHist"} {
+		"maxLatencyMs", "bytesReq", "bytesResp", "hist", "statusHist",
+		"nonBackendCount", "nonBackendSumMs", "nonBackendHist"} {
 		if _, ok := c0[k]; !ok {
 			t.Fatalf("missing cell field %q", k)
 		}
@@ -78,7 +77,7 @@ func TestBatchNDJSONShape(t *testing.T) {
 	}
 	r := res[0].(map[string]any)
 	for _, k := range []string{"runId", "requestId", "ts", "protocol", "endpoint", "class", "method",
-		"status", "latencyMs", "ttfbMs", "serverMs", "timingReason", "measurementVersion",
+		"status", "latencyMs", "ttfbMs", "serverMs", "measurementVersion",
 		"bytesReq", "bytesResp", "reachedBackend", "error"} {
 		if _, ok := r[k]; !ok {
 			t.Fatalf("missing result field %q", k)
@@ -87,7 +86,7 @@ func TestBatchNDJSONShape(t *testing.T) {
 	// An absent serverMs must arrive as an explicit null, not as 0: the store
 	// reads 0 as "the backend took no time" and would charge the request's
 	// whole TTFB to the gateway as a residual.
-	if r["serverMs"] != nil || r["timingReason"] != nil || r["error"] != nil {
+	if r["serverMs"] != nil || r["error"] != nil {
 		t.Fatalf("nulls not preserved: %v", r)
 	}
 	shed := m["shed"].([]any)
@@ -95,17 +94,10 @@ func TestBatchNDJSONShape(t *testing.T) {
 	if s0["bucketTs"].(float64) != 1730000000000 || s0["dropped"].(float64) != 3 {
 		t.Fatalf("shed: %v", s0)
 	}
-	// negative residual sums must survive the wire: clamping them anywhere
-	// shifts the reference distribution up and understates the gateway
-	base := m["residuals"].([]any)
-	b0 := base[0].(map[string]any)
-	if b0["sumMs"].(float64) != -0.25 || b0["cls"] != "small-rest" || b0["path"] != "direct" {
-		t.Fatalf("residuals: %v", b0)
-	}
-	// a residual cell is keyed by health window, not by minute: the control
-	// plane drops contaminated windows, and it cannot do that at minute grain
-	if b0["windowTs"].(float64) != 1730000000000 {
-		t.Fatalf("windowTs: %v", b0)
+	// negative non-backend sums must survive the wire: clamping them anywhere
+	// shifts every percentile above them up by exactly that amount
+	if c0["nonBackendSumMs"].(float64) != -0.25 {
+		t.Fatalf("nonBackendSumMs: %v", c0["nonBackendSumMs"])
 	}
 
 	// shed omitted when empty

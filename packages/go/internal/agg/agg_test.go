@@ -6,18 +6,9 @@ import (
 	"github.com/apigw-tester/go/internal/wire"
 )
 
-const t0 = int64(1_800_000_000_000) // minute- and window-aligned
+const t0 = int64(1_800_000_000_000) // minute-aligned
 
-// newAgg builds an aggregator whose clock sits well past the fixtures, so every
-// residual window is closed and the drain releases it.
-//
-// The fixtures are stamped at a fixed t0 rather than at the wall clock, which
-// means under the real clock their windows either have closed or never will
-// depending on the date the tests are run. Every test below is about what goes
-// into a cell, not about when it is released; that rule has its own tests.
-func newAgg() *Aggregator {
-	return NewWithClock(func() int64 { return t0 + 10*minuteMS })
-}
+func newAgg() *Aggregator { return New() }
 
 func res(over func(*wire.RequestResult)) *wire.RequestResult {
 	ttfb, server := 40.0, 10.0
@@ -122,78 +113,77 @@ func TestAGeneratorFaultIsNotCountedAsASuccessEither(t *testing.T) {
 	}
 }
 
-func TestResidualsAreKeyedByHealthWindow(t *testing.T) {
-	// contaminated windows are withheld whole, which cannot be done at the
-	// minute grain the other cells use
+func TestNonBackendTimeLandsInTheSameCellAsEverythingElse(t *testing.T) {
+	// Being a column on the cell rather than a table of its own is the whole
+	// point: it is then readable per endpoint, per class and per minute at any
+	// percentile, off the same rows the latency numbers come from.
 	a := newAgg()
 	a.Add(res(nil))
-	a.Add(res(func(r *wire.RequestResult) { r.TS = t0 + HealthWindowMS }))
-	a.AddDirect(wire.BaselineSample{TS: t0, Class: "small-rest", ResidualMs: -0.25})
+	a.Add(res(func(r *wire.RequestResult) { r.Class = "soap"; r.Protocol = "soap"; r.Endpoint = "SOAP getPetById" }))
 
 	b := a.Drain("b3", nil)
-	gw, direct := 0, 0
-	windows := map[int64]bool{}
-	for _, r := range b.Residuals {
-		switch r.Path {
-		case "gw":
-			gw++
-			windows[r.WindowTS] = true
-			if r.SumMs != 30 {
-				t.Fatalf("gw residual: %+v", r)
-			}
-		case "direct":
-			direct++
-			// negative residuals must survive: clamping them lifts the
-			// reference distribution and understates the gateway
-			if r.SumMs != -0.25 {
-				t.Fatalf("direct residual: %+v", r)
-			}
+	if len(b.Cells) != 2 {
+		t.Fatalf("cells: %d", len(b.Cells))
+	}
+	for _, c := range b.Cells {
+		if c.NonBackendCount != 1 || c.NonBackendSumMs != 30 { // ttfb 40 − server 10
+			t.Fatalf("non-backend on %s: %+v", c.Class, c)
 		}
-	}
-	if gw != 2 || direct != 1 {
-		t.Fatalf("arms: gw=%d direct=%d", gw, direct)
-	}
-	if !windows[t0] || !windows[t0+HealthWindowMS] {
-		t.Fatalf("windows: %v", windows)
+		if totalOf(c.NonBackendHist) != 1 {
+			t.Fatalf("histogram on %s: %v", c.Class, c.NonBackendHist)
+		}
 	}
 }
 
-func TestNoResidualWithoutBothClocks(t *testing.T) {
+func TestNegativeNonBackendTimeSurvives(t *testing.T) {
+	// The two clocks are read at different layers, so a fast local hop
+	// legitimately lands below zero. Flooring those at zero shifts every
+	// percentile above them up by exactly that amount.
+	a := newAgg()
+	ttfb, server := 9.75, 10.0
+	a.Add(res(func(r *wire.RequestResult) { r.TTFBMs = &ttfb; r.ServerMs = &server }))
+
+	c := a.Drain("b3n", nil).Cells[0]
+	if c.NonBackendCount != 1 || c.NonBackendSumMs != -0.25 {
+		t.Fatalf("non-backend: %+v", c)
+	}
+	if totalOf(c.NonBackendHist) != 1 {
+		t.Fatalf("negative value fell out of the histogram: %v", c.NonBackendHist)
+	}
+}
+
+func TestNoNonBackendTimeWithoutBothClocks(t *testing.T) {
 	a := newAgg()
 	a.Add(res(func(r *wire.RequestResult) { r.ServerMs = nil })) // gateway answered it
 	a.Add(res(func(r *wire.RequestResult) { r.TTFBMs = nil }))   // no headers arrived
 
-	b := a.Drain("b4", nil)
-	if len(b.Residuals) != 0 {
-		t.Fatalf("residuals: %+v", b.Residuals)
+	c := a.Drain("b4", nil).Cells[0]
+	if c.NonBackendCount != 0 || c.NonBackendSumMs != 0 {
+		t.Fatalf("measured what it could not see: %+v", c)
 	}
 	// but both still count toward throughput and latency — that is what the
 	// run delivered
-	if b.Cells[0].Count != 2 {
-		t.Fatalf("count: %d", b.Cells[0].Count)
+	if c.Count != 2 {
+		t.Fatalf("count: %d", c.Count)
 	}
 }
 
-func TestConnectionSetupComesOffTheResidual(t *testing.T) {
+func TestConnectionSetupComesOffNonBackendTime(t *testing.T) {
 	// A DNS lookup, a TCP handshake and a TLS handshake all sit inside TTFB and
 	// none of them is per-request gateway cost. Left in, a gateway would be
-	// charged for every connection the pool failed to keep — and the reference
-	// arm, running a near-idle pool of its own, pays that on a different
-	// schedule entirely, so the difference would land squarely in the Δ.
+	// charged for every connection the pool failed to keep — a cost that is
+	// real but belongs in ConnSetups, where it can be read on its own.
 	a := newAgg()
 	connect := 12.0
 	a.Add(res(func(r *wire.RequestResult) { r.ConnectMs = &connect; r.ConnReused = false }))
 
-	b := a.Drain("c1", nil)
-	if len(b.Residuals) != 1 {
-		t.Fatalf("residuals: %+v", b.Residuals)
-	}
+	c := a.Drain("c1", nil).Cells[0]
 	// ttfb 40 − server 10 − connect 12
-	if got := b.Residuals[0].SumMs; got != 18 {
-		t.Fatalf("residual: got %v want 18", got)
+	if c.NonBackendCount != 1 || c.NonBackendSumMs != 18 {
+		t.Fatalf("non-backend: %+v", c)
 	}
-	if b.Cells[0].ConnSetups != 1 || b.Cells[0].ConnSetupSumMs != 12 || b.Cells[0].ConnMeasured != 1 {
-		t.Fatalf("conn counters: %+v", b.Cells[0])
+	if c.ConnSetups != 1 || c.ConnSetupSumMs != 12 || c.ConnMeasured != 1 {
+		t.Fatalf("conn counters: %+v", c)
 	}
 }
 
@@ -202,13 +192,12 @@ func TestReusedConnectionIsMeasuredButNotCountedAsASetup(t *testing.T) {
 	reuse := 0.05 // a pool hit is not free, and the wait is still ours not the gateway's
 	a.Add(res(func(r *wire.RequestResult) { r.ConnectMs = &reuse; r.ConnReused = true }))
 
-	b := a.Drain("c2", nil)
-	c := b.Cells[0]
+	c := a.Drain("c2", nil).Cells[0]
 	if c.ConnMeasured != 1 || c.ConnSetups != 0 || c.ConnSetupSumMs != 0 {
 		t.Fatalf("conn counters: %+v", c)
 	}
-	if got := b.Residuals[0].SumMs; got != 40-10-0.05 {
-		t.Fatalf("residual: got %v", got)
+	if c.NonBackendSumMs != 40-10-0.05 {
+		t.Fatalf("non-backend: %v", c.NonBackendSumMs)
 	}
 }
 
@@ -316,77 +305,19 @@ func TestDrainResetsSoNothingShipsTwice(t *testing.T) {
 	}
 }
 
-func TestResidualsWaitForTheirWindowToClose(t *testing.T) {
-	// A residual may only ship with the verdict on the window it fell in, and
-	// that verdict is not known while the window can still turn out to contain a
-	// stall. Everything else ships immediately: throughput and latency describe
-	// what the run delivered whatever the generator's scheduling was doing.
-	now := t0 + 500
-	a := NewWithClock(func() int64 { return now })
+func TestNothingIsHeldBackAcrossADrain(t *testing.T) {
+	// Residual cells used to wait here until their health window closed, so the
+	// control plane could drop the ones taken while the process was stalled.
+	// Nothing waits now: a measurement the operator cannot see is a measurement
+	// they cannot ask about, and the filter it was waiting for is gone.
+	a := newAgg()
 	a.Add(res(nil))
 
 	b := a.Drain("w1", nil)
-	if len(b.Residuals) != 0 {
-		t.Fatalf("shipped a residual from an open window: %+v", b.Residuals)
-	}
-	if len(b.Cells) != 1 || b.Cells[0].Count != 1 {
-		t.Fatalf("held back more than the residual: %+v", b.Cells)
-	}
-
-	now = t0 + HealthWindowMS
-	b = a.Drain("w2", nil)
-	if len(b.Residuals) != 1 || b.Residuals[0].SumMs != 30 {
-		t.Fatalf("closed window not released: %+v", b.Residuals)
-	}
-	if len(b.Cells) != 0 {
-		t.Fatal("cells shipped twice")
+	if len(b.Cells) != 1 || b.Cells[0].NonBackendCount != 1 {
+		t.Fatalf("held a measurement back: %+v", b.Cells)
 	}
 	if !a.Empty() {
-		t.Fatal("released residual left behind")
-	}
-}
-
-func TestOnlyTheClosedWindowIsReleased(t *testing.T) {
-	now := t0 + HealthWindowMS + 500
-	a := NewWithClock(func() int64 { return now })
-	a.Add(res(nil))                                                        // closed window
-	a.Add(res(func(r *wire.RequestResult) { r.TS = t0 + HealthWindowMS })) // open one
-
-	b := a.Drain("w3", nil)
-	if len(b.Residuals) != 1 || b.Residuals[0].WindowTS != t0 {
-		t.Fatalf("residuals: %+v", b.Residuals)
-	}
-	if a.Empty() {
-		t.Fatal("the open window was released too")
-	}
-}
-
-func TestDrainAllReleasesOpenWindows(t *testing.T) {
-	// at shutdown, holding a window back is not deferring the verdict, it is
-	// losing the measurement
-	now := t0 + 500
-	a := NewWithClock(func() int64 { return now })
-	a.Add(res(nil))
-
-	b := a.DrainAll("w4", nil)
-	if len(b.Residuals) != 1 {
-		t.Fatalf("residuals: %+v", b.Residuals)
-	}
-	if !a.Empty() {
-		t.Fatal("drain-all left state behind")
-	}
-}
-
-func TestDrainAtUsesTheCallersClock(t *testing.T) {
-	// the worker reads the clock once and gives the same instant to the health
-	// sampler, so the two cannot disagree about which windows have closed
-	a := NewWithClock(func() int64 { t.Fatal("DrainAt read the clock itself"); return 0 })
-	a.Add(res(nil))
-
-	if n := len(a.DrainAt("w5", nil, t0+HealthWindowMS-1).Residuals); n != 0 {
-		t.Fatalf("released with the caller's clock inside the window: %d", n)
-	}
-	if n := len(a.DrainAt("w6", nil, t0+HealthWindowMS).Residuals); n != 1 {
-		t.Fatalf("not released with the caller's clock past the window: %d", n)
+		t.Fatal("drain left state behind")
 	}
 }

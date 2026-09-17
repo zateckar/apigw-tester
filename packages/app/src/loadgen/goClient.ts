@@ -8,17 +8,10 @@ import type {
   AggregateBatch,
   EdgeTables,
   GwTargets,
-  LoadProfile,
-  WorkerHealthCell
+  LoadProfile
 } from "@apigw/shared";
-import { edgeTableMismatch, HEALTH_WINDOW_MS } from "@apigw/shared";
-
-/** How many health windows to keep in case a cell and its residuals are split
- *  across batches. Thirty windows is a minute — far longer than any observed
- *  skew, and still only a few hundred bytes. */
-const HEALTH_MEMORY_WINDOWS = 30;
+import { edgeTableMismatch } from "@apigw/shared";
 import { expectedAuthHeader } from "../auth.js";
-import { filterHealthyResiduals, stampHealthWindows, windowHealth, workerWindowHealth } from "./health.js";
 
 /**
  * Control-plane client for the Go loadgen worker.
@@ -83,18 +76,11 @@ export class GoWorkerClient {
   private port = 0;
   private stdoutBuf = "";
   private socketBuf = "";
-  private healthCheck: (from: number, to: number) => string | null = () => "health unavailable";
   /** cleared if the worker's declared bucket tables do not match this build's */
   private bucketsOk = true;
-  /** recent per-window health reports from the worker; see rememberHealth */
-  private health = new Map<number, WorkerHealthCell>();
   private starting: Promise<void> | null = null;
 
   constructor(private events: GoClientEvents) {}
-
-  setHealthCheck(check: (from: number, to: number) => string | null): void {
-    this.healthCheck = check;
-  }
 
   get pid(): number | null {
     return this.child?.pid ?? null;
@@ -206,7 +192,7 @@ export class GoWorkerClient {
         console.error("[driver:go] dropping malformed batch:", (e as Error).message);
         continue;
       }
-      this.stampAndDeliver(batch);
+      this.deliver(batch);
     }
   }
 
@@ -218,65 +204,33 @@ export class GoWorkerClient {
     }
     try {
       const batch = JSON.parse(this.socketBuf) as AggregateBatch;
-      this.stampAndDeliver(batch);
+      this.deliver(batch);
     } catch { /* partial line: the worker would only send one mid-shutdown */ }
     this.socketBuf = "";
   }
 
   /**
-   * Qualify the batch's residuals, then hand it on.
+   * Hand a batch on, unless the worker's bucket tables disagree with ours.
    *
-   * The verdict comes from whichever process held the clock. The worker reports
-   * its own scheduling health per window and ships those cells alongside the
-   * residuals they qualify, so that is what is used; the control plane's event
-   * loop times nothing here and its delay is not evidence about these numbers.
-   * A worker too old to report health omits the key entirely, and the old
-   * control-plane gate applies — refusing to guess, in the same spirit as the
-   * bucket-table check above.
+   * Batches used to be filtered here: the worker's per-window health report was
+   * turned into a verdict and any window it condemned had its measurements
+   * dropped before the store ever saw them. That is gone. It silently deleted
+   * evidence the operator could not ask for back — and on the very batches most
+   * worth looking at, since a stalled window is where the interesting tail
+   * lives. The generator's health is still reported; it belongs in the run's
+   * validity verdict, where it is visible, not in a filter nobody can see.
    *
-   * Both arms of the comparison go through one filter. Withholding contaminated
-   * residuals from the gateway arm while keeping them in the direct arm would
-   * shift the reference distribution and understate the gateway by exactly the
-   * generator's own stalls. The raw tail is stamped rather than dropped: those
-   * rows still describe requests the gateway really served, and only their
-   * residual is in doubt.
+   * The bucket-table check stays, because that one is not a judgement call: a
+   * worker whose histogram edges differ writes numbers that are wrong rather
+   * than uncertain, and no downstream reader could tell.
    */
-  private stampAndDeliver(batch: AggregateBatch): void {
+  private deliver(batch: AggregateBatch): void {
     if (!this.bucketsOk) return;
-    const health = Array.isArray(batch.health)
-      ? workerWindowHealth(this.rememberHealth(batch.health))
-      : windowHealth(this.healthCheck);
-    if (Array.isArray(batch.tail)) stampHealthWindows(batch.tail, health);
-    if (Array.isArray(batch.residuals)) {
-      batch.residuals = filterHealthyResiduals(batch.residuals, health);
-    }
     try {
       void this.events.onBatch(batch);
     } catch (e) {
       console.error("[driver:go] ingest failed:", (e as Error).message);
     }
-  }
-
-  /**
-   * Fold the batch's health cells into a short-lived window and return the set
-   * a verdict may be drawn from.
-   *
-   * The worker releases a window's residual cells and its health cell on the
-   * same rule, so they normally arrive together. This exists for the case where
-   * they do not: the two drains read the clock at slightly different instants,
-   * and a socket write can be split across batches. Holding a minute of cells
-   * costs a few hundred bytes and removes a class of silent residual loss where
-   * the evidence arrived one batch after the thing it qualifies.
-   */
-  private rememberHealth(cells: WorkerHealthCell[]): WorkerHealthCell[] {
-    for (const c of cells) {
-      if (typeof c?.windowTs === "number") this.health.set(c.windowTs, c);
-    }
-    if (this.health.size > HEALTH_MEMORY_WINDOWS) {
-      const cutoff = Math.max(...this.health.keys()) - HEALTH_MEMORY_WINDOWS * HEALTH_WINDOW_MS;
-      for (const w of this.health.keys()) if (w < cutoff) this.health.delete(w);
-    }
-    return [...this.health.values()];
   }
 
   /** Send one control message to the worker. No-op when not running. */
@@ -286,20 +240,23 @@ export class GoWorkerClient {
     c.stdin.write(JSON.stringify(obj) + "\n");
   }
 
-  /** Push the configure op; safe before start (the worker applies on next start). */
-  configure(gw: GwTargets, profile: LoadProfile, baselineUrl: string): void {
+  /** Push the configure op; safe before start (the worker applies on next start).
+   *
+   *  `sutUrl` is where the SUT answers with no gateway in front of it. The
+   *  worker no longer sends traffic there — it is passed so the worker knows
+   *  which origin is us, which is what `forwardBasicAuth: "auto"` turns on. */
+  configure(gw: GwTargets, profile: LoadProfile, sutUrl: string): void {
     const raw = expectedAuthHeader();
     let basicAuth = "";
     if (raw) {
       const v = raw.toString("utf-8");
       if (v.startsWith("Basic ")) basicAuth = v.slice(6);
     }
-    const selfOrigin = originOf(baselineUrl) ?? baselineUrl;
+    const selfOrigin = originOf(sutUrl) ?? sutUrl;
     this.send({
       op: "configure",
       gw: { rest: gw.rest, soap: gw.soap },
       profile,
-      baselineUrl,
       selfOrigin,
       basicAuth
     });
