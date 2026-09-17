@@ -40,9 +40,11 @@ docker compose up --build -d
 Or copy `.env.example` to `.env`, fill it in, and `docker compose up -d`.
 Running it as a real service? See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
 
-That's the whole stack: **one container, one port**. The dashboard, the API, the Petstore SUT and the load driver all live in the same process. There is no separate nginx or UI container — the app serves the built dashboard itself, behind the same auth gate.
+That's the whole stack: **one container, two ports**. `8080` is the dashboard, the control API and the load driver; `8081` is the bundled Petstore SUT, which runs as its own process so the gateway under test can be pointed straight at it and so its CPU time is not the driver's. There is no separate nginx or UI container — the app serves the built dashboard itself, behind the same auth gate, and both ports carry that gate.
 
-Default gateway target is the bundled Petstore on this same process (so everything works out of the box). To test a real gateway open **Configure → API Gateway** and set the base URL + API key for **REST and SOAP separately** — a real gateway usually fronts them at different URLs/keys. Environment equivalents are `GW_REST_*` / `GW_SOAP_*` (`GW_REST_BASE_URL`, `GW_REST_API_KEY`, …); the legacy `GW_BASE_URL` / `GW_API_KEY` / `GW_API_KEY_HEADER` / `GW_PATH_PREFIX` still work and apply to both protocols when the protocol-specific variable is unset.
+Default gateway target is the bundled Petstore on `8081` (so everything works out of the box). To test a real gateway open **Configure → API Gateway** and set the base URL + API key for **REST and SOAP separately** — a real gateway usually fronts them at different URLs/keys. Environment equivalents are `GW_REST_*` / `GW_SOAP_*` (`GW_REST_BASE_URL`, `GW_REST_API_KEY`, …); the legacy `GW_BASE_URL` / `GW_API_KEY` / `GW_API_KEY_HEADER` / `GW_PATH_PREFIX` still work and apply to both protocols when the protocol-specific variable is unset.
+
+Pointing a target at `8080` is the one misconfiguration worth naming: the control plane answers, and serves `/health`, but it does not serve the petstore, so every generated request comes back `404`. A stored target from before the SUT moved to its own port is moved forward on startup, with a line in the log saying so.
 
 **The rig's own credential is not sent to your gateway.** `APP_BASIC_AUTH` guards this dashboard; the bundled petstore needs it, an external gateway must never see it. `forwardBasicAuth` (`GW_REST_FORWARD_BASIC_AUTH` / `GW_SOAP_FORWARD_BASIC_AUTH`, or the drawer) controls this per target:
 
@@ -50,7 +52,7 @@ Default gateway target is the bundled Petstore on this same process (so everythi
 - **`always`** — forward regardless. Only if the gateway is configured to accept or pass through the same credential.
 - **`never`** — never forward.
 
-The same rule governs **Test connection**, and its result reports `sentBasicAuth` so a 401 can be read correctly.
+The same rule governs **Test connection**, and its result reports `sentBasicAuth` so a 401 can be read correctly. Test connection probes a route the run itself generates — `GET /api/pets` for REST, a `getPetById` envelope for SOAP — not a liveness endpoint, so a host that is up but serves none of the run's traffic fails the test instead of passing it.
 
 ## Testing a gateway with content validation
 

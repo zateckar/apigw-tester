@@ -20,8 +20,8 @@ import {
   validateGwConfig,
   validateGwTargets
 } from "@apigw/shared";
-import { DEFAULT_GW_TARGETS, DEFAULT_LOAD_PROFILE } from "@apigw/shared";
-import type { GwConfig, RunReport } from "@apigw/shared";
+import { DEFAULT_LOAD_PROFILE } from "@apigw/shared";
+import type { GwConfig, GwTargets, RunReport } from "@apigw/shared";
 import { runPolicyProbes } from "./loadgen/policy.js";
 import { buildRunReport, renderRunReportMarkdown } from "./report.js";
 
@@ -93,6 +93,45 @@ function normalizeServerUrl(raw: string): string | null {
 
 function originOf(url: string): string | null {
   try { return new URL(url).origin; } catch { return null; }
+}
+
+/**
+ * Move a saved target that still points at the control plane's own port.
+ *
+ * The petstore used to be served by the control-plane process, so "point the
+ * rig at itself" meant that port, and that is what got written to the database.
+ * Once the SUT moved out of process that port stopped answering /api/pets, and
+ * a config stored before the move makes every generated request 404 — against a
+ * control plane that is up, reachable and serving /health, so nothing about the
+ * failure says "wrong target".
+ *
+ * Only a target that is unambiguously the old self-reference is moved: the
+ * control plane's exact origin, no path prefix, and only while the petstore
+ * really is elsewhere. A prefix or a different port is somebody's deliberate
+ * topology — a gateway fronting us, a proxy on the way in — and guessing at it
+ * would silently retarget a live measurement, which is worse than the 404.
+ *
+ * Returns null when nothing needed moving, so an untouched config is not
+ * rewritten on every boot.
+ */
+export function repointStrandedSelfTargets(
+  saved: GwTargets,
+  opts: { controlPlaneUrl: string; servesPetstore: boolean; defaults: GwTargets }
+): GwTargets | null {
+  if (opts.servesPetstore) return null; // still ours to answer; the old value is correct
+  const ours = originOf(opts.controlPlaneUrl);
+  if (ours === null) return null;
+  const moved = { ...saved };
+  let changed = false;
+  for (const p of ["rest", "soap"] as const) {
+    const side = saved[p];
+    const to = opts.defaults[p].baseUrl;
+    if (side.pathPrefix !== "" || originOf(side.baseUrl) !== ours || side.baseUrl === to) continue;
+    moved[p] = { ...side, baseUrl: to };
+    changed = true;
+    console.warn(`[gateway] saved ${p} target ${side.baseUrl} is this control plane, which no longer serves the petstore — moved to ${to}`);
+  }
+  return changed ? moved : null;
 }
 
 export function forwardsBasicAuth(target: GwConfig, selfUrl: string): boolean {
@@ -266,10 +305,16 @@ export function buildApp(cfg: AppConfig): BuiltApp {
 
     await schedulePolicies();
     const savedGw = await store.readGateway();
+    const movedGw = savedGw === null ? null : repointStrandedSelfTargets(sanitizeGwTargets(savedGw, runtime.defaultGateway), {
+      controlPlaneUrl: `http://127.0.0.1:${runtime.port}`,
+      servesPetstore: petstore !== null,
+      defaults: runtime.defaultGateway
+    });
     const savedProfile = await store.readProfile();
-    driver.setGw(sanitizeGwTargets(savedGw ?? runtime.defaultGateway, runtime.defaultGateway));
+    driver.setGw(sanitizeGwTargets(movedGw ?? savedGw ?? runtime.defaultGateway, runtime.defaultGateway));
     driver.setProfile(sanitizeLoadProfile(savedProfile ?? cfg.defaultProfile, cfg.defaultProfile));
     if (!savedGw) await store.writeGateway(runtime.defaultGateway);
+    else if (movedGw) await store.writeGateway(movedGw);
     if (!savedProfile) await store.writeProfile(cfg.defaultProfile);
     void driver.init().catch(e => console.error("driver init failed", e));
   })();
@@ -370,11 +415,17 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       return json(200, { items: await store.recent(n), histogramEdges: HISTOGRAM_EDGES });
     },
 
-    "GET /api/config/gateway": async () => json(200, sanitizeGwTargets(await store.readGateway() ?? DEFAULT_GW_TARGETS)),
+    // runtime, not cfg: the default has to be the port the SUT actually bound,
+    // and it has to be the same default every other handler falls back to.
+    // Answering with the library placeholder handed the dashboard a target on
+    // this control plane's own port, which stopped serving the petstore when
+    // the SUT moved out of process — so saving what the form showed was enough
+    // to make every request 404.
+    "GET /api/config/gateway": async () => json(200, sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway)),
     "PUT /api/config/gateway": { handler: async (ctx) => {
       const problem = validateGwTargets(ctx.jsonBody);
       if (problem) return json(400, { error: problem });
-      const clean = sanitizeGwTargets(ctx.jsonBody, sanitizeGwTargets(await store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway));
+      const clean = sanitizeGwTargets(ctx.jsonBody, sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway));
       await store.writeGateway(clean);
       driver.setGw(clean);
       return json(200, { saved: true, gateway: clean });
@@ -385,15 +436,20 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const protocol = body.protocol === "soap" ? "soap" : "rest";
       const problem = validateGwConfig(body);
       if (problem) return json(400, { ok: false, error: problem });
-      const persisted = sanitizeGwTargets(await store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+      const persisted = sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway);
       const probe = sanitizeGwConfig(body, persisted[protocol]);
       const prefix = probe.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
-      // a SOAP endpoint answers POSTs, not GET /health — probe it with a real
-      // getPetById call so a healthy route is not reported as down. Where the
-      // endpoint lives is deployment-specific: the bundled petstore serves it
-      // at <prefix>/soap/petservice, while a gateway may front the whole
-      // prefix as the SOAP service. Try the suffix first, then the bare
-      // prefix on a 404.
+      // Both sides probe a route the load itself generates, because the only
+      // useful question here is "will the run work", and a liveness endpoint
+      // does not answer it. /health used to stand in for the REST side and
+      // reported a confident green against this control plane's own port —
+      // which serves /health and nothing else the run needs, so every request
+      // then 404'd behind a passing test.
+      //
+      // Where the SOAP endpoint lives is deployment-specific: the bundled
+      // petstore serves it at <prefix>/soap/petservice, while a gateway may
+      // front the whole prefix as the SOAP service. Try the suffix first, then
+      // the bare prefix on a 404.
       const isSoap = protocol === "soap";
       const basePrefix = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}`;
 
@@ -415,7 +471,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const soapProbeBody = '<?xml version="1.0" encoding="utf-8"?>' +
         '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="http://petstore.apigw.test/soap">' +
         '<soap:Body><tns:getPetByIdRequest><petId>1</petId></tns:getPetByIdRequest></soap:Body></soap:Envelope>';
-      const url = isSoap ? `${basePrefix}/soap/petservice` : `${basePrefix}/health`;
+      const url = isSoap ? `${basePrefix}/soap/petservice` : `${basePrefix}/api/pets?size=1`;
       try {
         let upstream = await fetch(url, isSoap
           ? { method: "POST", headers, body: soapProbeBody, signal: ac.signal }
@@ -461,7 +517,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       startingRun = true;
       try {
       const profile = sanitizeLoadProfile(await store.readProfile() ?? cfg.defaultProfile, cfg.defaultProfile);
-      const gateway = sanitizeGwTargets(await store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway);
+      const gateway = sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway);
       const runId = `run-${Date.now()}`;
       await store.recordRunStart(runId, profile);
       driver.setGw(gateway);
@@ -556,7 +612,7 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       run,
       summary,
       scope: await store.windowScope(runId, run.startedAt, to),
-      gateway: sanitizeGwTargets(await store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway),
+      gateway: sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway),
       policies: await store.readPolicyResults(),
       policyConfig: await store.readPolicyConfig(),
       slo: await store.readSlo()

@@ -93,8 +93,12 @@ export interface GwConfig {
 }
 
 export const DEFAULT_GW_CONFIG: GwConfig = {
-  // the bundled petstore on this same process/port — works out of the box
-  baseUrl: "http://127.0.0.1:8080",
+  // The bundled SUT's own port. A placeholder only: the petstore is its own
+  // process now, its port is configurable, and it can be asked to bind an
+  // ephemeral one — so the server derives the real default from its runtime
+  // config and every handler answers with that. Nothing but a client with no
+  // server reply yet should ever be reading this.
+  baseUrl: "http://127.0.0.1:8081",
   apiKey: "",
   apiKeyHeader: "X-API-Key",
   pathPrefix: "",

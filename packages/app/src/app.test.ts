@@ -425,18 +425,20 @@ describe("apigw-tester app (auth protected)", () => {
     const probe = async (cfg: Record<string, unknown>) =>
       authed("/api/config/gateway/test", { method: "POST", body: JSON.stringify(cfg) });
 
-    // REST probes /health (public); protocol picks which persisted side the
-    // probe falls back to
-    const ok = (await (await probe({ protocol: "rest", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
+    // REST probes a route the run itself generates, not a liveness endpoint;
+    // protocol picks which persisted side the probe falls back to. The
+    // credential is forwarded explicitly because this suite listens on an
+    // ephemeral port, which "auto" cannot recognise as our own origin.
+    const ok = (await (await probe({ protocol: "rest", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "", forwardBasicAuth: "always" })).json()) as {
       ok: boolean; status: number; url: string; latencyMs: number;
     };
     expect(ok.ok).toBe(true);
     expect(ok.status).toBe(200);
-    expect(ok.url).toBe(`${base}/health`);
+    expect(ok.url).toBe(`${base}/api/pets?size=1`);
     expect(typeof ok.latencyMs).toBe("number");
 
-    // SOAP has no GET /health — the probe issues a real getPetById envelope,
-    // and a 200 proves the envelope round-trips through the gateway
+    // the SOAP side's equivalent: a real getPetById envelope, where a 200
+    // proves the envelope round-trips through the gateway
     const okSoap = (await (await probe({ protocol: "soap", baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
       ok: boolean; status: number; url: string; latencyMs: number;
     };
@@ -448,7 +450,7 @@ describe("apigw-tester app (auth protected)", () => {
     const prefixed = (await (await probe({ baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "/v1" })).json()) as {
       url: string;
     };
-    expect(prefixed.url).toBe(`${base}/v1/health`);
+    expect(prefixed.url).toBe(`${base}/v1/api/pets?size=1`);
 
     // unreachable reports a reason instead of throwing
     const dead = (await (await probe({ baseUrl: "http://127.0.0.1:1", apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "" })).json()) as {
