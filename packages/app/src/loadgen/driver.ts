@@ -202,6 +202,17 @@ export const MAX_REFERENCE_INFLIGHT = 256;
 /** how long stop() waits for in-flight requests before giving up on them */
 const DRAIN_TIMEOUT_MS = 10_000;
 const DRAIN_POLL_MS = 250;
+/**
+ * How long the Go path waits for the worker's "stopped" ack before ending the
+ * run anyway.
+ *
+ * The worker's own stop is bounded — its request drain and its reference drain
+ * each get DrainTimeout — so an ack that has not arrived by now is not late,
+ * it is not coming: a wedged flush, a dead child, a lost line. Without this the
+ * run sits at "stopping" until the process restarts, and the operator cannot
+ * start the next one.
+ */
+const GO_STOP_ACK_TIMEOUT_MS = 30_000;
 /** ids of pets we created, kept so deletePet has something real to remove */
 const MAX_TRACKED_IDS = 2_000;
 /** give up on a batch the store keeps refusing, rather than wedging the spool */
@@ -256,6 +267,8 @@ export class Driver {
   /** arm-only deadline for the Go path: tickTimer does not run there, so a one-
    *  shot watchdog is what enforces durationMinutes for Go-driven runs */
   private durationTimer: ReturnType<typeof setTimeout> | null = null;
+  /** backstop for a "stopped" ack the Go worker never sends */
+  private goStopTimer: ReturnType<typeof setTimeout> | null = null;
 
   private inFlight = 0;
   private activeRequests = new Set<AbortController>();
@@ -369,12 +382,17 @@ export class Driver {
           }
         },
         onStopped: () => {
-          if (this.state === "running") {
-            this.state = "idle";
-            this.runId = null;
-            this.startedAt = null;
-            this.stoppedAt = null;
-          }
+          // Accepting only "running" here was the bug behind a run that said
+          // "stopping" forever: stop() moves us to "stopping" and *then* asks
+          // the worker to stop, so its ack always arrived in the one state this
+          // guard rejected. The ack was dropped and nothing else ever moved the
+          // run to idle — only a restart, or starting another run, cleared it.
+          if (this.state === "idle") return;
+          if (this.goStopTimer) { clearTimeout(this.goStopTimer); this.goStopTimer = null; }
+          this.state = "idle";
+          this.runId = null;
+          this.startedAt = null;
+          this.stoppedAt = null;
         }
       });
       client.setHealthCheck((from, to) => this.healthCheck(from, to));
@@ -497,6 +515,8 @@ export class Driver {
     const goClient = this.go();
     if (goClient) {
       if (this.state === "running") return { ok: true, runId: this.runId ?? runId };
+      // a stop still waiting on its ack is superseded by this run
+      if (this.goStopTimer) { clearTimeout(this.goStopTimer); this.goStopTimer = null; }
       void goClient.ensureStarted().then(() => {
         goClient.configure(this.gw, this.profile, this.baselineUrl);
         goClient.start(runId);
@@ -587,7 +607,22 @@ export class Driver {
       this.goClient.stop();
       this.state = "stopping";
       this.stoppedAt = Date.now();
-      // the "stopped" broadcast (and the worker's final batch) move us to idle
+      // the "stopped" broadcast (and the worker's final batch) move us to idle;
+      // this is the backstop for when it never comes
+      if (this.goStopTimer) clearTimeout(this.goStopTimer);
+      this.goStopTimer = setTimeout(() => {
+        this.goStopTimer = null;
+        if (this.state !== "stopping") return; // the ack landed, or a new run took over
+        console.warn(
+          `[driver] run ${runId}: no stop ack from the go worker after ` +
+          `${GO_STOP_ACK_TIMEOUT_MS / 1000}s — ending the run anyway`
+        );
+        this.state = "idle";
+        this.runId = null;
+        this.startedAt = null;
+        this.stoppedAt = null;
+      }, GO_STOP_ACK_TIMEOUT_MS);
+      this.goStopTimer.unref?.();
       return { stopped: true, runId };
     }
     if (this.state === "idle") return { stopped: true, runId: null };
@@ -1058,6 +1093,7 @@ export class Driver {
 
   async shutdown(): Promise<void> {
     if (this.durationTimer) { clearTimeout(this.durationTimer); this.durationTimer = null; }
+    if (this.goStopTimer) { clearTimeout(this.goStopTimer); this.goStopTimer = null; }
     if (this.goClient) {
       // stop the timers the ts path may have armed before the client came up
       if (this.tickTimer) clearInterval(this.tickTimer);

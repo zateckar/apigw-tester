@@ -255,3 +255,25 @@ func (s *Streamer) Drain() []wire.BaselineSample {
 // Wait blocks until outstanding probes finish, so a run's final flush carries
 // the reference observations covering its last seconds.
 func (s *Streamer) Wait() { s.wg.Wait() }
+
+// WaitFor is Wait with a deadline, reporting whether the probes finished.
+//
+// A probe's own budget runs to BudgetFor(class) — a minute for the large
+// classes — so an unbounded wait here let one straggler hold the whole stop
+// open for that long, well past the bound the request drain gets. A run that
+// will not end is worse than a reference arm missing its last few samples, and
+// the samples are not even lost: a probe that lands after the deadline still
+// spools, and the next flush carries it.
+func (s *Streamer) WaitFor(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}

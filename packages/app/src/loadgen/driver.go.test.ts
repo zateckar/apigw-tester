@@ -248,6 +248,64 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
     },
     { timeout: 120_000 }
   );
+
+  it("returns to idle after a stop", async () => {
+    // The run used to wedge here permanently. stop() moves the driver to
+    // "stopping" and then asks the worker to stop; the worker's ack was only
+    // accepted while the state was still "running", so the one state the ack
+    // could ever arrive in was the one that dropped it. The dashboard showed
+    // "stopping" until the process was restarted, and no further run could be
+    // started. Asserting on the state after the stop is what catches that —
+    // asserting the stop call returns 200 does not, because it always did.
+    process.env["LOADGEN_BACKEND"] = "go";
+    const built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
+    built.driver.setHealthCheck(() => null);
+    const server = built.listen(0);
+    await built.ready;
+    const base = `http://127.0.0.1:${server.port}`;
+    const authed = (p: string, init?: RequestInit) =>
+      fetch(`${base}${p}`, { ...init, headers: { authorization: AUTH, "Content-Type": "application/json" } });
+
+    try {
+      await authed("/api/config/gateway", { method: "PUT", body: JSON.stringify({
+        rest: { baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "", forwardBasicAuth: "always" },
+        soap: { baseUrl: base, apiKey: "", apiKeyHeader: "X-API-Key", pathPrefix: "", forwardBasicAuth: "always" }
+      }) });
+      await authed("/api/config/profile", { method: "PUT", body: JSON.stringify({
+        mode: "constant", rps: 50, maxConcurrency: 50, soapRatioPct: 10, invalidRatioPct: 2,
+        scenarioWeights: { listPets: 50, getPet: 20, createPet: 10, updatePet: 5, deletePet: 5, placeOrder: 10 }
+      }) });
+
+      await authed("/api/run/start", { method: "POST", body: "{}" });
+      await sleep(3000);
+      expect((await (await authed("/api/run/status")).json()).state).toBe("running");
+
+      const stoppedAt = Date.now();
+      await authed("/api/run/stop", { method: "POST" });
+      // Deliberately generous. A healthy stop lands in a few seconds, but this
+      // suite runs servers in parallel and the bound must not become a flake
+      // detector — the bug this guards against never reaches idle at all, so
+      // any finite bound catches it.
+      let state = "";
+      for (let i = 0; i < 300; i++) {
+        state = (await (await authed("/api/run/status")).json()).state;
+        if (state === "idle") break;
+        await sleep(200);
+      }
+      const tookMs = Date.now() - stoppedAt;
+      if (state !== "idle") console.error(`[test] still "${state}" after ${tookMs}ms`);
+      expect(state).toBe("idle");
+
+      // and the rig is usable again: a wedged run refused the next start
+      const restart = await authed("/api/run/start", { method: "POST", body: "{}" });
+      expect(restart.status).toBe(200);
+      await authed("/api/run/stop", { method: "POST" });
+    } finally {
+      await built.shutdown();
+      server.stop(true);
+      delete process.env["LOADGEN_BACKEND"];
+    }
+  }, { timeout: 180_000 });
 });
 
 describe("workerBinaryPath", () => {

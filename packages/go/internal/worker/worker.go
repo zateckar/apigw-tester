@@ -290,9 +290,14 @@ func (w *Worker) Stop() {
 		// leaked requests are counted in the flush as they land; proceeding is
 		// the TS driver's behaviour after its drain timeout
 	}
-	// the reference arm drains too: flushing without it would leave the run's
-	// last minute comparing full gateway traffic against a truncated control
-	w.reference.Wait()
+	// The reference arm drains too: flushing without it would leave the run's
+	// last minute comparing full gateway traffic against a truncated control.
+	// Bounded like the request drain above — it used to be unbounded, and a
+	// single large-class probe with a minute-long budget could hold the whole
+	// stop open, which the control plane sees as a run stuck at "stopping".
+	if !w.reference.WaitFor(DrainTimeout) {
+		fmt.Fprintf(os.Stderr, "[worker] reference drain timed out after %s; stopping anyway\n", DrainTimeout)
+	}
 
 	w.flush(true)
 	// the final tally, after the drain: without it the last status is up to
@@ -310,7 +315,7 @@ func (w *Worker) Stop() {
 func (w *Worker) Shutdown() {
 	w.stopAll.Do(func() {
 		w.Stop()
-		w.reference.Wait()
+		w.reference.WaitFor(DrainTimeout)
 		w.reaper.Stop()
 		close(w.done)
 		<-w.flushDone
