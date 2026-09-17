@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LIMITS, MEASUREMENT_VERSION, RAW_TAIL_PER_FLUSH, type RequestResult, type SystemSample } from "@apigw/shared";
+import { LIMITS, MEASUREMENT_VERSION, RAW_TAIL_PER_FLUSH, type RequestResult, type SystemSample, type WorkerHealthCell } from "@apigw/shared";
 import { createMetricsStore } from "./server.js";
 import { aggregateBatch } from "./aggregate.js";
 import { openDb } from "./db.js";
@@ -337,8 +337,95 @@ describe("measurement validity", () => {
     const v = s.summary(300_000).validity;
     expect(v.cpuProcessPctMax).toBeNull();
     expect(v.eventLoopP99MsMax).toBeNull();
+    expect(v.workerSchedP99MsMax).toBeNull();
     expect(v.targetRps).toBeNull();
     s.close();
+  });
+
+  describe("judging the process that held the clock", () => {
+    const workerCell = (ts: number, over: Partial<WorkerHealthCell> = {}): WorkerHealthCell => ({
+      windowTs: Math.floor(ts / 2_000) * 2_000, fromTs: ts, toTs: ts + 2_000,
+      samples: 8, schedP99Ms: 0.05, schedMaxMs: 0.4, cpuPct: 20, goroutines: 40, ...over
+    });
+
+    it("ignores this process's event loop when the worker generated the load", () => {
+      // The crux. With the Go backend every clock is read inside the worker, so
+      // this loop is idle bookkeeping — and on Windows an idle Bun process
+      // reports an event-loop p99 of up to ~21ms at 0% CPU. Consulting it here
+      // disqualified windows for the host's timer granularity: a run at 20 rps
+      // on an unloaded machine came back "not trustworthy".
+      const s = createMetricsStore(":memory:");
+      const ts = Date.now();
+      s.ingestAggregate(aggregateBatch({ batchId: "gowin", results: many(10, { ts }) }));
+      s.ingestAggregate({ ...aggregateBatch({ batchId: "gohealth", results: [] }), health: [workerCell(ts)] });
+      s.recordHealth(health({ ts, cpuProcessPct: 1, eventLoopP99ms: 450 }));
+
+      const v = s.summary(300_000).validity;
+      expect(v.ok).toBe(true);
+      expect(v.eventLoopP99MsMax).toBeNull();
+      expect(v.workerSchedP99MsMax).toBeCloseTo(0.05, 10);
+      s.close();
+    });
+
+    it("fails the window when the worker's own scheduler was the delay", () => {
+      const s = createMetricsStore(":memory:");
+      const ts = Date.now();
+      s.ingestAggregate({
+        ...aggregateBatch({ batchId: "stalled", results: many(10, { ts }) }),
+        health: [workerCell(ts), workerCell(ts, { schedP99Ms: 40, schedMaxMs: 120 })]
+      });
+
+      const v = s.summary(300_000).validity;
+      expect(v.ok).toBe(false);
+      // the max across the minute's windows, not a mean: one stalled 2s window
+      // is the event worth surfacing and an average would bury it
+      expect(v.workerSchedP99MsMax).toBe(40);
+      expect(v.reasons.some((r) => r.includes("scheduling latency"))).toBe(true);
+      s.close();
+    });
+
+    it("still judges this event loop when the in-process driver generated the load", () => {
+      // no worker health for the window means nothing else was holding the
+      // clock, and then this loop's delay is in every number the window reports
+      const s = createMetricsStore(":memory:");
+      const ts = Date.now();
+      s.ingestBatch({ batchId: "tsdriver", results: many(10, { ts }) });
+      s.recordHealth(health({ ts, cpuProcessPct: 1, eventLoopP99ms: 450 }));
+
+      const v = s.summary(300_000).validity;
+      expect(v.ok).toBe(false);
+      expect(v.eventLoopP99MsMax).toBe(450);
+      expect(v.reasons.some((r) => r.includes("event-loop"))).toBe(true);
+      s.close();
+    });
+
+    it("does not fire on a loop delay that is the platform's floor rather than ours", () => {
+      // 21ms is what an idle Bun process on Windows reports with no application
+      // in it. A limit under that is not a gate, it is a permanent fail.
+      const s = createMetricsStore(":memory:");
+      const ts = Date.now();
+      s.ingestBatch({ batchId: "floor", results: many(10, { ts }) });
+      s.recordHealth(health({ ts, cpuProcessPct: 0, eventLoopP99ms: 21 }));
+
+      const v = s.summary(300_000).validity;
+      expect(v.ok).toBe(true);
+      s.close();
+    });
+
+    it("flags a worker burning its own CPU", () => {
+      const s = createMetricsStore(":memory:");
+      const ts = Date.now();
+      s.ingestAggregate({
+        ...aggregateBatch({ batchId: "hotworker", results: many(10, { ts }) }),
+        health: [workerCell(ts, { cpuPct: 97 })]
+      });
+
+      const v = s.summary(300_000).validity;
+      expect(v.ok).toBe(false);
+      expect(v.workerCpuPctMax).toBe(97);
+      expect(v.reasons.some((r) => r.includes("available CPU"))).toBe(true);
+      s.close();
+    });
   });
 
   it("sums shed accounting across the batches that report it", () => {

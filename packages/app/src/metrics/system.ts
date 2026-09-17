@@ -1,7 +1,6 @@
 import os from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
-import { VALIDITY_LIMITS } from "@apigw/shared";
 import { readFileSync } from "node:fs";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import type { AggregateBatch, SystemSample } from "@apigw/shared";
@@ -23,7 +22,6 @@ export interface SystemSampler {
   stop(): void;
   latest(): SystemSample;
   sampleNow(): void;
-  qualityBetween(from: number, to: number): string | null;
   history(n?: number): SystemSample[];
   /** Called once per ingested batch so appInBps/appOutBps can be derived
    *  without the sampler reaching into the metrics store. */
@@ -215,26 +213,17 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
   // A 20ms-resolution histogram trades a pinch of low-end accuracy for a
   // permanent memory cap; enabled once because the histogram survives reset().
   //
-  // Note for anyone tuning this: qualityBetween thresholds eventLoopMaxMs —
-  // the worst single timer wakeup in a 2s interval — against a 10ms limit, and
-  // on an idle process that number is the platform's timer granularity rather
-  // than this process's load. Measured here on Windows (15.6ms system tick):
-  // a Bun process with no application in it at all reports a max lateness of
-  // ~20ms at this resolution and ~27ms at 1ms resolution. Both are above the
-  // limit. Three things that look like levers are not:
+  // What this number can and cannot carry. On Windows (15.6ms system tick) an
+  // idle Bun process with no application in it reports an event-loop p99 of up
+  // to ~21ms, at 0% process CPU. Finer resolution makes it worse by catching
+  // more outliers, and p99 is indistinguishable from max here at ~100 samples
+  // per interval, so neither is a lever. The floor is the platform's, not ours.
   //
-  //   - finer resolution makes it worse, by catching more outliers;
-  //   - p99 is indistinguishable from max here (~100 samples per interval), so
-  //     reading the statistic the limit is named for changes nothing;
-  //   - it is not caused by anything the control plane does. With the petstore
-  //     in this process and with it split out, 200rps disqualifies 94.9% and
-  //     92.7% of windows respectively, at 0% process CPU either way.
-  //
-  // What it means in practice: when the control plane is idle — which is now
-  // the intended state, since neither the load nor the backend runs here — a
-  // "local event-loop stall" verdict can be the host's timer behaviour and not
-  // evidence about the measurement at all. Deciding what the gate should read
-  // instead is a change to the trustworthiness model, not a tuning knob.
+  // So this is only evidence when this process is the one holding the clock —
+  // the in-process TS driver. With the Go worker, validityFor reads the
+  // worker's goroutine scheduling p99 instead and does not consult this at all;
+  // it used to, and disqualified idle windows for the host's timer granularity.
+  // VALIDITY_LIMITS.eventLoopP99Ms is set above the measured floor accordingly.
   let loopHist: ReturnType<typeof monitorEventLoopDelay> | null = null;
   try {
     loopHist = monitorEventLoopDelay({ resolution: 20 });
@@ -392,18 +381,6 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
       loopHist?.disable();
     },
     sampleNow: tick,
-    qualityBetween(from, to) {
-      // Samples describe the interval since the previous read, not one instant.
-      const overlap = samples.filter(s => s.intervalStartTs !== undefined && s.ts >= from && s.intervalStartTs <= to);
-      if (!overlap.length || overlap[0]!.intervalStartTs! > from || overlap[overlap.length - 1]!.ts < to - 1) return "health coverage unavailable";
-      for (const s of overlap) {
-        if (s.cpuCorePct === null || s.cpuCorePct === undefined || s.eventLoopMaxMs == null) return "health unavailable";
-        if ((s.cpuThrottledMs ?? 0) > 0) return "local CPU throttling";
-        if (s.cpuCorePct > 85 || (s.cpuCapacityPct ?? 0) > 85) return "local CPU saturation";
-        if (s.eventLoopMaxMs > VALIDITY_LIMITS.eventLoopP99Ms) return "local event-loop stall";
-      }
-      return null;
-    },
     latest() {
       // before start() (or after a tick threw) report levels with null rates
       return latestSample ?? nullSample(Date.now());

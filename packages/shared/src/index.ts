@@ -605,12 +605,12 @@ export interface AggregateBatch {
    * and `undefined` from one that does not. An empty array means "this window
    * was quiet"; `undefined` means the generator cannot see itself.
    *
-   * This is evidence *about* a window, reported alongside it. It is no longer
-   * used to withhold measurements: doing so silently deleted data the operator
-   * had no way to ask for back, and the thing it was protecting — a two-arm
-   * difference thin enough for one stalled window to move — is gone. It belongs
-   * in the run's validity verdict, next to VALIDITY_LIMITS.workerSchedP99Ms,
-   * where a saturated generator is reported rather than quietly compensated for.
+   * This is evidence *about* a window, reported alongside it. It is not used to
+   * withhold measurements: doing so silently deleted data the operator had no
+   * way to ask for back. It lands in the run's validity verdict instead — see
+   * VALIDITY_LIMITS.workerSchedP99Ms — where a saturated generator is reported
+   * rather than quietly compensated for, and where the reader can see both the
+   * number and the reason to doubt it.
    */
   health?: WorkerHealthCell[];
 }
@@ -823,12 +823,26 @@ export const VALIDITY_LIMITS = {
   /**
    * Event-loop stall that starts showing up in measured latency.
    *
-   * Applies only when the control plane's own loop is the instrument — i.e.
-   * the in-process TS driver. With the Go backend every clock is read inside
-   * the worker, and this process's loop delay says nothing about the numbers;
-   * see workerSchedP99Ms.
+   * Applies only when the control plane's own loop is the instrument — i.e. the
+   * in-process TS driver. With the Go backend every clock is read inside the
+   * worker, and this process's loop delay says nothing about the numbers; the
+   * verdict gates on workerSchedP99Ms instead and does not consult this at all.
+   *
+   * Was 10ms, which is below this instrument's noise floor and so could not
+   * pass. Measured on Windows (15.6ms system tick), control plane started and
+   * then left completely idle, `max` over the window of the per-sample
+   * event-loop p99 — the exact quantity the gate reads — three passes:
+   *
+   *   9.5ms   14.9ms   20.6ms      at 0.0-0.1% process CPU
+   *
+   * Two of three disqualified a window in which this process did nothing at
+   * all. 50ms is above the observed idle ceiling with room to spare, and a loop
+   * delay that large is unambiguously the generator's story: it adds up to 50ms
+   * to a response the gateway may have served in one. Nothing between ~21ms and
+   * the floor is resolvable with this instrument on this platform, so a tighter
+   * limit would be a number rather than a measurement.
    */
-  eventLoopP99Ms: 10,
+  eventLoopP99Ms: 50,
   /**
    * Scheduling latency, p99 over a health window, past which the generator's
    * own delay is a material part of what it measured.
@@ -906,8 +920,18 @@ export interface WindowValidity {
   targetRps: number | null;
   /** rate actually issued */
   achievedRps: number;
+  /** peak process CPU of whichever process held the clock, as a share of the
+   *  whole machine. Null when nothing measured it. */
   cpuProcessPctMax: number | null;
+  /** peak event-loop p99 of the control plane. Null when the control plane was
+   *  not the instrument — a Go-backed run reads workerSchedP99MsMax instead,
+   *  and this process's loop delay is not evidence about those numbers. */
   eventLoopP99MsMax: number | null;
+  /** peak goroutine scheduling p99 inside the Go worker, ms. Null when no
+   *  worker health covered the window (no run, or the TS driver). */
+  workerSchedP99MsMax: number | null;
+  /** peak CPU inside the Go worker, as a share of its runtime's available CPU */
+  workerCpuPctMax: number | null;
 }
 
 /**

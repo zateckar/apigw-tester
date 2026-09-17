@@ -238,7 +238,7 @@ and from the Docker context.
 | Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme; "non-backend time" is the headline metric |
 | Status dimension | `packages/shared/` (`STATUS_BUCKETS`) | Every response is bucketed by status, so 401/403/429 and 502/503/504 are visible instead of folded away — see below |
 | Policy probes | `packages/app/src/loadgen/policy.ts` | Eight deliberate probes (auth, quota, payload cap, upstream timeout, cache, route allowlist, CORS) with `pass` / `not-enforced` / `fail` / `error` outcomes |
-| Validity gate | `packages/app/src/metrics/server.ts` (`validityFor`) | Load shed + generator CPU/event-loop saturation, so a window the rig could not honestly measure is marked as such |
+| Validity gate | `packages/app/src/metrics/server.ts` (`validityFor`) | Load shed, lost measurements, connect failures, and saturation **of the process that held the stopwatch** — the Go worker's goroutine scheduling p99, or the control plane's event loop when the in-process driver generated the run. A window the rig could not honestly measure is marked as such |
 | Run report | `packages/app/src/report.ts` | Per-run JSON + Markdown with a `pass` / `fail` / `inconclusive` verdict against configured SLOs, API keys redacted |
 | Shared types | `packages/shared/` | Types **and** the config sanitizers the server, driver and UI all share |
 

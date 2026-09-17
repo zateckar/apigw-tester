@@ -144,6 +144,23 @@ export function openDb(path: string): DbHandle {
       loop_p99_max REAL NOT NULL DEFAULT 0
     );
 
+    -- Worker health per minute: the same question as host_health, asked of the
+    -- process that actually held the stopwatch. With the Go backend every clock
+    -- is read inside the worker, so this process's event loop says nothing
+    -- about the numbers and that one's scheduler says everything.
+    --
+    -- Rolled to the minute from HEALTH_WINDOW_MS cells. The maxima are what the
+    -- verdict reads — one stalled 2s window inside a minute is exactly the
+    -- event worth surfacing, and a mean over the minute would bury it.
+    CREATE TABLE IF NOT EXISTS worker_health (
+      bucket_ts INTEGER PRIMARY KEY,
+      windows INTEGER NOT NULL DEFAULT 0,
+      samples INTEGER NOT NULL DEFAULT 0,
+      sched_p99_max REAL NOT NULL DEFAULT 0,
+      sched_max_max REAL NOT NULL DEFAULT 0,
+      cpu_max REAL NOT NULL DEFAULT 0
+    );
+
     -- Latest outcome per gateway policy probe; one row per policy, overwritten.
     CREATE TABLE IF NOT EXISTS policy_results (
       id TEXT PRIMARY KEY,

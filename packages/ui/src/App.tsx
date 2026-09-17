@@ -9,7 +9,7 @@ import {
   DEFAULT_GW, DEFAULT_PROFILE, type SummaryWindow
 } from "./api";
 import type { GwTargets, LoadProfile, PolicyState, RunEvent, StatusBucket, VerdictState } from "./api";
-import { GATEWAY_FAULT_BUCKETS } from "@apigw/shared";
+import { GATEWAY_FAULT_BUCKETS, VALIDITY_LIMITS } from "@apigw/shared";
 import ConfigDrawer from "./ConfigDrawer";
 
 /** label and summary window are the same value on purpose: the KPI tiles used
@@ -491,6 +491,17 @@ export default function App() {
               {stat(sys.current.eventLoopP99ms ?? undefined, (n) => `${n.toFixed(1)} ms`)}
             </b>
           </div>
+          {/* The generator's own scheduler, when the Go worker is generating.
+              That is the clock the measurements are read on, so it — not the
+              loop above — is what the validity verdict gates on. */}
+          {validity?.workerSchedP99MsMax != null && (
+            <div className="sitem" title="Worst 2-second window's goroutine scheduling latency at p99, inside the load generator. Added to every measured TTFB without being added to the backend's own clock.">
+              <span>Generator sched p99</span>
+              <b style={{ color: validity.workerSchedP99MsMax > VALIDITY_LIMITS.workerSchedP99Ms ? "var(--err)" : undefined }}>
+                {validity.workerSchedP99MsMax.toFixed(2)} ms
+              </b>
+            </div>
+          )}
           <div className="sitem">
             <span>App ⇅</span>
             <b>{fmtBytes(sys.current.appInBps)}/s in · {fmtBytes(sys.current.appOutBps)}/s out</b>

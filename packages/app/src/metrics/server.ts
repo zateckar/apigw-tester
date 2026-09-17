@@ -377,6 +377,16 @@ export function createMetricsStore(dbPath: string): MetricsStore {
        loop_p99_sum = loop_p99_sum + excluded.loop_p99_sum,
        loop_p99_max = MAX(loop_p99_max, excluded.loop_p99_max)`
   );
+  const upsertWorkerHealth = db.prepare(
+    `INSERT INTO worker_health (bucket_ts, windows, samples, sched_p99_max, sched_max_max, cpu_max)
+     VALUES (?, 1, ?, ?, ?, ?)
+     ON CONFLICT(bucket_ts) DO UPDATE SET
+       windows = windows + 1,
+       samples = samples + excluded.samples,
+       sched_p99_max = MAX(sched_p99_max, excluded.sched_p99_max),
+       sched_max_max = MAX(sched_max_max, excluded.sched_max_max),
+       cpu_max = MAX(cpu_max, excluded.cpu_max)`
+  );
   const upsertPolicy = db.prepare(
     `INSERT INTO policy_results (id, checked_at, payload) VALUES (?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET checked_at = excluded.checked_at, payload = excluded.payload`
@@ -478,6 +488,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
               COALESCE(SUM(samples),0) AS samples
        FROM host_health WHERE bucket_ts >= ? AND bucket_ts <= ?`
     ).get(fromB, toB) as { cpuMax: number; loopMax: number; samples: number };
+    const worker = db.prepare(
+      `SELECT COALESCE(MAX(sched_p99_max),-1) AS schedMax, COALESCE(MAX(cpu_max),-1) AS cpuMax,
+              COALESCE(SUM(windows),0) AS windows
+       FROM worker_health WHERE bucket_ts >= ? AND bucket_ts <= ?`
+    ).get(fromB, toB) as { schedMax: number; cpuMax: number; windows: number };
 
     const dropped = Number(shed.dropped) || 0;
     const resultsLost = Number(shed.resultsLost) || 0;
@@ -487,7 +502,20 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const shedPct = intended === 0 ? 0 : (100 * dropped) / intended;
     const targetRps = Number(shed.ticks) > 0 ? Number(shed.targetSum) / Number(shed.ticks) : null;
     const cpuMax = Number(health.samples) > 0 && health.cpuMax >= 0 ? health.cpuMax : null;
-    const loopMax = Number(health.samples) > 0 && health.loopMax >= 0 ? health.loopMax : null;
+    // Whichever process held the stopwatch is the one on trial. With the Go
+    // worker every clock is read over there, and this process's event loop is
+    // idle bookkeeping — on an idle Bun process on Windows its p99 reads up to
+    // ~21ms against what used to be a 10ms limit, so consulting it here
+    // disqualified windows for the host's timer granularity. Worker health
+    // present means the worker generated the window; absent means the
+    // in-process driver did, and then this loop IS the instrument.
+    const workerWindows = Number(worker.windows) || 0;
+    const workerMeasured = workerWindows > 0;
+    const schedMax = workerMeasured && worker.schedMax >= 0 ? worker.schedMax : null;
+    const workerCpuMax = workerMeasured && worker.cpuMax >= 0 ? worker.cpuMax : null;
+    const loopMax = !workerMeasured && Number(health.samples) > 0 && health.loopMax >= 0
+      ? health.loopMax
+      : null;
 
     const reasons: string[] = [];
     if (shedPct > VALIDITY_LIMITS.shedPct) {
@@ -525,6 +553,21 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     if (loopMax !== null && loopMax > VALIDITY_LIMITS.eventLoopP99Ms) {
       reasons.push(`event-loop delay reached ${loopMax.toFixed(0)} ms (limit ${VALIDITY_LIMITS.eventLoopP99Ms} ms) — every latency in this window is inflated by that much`);
     }
+    if (schedMax !== null && schedMax > VALIDITY_LIMITS.workerSchedP99Ms) {
+      // The generator's goroutine sat runnable this long before it could read
+      // the clock, and that delay lands whole inside ttfb − serverMs. It is
+      // reported, not compensated for: nothing here can tell how much of the
+      // window's non-backend time it accounts for.
+      reasons.push(
+        `the load generator's own scheduling latency reached ${schedMax.toFixed(1)} ms at p99 ` +
+        `(limit ${VALIDITY_LIMITS.workerSchedP99Ms} ms) — that delay is added to every measured ` +
+        `TTFB in this window without being added to the backend's own clock, so it reads as ` +
+        `non-backend time that never happened`
+      );
+    }
+    if (workerCpuMax !== null && workerCpuMax > VALIDITY_LIMITS.workerCpuPct) {
+      reasons.push(`the load generator used ${workerCpuMax.toFixed(0)}% of its available CPU (limit ${VALIDITY_LIMITS.workerCpuPct}%) — measured latency includes our own queueing`);
+    }
 
     return {
       ok: reasons.length === 0,
@@ -536,7 +579,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       targetRps,
       achievedRps: issued / windowSec,
       cpuProcessPctMax: cpuMax,
-      eventLoopP99MsMax: loopMax
+      eventLoopP99MsMax: loopMax,
+      workerSchedP99MsMax: schedMax,
+      workerCpuPctMax: workerCpuMax
     };
   }
 
@@ -760,6 +805,21 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           Math.max(0, Math.round(s.genFaults ?? 0) || 0),
           Number.isFinite(s.targetSum) ? s.targetSum : 0,
           Math.max(0, Math.round(s.ticks) || 0)
+        );
+      }
+
+      // and so does the generator's own health, for the same reason: a window
+      // can never show what was measured without what the instrument was doing
+      // while it measured. Written even when the array is empty — the row's
+      // absence is what "the TS driver generated this" means downstream.
+      for (const h of agg.health ?? []) {
+        if (!Number.isFinite(h?.windowTs)) continue;
+        upsertWorkerHealth.run(
+          Math.floor(h.windowTs / MINUTE_BUCKETS) * MINUTE_BUCKETS,
+          Math.max(0, Math.round(h.samples) || 0),
+          Number.isFinite(h.schedP99Ms) ? h.schedP99Ms : 0,
+          Number.isFinite(h.schedMaxMs) ? h.schedMaxMs : 0,
+          Number.isFinite(h.cpuPct) ? h.cpuPct : 0
         );
       }
       markBatch.run(agg.batchId, Date.now());
@@ -1049,6 +1109,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       // minute layer, so they age out on the same schedule as it
       deleted += Number(db.prepare(`DELETE FROM load_shed WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
       deleted += Number(db.prepare(`DELETE FROM host_health WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
+      deleted += Number(db.prepare(`DELETE FROM worker_health WHERE bucket_ts < ?`).run(minuteCutoff).changes) || 0;
       // run attribution ages out with the minute layer, not with the raw tail:
       // a report window that still has roll-ups must still be able to say how
       // much of them was its own run
@@ -1136,6 +1197,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         db.exec("DELETE FROM run_minute");
         db.exec("DELETE FROM load_shed");
         db.exec("DELETE FROM host_health");
+        db.exec("DELETE FROM worker_health");
         db.exec("DELETE FROM policy_results");
         db.exec("DELETE FROM ingest_seen");
         db.exec("DELETE FROM runs");

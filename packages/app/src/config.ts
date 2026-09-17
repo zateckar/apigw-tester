@@ -51,15 +51,14 @@ export interface AppConfig {
   /** Port for the go SUT. 0 asks the OS for a free one (tests). Ignored by `ts`. */
   sutPort: number;
   /**
-   * Where the backend answers with no gateway in front of it. The reference
-   * stream — the control arm of the added-TTFB measurement — is sent here.
+   * Where the backend answers with no gateway in front of it.
    *
-   * Defaults to this process, which is right for the out-of-the-box setup
-   * where the gateway fronts the bundled petstore. Point PETSTORE_SELF_URL at
-   * the real backend when the gateway fronts something else: the Δ compares
-   * this against the gateway path, so if the two do not terminate at the same
-   * backend it measures the difference between two backends and calls it the
-   * gateway's cost.
+   * No traffic is sent here — a reference stream used to be, and is not any
+   * more. It is what "which origin is us" means for forwardBasicAuth: "auto",
+   * and it is the default gateway target for the out-of-the-box setup where
+   * there is no gateway yet. Point PETSTORE_SELF_URL at the real backend when
+   * the gateway fronts something else, so this rig's own Basic credential is
+   * not handed to a third party.
    */
   selfUrl: string;
   defaultGateway: GwTargets;

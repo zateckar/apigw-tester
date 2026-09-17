@@ -209,17 +209,20 @@ it("honors the tightest CPU quota, cpuset and ancestor throttling", () => {
 });
 
 
-it("rejects incomplete health coverage and intervals overlapping a stall", async () => {
+it("records a synchronous stall in the loop it is watching", async () => {
+  // There was a qualityBetween() here that turned these samples into a verdict
+  // used to withhold measurements. The verdict moved into validityFor, which
+  // reads the roll-up rather than this in-memory ring — but the sampler still
+  // has to see a stall at all, or nothing downstream can.
   const sampler = createSystemSampler({ intervalMs: 30 });
   sampler.start();
   try {
-    expect(sampler.qualityBetween(Date.now() - 10_000, Date.now())).toContain("unavailable");
     await sleep(60);
-    const start = Date.now();
     const until = performance.now() + 80;
     while (performance.now() < until) { /* simulate synchronous metrics work */ }
     await sleep(40);
     sampler.sampleNow();
-    expect(sampler.qualityBetween(start, Date.now())).not.toBeNull();
+    const worst = Math.max(...sampler.history().map((s) => s.eventLoopP99ms ?? 0));
+    expect(worst).toBeGreaterThan(20);
   } finally { sampler.stop(); }
 });
