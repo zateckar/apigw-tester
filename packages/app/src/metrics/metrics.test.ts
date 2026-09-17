@@ -949,8 +949,32 @@ describe("distributional gateway overhead and durable coverage", () => {
       expect(d.p90).toBeNull();       // 100
       expect(d.p95).toBeNull();       // 200
       expect(d.p99).toBeNull();       // 1000
-      expect(d.unavailable).toContain("p90, p95, p99");
+      // each percentile quotes its own bar: 30 samples is 70 short of p90 and
+      // 970 short of p99, and one number cannot say both
+      expect(d.unavailable).toContain("p90 needs 100");
+      expect(d.unavailable).toContain("p95 needs 200");
+      expect(d.unavailable).toContain("p99 needs 1,000");
       expect(d.unavailable).toContain("30 direct");
+      expect(d.unavailable).toContain("direct reference stream is the thinner arm");
+    } finally { store.close(); }
+  });
+
+  it("names the gateway arm when it is the thinner one", () => {
+    // the usual case is a thin reference arm, but a gateway that strips
+    // X-Server-Ms from most responses inverts it, and the message has to point
+    // at the side that actually ran out rather than at the usual suspect
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({
+        batchId: "inverted",
+        results: many(30, { ttfbMs: 112, serverMs: 100 }),
+        baseline: direct(1_000, 2)
+      });
+      const d = store.summary(300_000).overheadMs;
+      expect(d.gwSamples).toBe(30);
+      expect(d.p90).toBeNull();
+      expect(d.unavailable).not.toContain("thinner arm");
+      expect(d.unavailable).toContain("30 through the gateway");
     } finally { store.close(); }
   });
 

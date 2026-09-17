@@ -211,7 +211,8 @@ it("cannot pass overhead acceptance without a Δ to judge", () => {
       overheadMs: {
         p50: 1, p90: null, p95: null, p99: null, avg: 1,
         gwSamples: 900, directSamples: 30,
-        unavailable: "p90, p95, p99 need 1,000 residuals on each side; this window has 900 through the gateway and 30 direct"
+        unavailable: "p90 needs 100, p95 needs 200, p99 needs 1,000 residuals on each side; " +
+          "this window has 900 through the gateway and 30 direct (the direct reference stream is the thinner arm)"
       }
     }),
     scope: { totalRequests: 100, foreignRequests: 0, foreignPct: 0 },

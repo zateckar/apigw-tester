@@ -266,10 +266,18 @@ function overheadDelta(pair: ResidualPair): OverheadDelta {
       "no request through the gateway carried backend timing (X-Server-Ms), so none of them has a residual; " +
       "a gateway that strips the header, or that answered everything itself, cannot be measured this way";
   } else if (thin.length > 0) {
-    const need = minSamplesForPercentile(thin[thin.length - 1] as number);
+    // One requirement per percentile. They differ by an order of magnitude —
+    // p90 wants 100, p99 wants 1,000 — and collapsing them onto the largest
+    // told a window 31 samples short of p90 that it was 931 short, which sends
+    // anyone trying to fix it after the wrong number by a factor of ten.
+    const needs = thin.map((p) => `p${p} needs ${minSamplesForPercentile(p).toLocaleString()}`).join(", ");
     unavailable =
-      `${thin.map((p) => `p${p}`).join(", ")} need ${need.toLocaleString()} residuals on each side; ` +
-      `this window has ${gw.count.toLocaleString()} through the gateway and ${direct.count.toLocaleString()} direct`;
+      `${needs} residuals on each side; this window has ` +
+      `${gw.count.toLocaleString()} through the gateway and ${direct.count.toLocaleString()} direct` +
+      // naming the thinner arm matters: the reference stream is a fixed small
+      // share of the load, so it is almost always the binding constraint, and
+      // "run it longer or faster" is the only thing that moves it
+      (direct.count <= gw.count ? " (the direct reference stream is the thinner arm)" : "");
   }
 
   return {
