@@ -9,7 +9,6 @@ import {
   buildSlowSpec,
   buildConcurrencySpec,
   buildInvalidSpec,
-  buildBaselineProbe,
   pickClass,
   weightedPick,
   DEFAULT_STRESS_MIX,
@@ -268,16 +267,3 @@ describe("buildSpec class mix", () => {
   });
 });
 
-describe("baseline probes", () => {
-  it("returns a probe per class", () => {
-    const probes = buildBaselineProbe(ctx());
-    const classes = new Set(probes.map((x) => x.class));
-    expect(classes.has("small-rest")).toBe(true);
-    expect(classes.has("soap")).toBe(true);
-    expect(classes.has("big-response")).toBe(true);
-    expect(classes.has("big-request")).toBe(true);
-    expect(classes.has("slow-upstream")).toBe(true);
-    expect(classes.has("concurrency")).toBe(true);
-    expect(classes.has("invalid")).toBe(true);
-  });
-});

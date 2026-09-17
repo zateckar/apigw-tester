@@ -309,20 +309,50 @@ export default function App() {
 
       {/* ---------- KPIs ---------- */}
       <div className="kpis">
-        <div className="kpi" style={{ borderColor: "var(--accent)" }}>
-          <div className="label" title={Object.entries(summary?.overheadMs.exclusionReasons ?? {}).map(([reason, count]) => `${reason}: ${count}`).join("; ")}>Estimated added TTFB ({range.label})</div>
+        <div
+          className="kpi"
+          style={{ borderColor: "var(--accent)" }}
+          title={
+            "The 95th percentile of ttfb − serverMs for traffic through the gateway, minus the 95th percentile of " +
+            "the same quantity for a reference stream sent straight to the backend over the same minutes in the " +
+            "same scenario mix. It is a difference between two distributions, not a per-request overhead: no " +
+            "request here was ever sent both ways. A negative value means the two differ by less than this rig " +
+            "can resolve. Connection setup is measured per request and subtracted from both sides, so a gateway " +
+            "is not charged here for handshakes — see the reuse line below for whether it caused any."
+          }
+        >
+          <div className="label">Added TTFB vs direct, p95 ({range.label})</div>
           <div className="value" style={{ color: "var(--accent)" }}>
             {stat(summary?.overheadMs.p95, fmtMs)}
           </div>
           <div className="sub">
             {noGateway
               ? "no gateway configured — this is loopback slop"
-              : `p95 · p50 ${stat(summary?.overheadMs.p50, fmtMs)} · p99 ${stat(summary?.overheadMs.p99, fmtMs)}`}
+              : `p50 ${stat(summary?.overheadMs.p50, fmtMs)} · p99 ${stat(summary?.overheadMs.p99, fmtMs)}`}
           </div>
-          <div className="sub">Small REST, concurrency and SOAP: {summary?.overheadMs.eligible ?? 0} eligible / {summary?.overheadMs.excluded ?? 0} excluded</div>
-          {Object.entries(summary?.overheadMs.exclusionReasons ?? {}).map(([reason, count]) => (
-            <div className="sub" key={reason}>{reason}: {count}</div>
-          ))}
+          <div className="sub">
+            Small REST, concurrency and SOAP: {(summary?.overheadMs.gwSamples ?? 0).toLocaleString()} through GW
+            {" vs "}{(summary?.overheadMs.directSamples ?? 0).toLocaleString()} direct
+          </div>
+          {summary?.overheadMs.unavailable != null && (
+            <div className="sub">{summary.overheadMs.unavailable}</div>
+          )}
+          {summary != null && summary.connSetup.measured > 0 && (
+            <div
+              className="sub"
+              style={{ color: (summary.connSetup.pct ?? 0) > 5 ? "var(--err)" : undefined }}
+              title={
+                "Requests that had to open a connection rather than reuse a pooled one. This cost is measured " +
+                "per request and taken out of the added-TTFB figure above, so it is reported here instead of " +
+                "inflating that number. A high share against a real gateway means it is refusing or capping " +
+                "keep-alive, which every caller pays for in handshakes."
+              }
+            >
+              {(100 - (summary.connSetup.pct ?? 0)).toFixed(1)}% connections reused
+              {summary.connSetup.avgMs !== null &&
+                ` · ${summary.connSetup.setups.toLocaleString()} setups at ${fmtMs(summary.connSetup.avgMs)}`}
+            </div>
+          )}
         </div>
         <div
           className="kpi"
@@ -346,6 +376,14 @@ export default function App() {
             {validity && validity.droppedRequests > 0 && (
               <span style={{ color: "var(--err)" }}>
                 {" "}· shed {validity.droppedRequests.toLocaleString()} ({validity.shedPct.toFixed(1)}%)
+              </span>
+            )}
+            {validity && validity.resultsLost > 0 && (
+              <span
+                style={{ color: "var(--err)" }}
+                title="Requests the gateway served whose measurement never reached the store. Unlike shed load, this traffic did happen — the charts just do not describe all of it."
+              >
+                {" "}· {validity.resultsLost.toLocaleString()} measurements lost
               </span>
             )}
             {status?.throttledSinceMs != null && <span style={{ color: "var(--err)" }}> · throttled</span>}
@@ -473,7 +511,7 @@ export default function App() {
       {/* ---------- Charts grid ---------- */}
       <div className="grid-2">
         <div className="section">
-          <h2>Estimated added TTFB — qualified small REST, concurrency and SOAP</h2>
+          <h2>Added TTFB vs direct — small REST, concurrency and SOAP</h2>
           <Panel height={240}>
             {({ width, height }) => (
               <AreaChart width={width} height={height} data={points}>
@@ -667,7 +705,8 @@ export default function App() {
             <tr>
               <th>Class</th><th>Calls</th><th>Err %</th><th>4xx</th><th>GW faults</th>
               <th>Latency p50</th><th>Latency p95</th><th>Latency p99</th>
-              <th className="accent">GW OH p50</th><th className="accent">GW OH p95</th><th className="accent">GW OH p99</th><th className="accent">GW OH avg</th>
+              <th className="accent" title="Difference against the direct reference stream restricted to this same class, at matched percentiles.">Δ vs direct p50</th>
+              <th className="accent">Δ p95</th><th className="accent">Δ p99</th><th className="accent">Δ mean</th>
               <th>avg req</th><th>avg resp</th>
             </tr>
           </thead>
@@ -690,7 +729,10 @@ export default function App() {
                 <td className="accent-cell">{fmtMs(c.overheadMs.p50)}</td>
                 <td className="accent-cell">{fmtMs(c.overheadMs.p95)}</td>
                 <td className="accent-cell">{fmtMs(c.overheadMs.p99)}</td>
-                <td className="accent-cell">{fmtMs(c.overheadMs.avg)}<small className="hint"> · {c.overheadMs.eligible ?? 0} eligible / {c.overheadMs.excluded ?? 0} excluded</small></td>
+                <td className="accent-cell" title={c.overheadMs.unavailable ?? undefined}>
+                  {fmtMs(c.overheadMs.avg)}
+                  <small className="hint"> · {c.overheadMs.gwSamples.toLocaleString()} vs {c.overheadMs.directSamples.toLocaleString()} direct</small>
+                </td>
                 <td>{fmtBytes(c.avgBytesReq)}</td>
                 <td>{fmtBytes(c.avgBytesResp)}</td>
               </tr>
@@ -749,7 +791,9 @@ export default function App() {
           <thead>
             <tr>
               <th>Time</th><th>Request id</th><th>Proto</th><th>Method</th><th>Endpoint</th>
-              <th>Status</th><th>Answered by</th><th>Latency</th><th>TTFB</th><th>Body</th><th>GW OH</th><th>Resp</th><th>Error</th>
+              <th>Status</th><th>Answered by</th><th>Latency</th><th>TTFB</th><th>Body</th>
+              <th title="ttfb − serverMs: everything that was not the backend, for this one request. Not the gateway's cost on its own — it also carries the hop to the gateway and back. The headline figure compares this against the same quantity measured straight to the backend.">Residual</th>
+              <th>Resp</th><th>Error</th>
             </tr>
           </thead>
           <tbody>
@@ -775,7 +819,10 @@ export default function App() {
                 <td>{fmtMs(r.latencyMs)}</td>
                 <td>{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(r.ttfbMs)}</td>
                 <td className="hint">{r.ttfbMs === null || r.ttfbMs === undefined ? "—" : fmtMs(Math.max(0, r.latencyMs - r.ttfbMs))}</td>
-                <td title={r.overheadReason ?? "Qualified estimate"}>{fmtMs(r.overheadMs)}{r.overheadReason && <small className="hint"> {r.overheadReason}</small>}</td>
+                <td title={r.timingReason ?? (r.serverMs == null ? "no backend timing on this response" : undefined)}>
+                  {r.ttfbMs == null || r.serverMs == null ? "—" : fmtMs(r.ttfbMs - r.serverMs)}
+                  {r.timingReason && <small className="hint"> {r.timingReason}</small>}
+                </td>
                 <td>{fmtBytes(r.bytesResp)}</td>
                 <td className="hint">{r.error ?? ""}</td>
               </tr>

@@ -5,13 +5,20 @@ import type { Readable, Writable } from "node:stream";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
+  AggregateBatch,
+  EdgeTables,
   GwTargets,
-  IngestBatch,
   LoadProfile,
-  RequestResult,
-  ScenarioClass
+  WorkerHealthCell
 } from "@apigw/shared";
+import { edgeTableMismatch, HEALTH_WINDOW_MS } from "@apigw/shared";
+
+/** How many health windows to keep in case a cell and its residuals are split
+ *  across batches. Thirty windows is a minute — far longer than any observed
+ *  skew, and still only a few hundred bytes. */
+const HEALTH_MEMORY_WINDOWS = 30;
 import { expectedAuthHeader } from "../auth.js";
+import { filterHealthyResiduals, stampHealthWindows, windowHealth, workerWindowHealth } from "./health.js";
 
 /**
  * Control-plane client for the Go loadgen worker.
@@ -23,13 +30,13 @@ import { expectedAuthHeader } from "../auth.js";
  */
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-/** packages/worker, relative to packages/app/src/loadgen. */
-const WORKER_DIR = resolve(HERE, "../../../worker");
+/** packages/go, relative to packages/app/src/loadgen. */
+const GO_DIR = resolve(HERE, "../../../go");
 
 /** Absolute path of the built worker binary for the current platform, or null. */
 export function workerBinaryPath(): string | null {
   const name = process.platform === "win32" ? "gwtester-worker.exe" : "gwtester-worker";
-  const p = join(WORKER_DIR, "bin", name);
+  const p = join(GO_DIR, "bin", name);
   return existsSync(p) ? p : null;
 }
 
@@ -47,27 +54,22 @@ export interface GoStatusMsg {
   invalidRejectedByGateway: number;
   inFlight: number;
   targetRps: number;
+  /** load never issued (concurrency ceiling) */
   dropped: number;
-}
-
-export interface GoBaselineMsg {
-  at: Record<string, number>;
-  byClass: Record<string, number[]>;
+  /** measurements discarded after the request was served */
+  resultsLost: number;
 }
 
 interface OutMsg {
-  op: "ready" | "status" | "baseline" | "stopped";
+  op: "ready" | "status" | "stopped";
   [k: string]: unknown;
 }
 
 export interface GoClientEvents {
-  onBatch: (batch: IngestBatch) => void | Promise<unknown>;
+  onBatch: (batch: AggregateBatch) => void | Promise<unknown>;
   onStatus: (s: GoStatusMsg) => void;
-  onBaseline: (b: GoBaselineMsg) => void;
   onStopped: (runId: string) => void;
 }
-
-const HEALTH_SAMPLE_MS = 2_000;
 
 /**
  * GoWorkerClient spawns and owns one worker child process plus the results
@@ -82,6 +84,10 @@ export class GoWorkerClient {
   private stdoutBuf = "";
   private socketBuf = "";
   private healthCheck: (from: number, to: number) => string | null = () => "health unavailable";
+  /** cleared if the worker's declared bucket tables do not match this build's */
+  private bucketsOk = true;
+  /** recent per-window health reports from the worker; see rememberHealth */
+  private health = new Map<number, WorkerHealthCell>();
   private starting: Promise<void> | null = null;
 
   constructor(private events: GoClientEvents) {}
@@ -108,7 +114,7 @@ export class GoWorkerClient {
 
   private async spawn(): Promise<void> {
     const bin = workerBinaryPath();
-    if (bin === null) throw new Error(`gwtester-worker binary not found under ${join(WORKER_DIR, "bin")}`);
+    if (bin === null) throw new Error(`gwtester-worker binary not found under ${join(GO_DIR, "bin")}`);
 
     this.server = createServer((sock) => {
       sock.setNoDelay(true);
@@ -155,16 +161,34 @@ export class GoWorkerClient {
         case "status":
           this.events.onStatus(msg as unknown as GoStatusMsg);
           break;
-        case "baseline":
-          this.events.onBaseline({ at: msg.at as Record<string, number>, byClass: msg.byClass as Record<string, number[]> });
-          break;
         case "stopped":
           this.events.onStopped(msg.runId as string);
           break;
         case "ready":
+          this.checkBucketTables(msg["buckets"]);
           break;
       }
     }
+  }
+
+  /**
+   * Refuse a worker whose histogram bucket tables differ from ours.
+   *
+   * The worker rolls its own results up, which means it has its own copy of the
+   * latency, residual and status edge tables. Those arrays ARE the on-disk
+   * layout and merge positionally, so a drift between the two implementations
+   * does not fail — it quietly mixes two different histograms into one column
+   * and answers every percentile wrong for as long as the database lives. That
+   * is worth one comparison at handshake.
+   */
+  private checkBucketTables(declared: unknown): void {
+    const mismatch = edgeTableMismatch(declared as Partial<EdgeTables> | undefined);
+    if (mismatch === null) return;
+    console.error(
+      `[driver:go] worker bucket tables disagree with this build (${mismatch}); ` +
+      "refusing its results — rebuild the worker from this commit"
+    );
+    this.bucketsOk = false;
   }
 
   private onSocketData(chunk: Buffer): void {
@@ -175,34 +199,14 @@ export class GoWorkerClient {
       const line = this.socketBuf.slice(0, nl);
       this.socketBuf = this.socketBuf.slice(nl + 1);
       if (line.trim() === "") continue;
-      let batch: IngestBatch;
+      let batch: AggregateBatch;
       try {
-        batch = JSON.parse(line) as IngestBatch;
+        batch = JSON.parse(line) as AggregateBatch;
       } catch (e) {
         console.error("[driver:go] dropping malformed batch:", (e as Error).message);
         continue;
       }
       this.stampAndDeliver(batch);
-    }
-  }
-
-  /**
-   * Health-stamp a batch exactly as the TS flush loop did: group results by
-   * the sampler's 2s window, one healthCheck per distinct window, results
-   * with an exclusion reason of their own (worker sets only "request
-   * failed") keep it.
-   */
-  stampBatch(results: RequestResult[]): void {
-    const byWindow = new Map<number, string | null>();
-    for (const r of results) {
-      if (r.overheadReason !== null && r.overheadReason !== undefined) continue;
-      const w = Math.floor(r.ts / HEALTH_SAMPLE_MS);
-      let reason = byWindow.get(w);
-      if (reason === undefined) {
-        reason = this.healthCheck(w * HEALTH_SAMPLE_MS, (w + 1) * HEALTH_SAMPLE_MS);
-        byWindow.set(w, reason);
-      }
-      if (reason !== null) r.overheadReason = reason;
     }
   }
 
@@ -213,19 +217,66 @@ export class GoWorkerClient {
       return;
     }
     try {
-      const batch = JSON.parse(this.socketBuf) as IngestBatch;
+      const batch = JSON.parse(this.socketBuf) as AggregateBatch;
       this.stampAndDeliver(batch);
     } catch { /* partial line: the worker would only send one mid-shutdown */ }
     this.socketBuf = "";
   }
 
-  private stampAndDeliver(batch: IngestBatch): void {
-    if (Array.isArray(batch.results)) this.stampBatch(batch.results);
+  /**
+   * Qualify the batch's residuals, then hand it on.
+   *
+   * The verdict comes from whichever process held the clock. The worker reports
+   * its own scheduling health per window and ships those cells alongside the
+   * residuals they qualify, so that is what is used; the control plane's event
+   * loop times nothing here and its delay is not evidence about these numbers.
+   * A worker too old to report health omits the key entirely, and the old
+   * control-plane gate applies — refusing to guess, in the same spirit as the
+   * bucket-table check above.
+   *
+   * Both arms of the comparison go through one filter. Withholding contaminated
+   * residuals from the gateway arm while keeping them in the direct arm would
+   * shift the reference distribution and understate the gateway by exactly the
+   * generator's own stalls. The raw tail is stamped rather than dropped: those
+   * rows still describe requests the gateway really served, and only their
+   * residual is in doubt.
+   */
+  private stampAndDeliver(batch: AggregateBatch): void {
+    if (!this.bucketsOk) return;
+    const health = Array.isArray(batch.health)
+      ? workerWindowHealth(this.rememberHealth(batch.health))
+      : windowHealth(this.healthCheck);
+    if (Array.isArray(batch.tail)) stampHealthWindows(batch.tail, health);
+    if (Array.isArray(batch.residuals)) {
+      batch.residuals = filterHealthyResiduals(batch.residuals, health);
+    }
     try {
       void this.events.onBatch(batch);
     } catch (e) {
       console.error("[driver:go] ingest failed:", (e as Error).message);
     }
+  }
+
+  /**
+   * Fold the batch's health cells into a short-lived window and return the set
+   * a verdict may be drawn from.
+   *
+   * The worker releases a window's residual cells and its health cell on the
+   * same rule, so they normally arrive together. This exists for the case where
+   * they do not: the two drains read the clock at slightly different instants,
+   * and a socket write can be split across batches. Holding a minute of cells
+   * costs a few hundred bytes and removes a class of silent residual loss where
+   * the evidence arrived one batch after the thing it qualifies.
+   */
+  private rememberHealth(cells: WorkerHealthCell[]): WorkerHealthCell[] {
+    for (const c of cells) {
+      if (typeof c?.windowTs === "number") this.health.set(c.windowTs, c);
+    }
+    if (this.health.size > HEALTH_MEMORY_WINDOWS) {
+      const cutoff = Math.max(...this.health.keys()) - HEALTH_MEMORY_WINDOWS * HEALTH_WINDOW_MS;
+      for (const w of this.health.keys()) if (w < cutoff) this.health.delete(w);
+    }
+    return [...this.health.values()];
   }
 
   /** Send one control message to the worker. No-op when not running. */
@@ -295,9 +346,4 @@ export class GoWorkerClient {
 
 function originOf(url: string): string | null {
   try { return new URL(url).origin; } catch { return null; }
-}
-
-/** Re-export for the driver: classes keyed map from a baseline op. */
-export function classesOf(b: GoBaselineMsg): ScenarioClass[] {
-  return Object.keys(b.byClass) as ScenarioClass[];
 }

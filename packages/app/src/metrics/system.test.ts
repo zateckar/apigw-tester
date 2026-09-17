@@ -3,7 +3,8 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSystemSampler, readCpuCapacity } from "./system.js";
-import type { IngestBatch } from "@apigw/shared";
+import { aggregateBatch } from "./aggregate.js";
+import { MEASUREMENT_VERSION, type AggregateBatch } from "@apigw/shared";
 
 // counters across two "reads" of a fake /proc file: the second content carries
 // +200 rx per non-lo interface, tx unchanged
@@ -45,16 +46,16 @@ function tempProcFile(name: string, content: string): string {
   return p;
 }
 
-function batch(bytesReq: number, bytesResp: number): IngestBatch {
-  return {
+function batch(bytesReq: number, bytesResp: number): AggregateBatch {
+  return aggregateBatch({
     batchId: `b-${Math.random()}`,
     results: [{
       runId: "r", requestId: `req-${Math.random()}`, ts: Date.now(), protocol: "rest", endpoint: "GET /x",
       class: "small-rest", method: "GET", status: 200,
-      latencyMs: 1, ttfbMs: 1, measurementVersion: 2, overheadReason: null, baselineMs: 0, overheadMs: 1,
+      latencyMs: 1, ttfbMs: 1, serverMs: null, measurementVersion: MEASUREMENT_VERSION, timingReason: null,
       bytesReq, bytesResp, reachedBackend: true, error: null
     }]
-  };
+  });
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -186,8 +187,8 @@ describe("app traffic accounting", () => {
 
   it("an empty or malformed batch cannot poison the rates", () => {
     const s = createSystemSampler();
-    s.noteBatch({ batchId: "x", results: [] });
-    s.noteBatch({} as unknown as IngestBatch);
+    s.noteBatch(aggregateBatch({ batchId: "x", results: [] }));
+    s.noteBatch({} as unknown as AggregateBatch);
     expect(s.latest().appInBps).toBe(0);
     expect(s.latest().appOutBps).toBe(0);
   });

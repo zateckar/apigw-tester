@@ -369,22 +369,8 @@ export function buildSpec(profile: LoadProfile, ctx: SpecContext, rand: () => nu
   }
 }
 
-/** Same shape as buildSpec but uses fixed paths — used to probe the SUT (no GW)
- *  for per-class baselines. Always contract-valid. */
-export function buildBaselineProbe(ctx: SpecContext): ReqSpec[] {
-  return [
-    { protocol: "rest", endpoint: "GET /api/pets", class: "small-rest", method: "GET", path: "/api/pets?size=10", headers: {}, body: null, expectBytes: 2000 },
-    { protocol: "soap", endpoint: "SOAP getPetById", class: "soap", method: "POST", path: "/soap/petservice",
-      headers: { "Content-Type": "text/xml; charset=utf-8", SOAPAction: '"getPetById"' },
-      body: envelope(`<tns:getPetByIdRequest><petId>${existingPetId(ctx)}</petId></tns:getPetByIdRequest>`),
-      expectBytes: 800 },
-    buildBigResponseSpec(),
-    { protocol: "rest", endpoint: "POST /api/echo", class: "big-request", method: "POST", path: "/api/echo",
-      headers: { "Content-Type": "application/json" }, body: bigRequestBody(65536), expectBytes: 200 },
-    { protocol: "rest", endpoint: "GET /api/slow/{ms}", class: "slow-upstream", method: "GET", path: "/api/slow/500", headers: {}, body: null, expectBytes: 200 },
-    { protocol: "rest", endpoint: "GET /api/pets", class: "concurrency", method: "GET", path: "/api/pets?size=5", headers: {}, body: null, expectBytes: 1000 },
-    // a known-invalid probe so the 'invalid' class also gets a baseline
-    { protocol: "rest", endpoint: "GET /api/pets [invalid:bad-enum-query]", class: "invalid", method: "GET",
-      path: "/api/pets?status=teleported", headers: {}, body: null, expectBytes: 200, expectInvalid: true }
-  ];
-}
+// There was a buildBaselineProbe() here: seven fixed specs, one per class, run
+// as a cycle every two minutes to calibrate direct transport. The reference
+// stream that replaced it calls buildSpec directly, because the two arms of the
+// overhead comparison are only poolable across classes if they are drawn from
+// the same mix — and a fixed one-of-each set is not the mix the load generates.

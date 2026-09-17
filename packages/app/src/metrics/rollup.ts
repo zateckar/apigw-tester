@@ -1,4 +1,4 @@
-import { HISTOGRAM_EDGES_MS, STATUS_BUCKETS, statusBucketIndex } from "@apigw/shared";
+import { HISTOGRAM_EDGES_MS, RESIDUAL_EDGES_MS, STATUS_BUCKETS, statusBucketIndex } from "@apigw/shared";
 
 /** Fixed log-scale histogram over latency in milliseconds. */
 
@@ -81,6 +81,70 @@ export function percentile(h: Histogram, p: number): number {
     lower = upper;
   }
   return edges[edges.length - 1] ?? OVERFLOW_EDGE_MS;
+}
+
+// ---- residual histograms ---------------------------------------------------
+// Same positional-array shape as the latency histogram — mergeHistograms and
+// totalInHistogram work on both — over a different, signed set of edges.
+
+/** Counts per RESIDUAL_EDGES_MS slot, plus one overflow slot. */
+export type ResidualHistogram = number[];
+
+export function emptyResidualHistogram(): ResidualHistogram {
+  return new Array(RESIDUAL_EDGES_MS.length + 1).fill(0);
+}
+
+export function residualBucketIndex(ms: number): number {
+  const edges = RESIDUAL_EDGES_MS;
+  let lo = 0;
+  let hi = edges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ms <= (edges[mid] as number)) hi = mid - 1;
+    else lo = mid + 1;
+  }
+  return lo;
+}
+
+export function addToResidualHistogram(h: ResidualHistogram, ms: number, count = 1): void {
+  const i = residualBucketIndex(ms);
+  h[i] = ((h[i] as number) ?? 0) + count;
+}
+
+/** Notional outer edges, so the extreme buckets interpolate to a finite number
+ *  instead of ±Infinity. Both are 2× the outermost real edge. */
+const RESIDUAL_OVERFLOW_MS = (RESIDUAL_EDGES_MS[RESIDUAL_EDGES_MS.length - 1] as number) * 2;
+const RESIDUAL_UNDERFLOW_MS = (RESIDUAL_EDGES_MS[0] as number) * 2;
+
+/**
+ * Percentile of a residual distribution, interpolating inside the bucket.
+ *
+ * Distinct from percentile() only in its edge table and in starting the first
+ * bucket's lower bound below zero: reusing the latency version here would read
+ * every negative residual as if it were 0–1 ms.
+ */
+export function residualPercentile(h: ResidualHistogram, p: number): number | null {
+  const total = totalInHistogram(h);
+  if (total === 0) return null;
+  const edges = RESIDUAL_EDGES_MS;
+  const targetRank = (p / 100) * total;
+  let cumulative = 0;
+  let lower = RESIDUAL_UNDERFLOW_MS;
+  for (let i = 0; i < h.length; i++) {
+    const count = h[i] ?? 0;
+    const upper = edges[i] ?? RESIDUAL_OVERFLOW_MS;
+    if (count === 0) {
+      lower = upper;
+      continue;
+    }
+    cumulative += count;
+    if (cumulative >= targetRank) {
+      const rankInBucket = count === 1 ? 1 : (targetRank - (cumulative - count)) / count;
+      return lower + rankInBucket * (upper - lower);
+    }
+    lower = upper;
+  }
+  return edges[edges.length - 1] ?? RESIDUAL_OVERFLOW_MS;
 }
 
 export function meanFromRollup(latencySumMs: number, count: number): number {

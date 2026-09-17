@@ -27,25 +27,36 @@ jobs:
       - run: bunx eslint .
       - run: npm run typecheck
 
-      # TS-side tests. The Go driver integration test skips automatically
-      # when the worker binary is absent (the go step below builds one).
-      - name: Build the Go loadgen worker (needed by the integration test)
-        working-directory: packages/worker
+      # TS-side tests. The Go driver and Go SUT integration tests skip
+      # automatically when their binaries are absent, so both are built here —
+      # a green run that silently skipped them would be worse than a red one.
+      - name: Build the Go binaries (needed by the integration tests)
+        working-directory: packages/go
         run: |
           mkdir -p bin
           GOOS=linux GOARCH=amd64 go build -trimpath -o bin/gwtester-worker ./cmd/gwtester-worker
+          GOOS=linux GOARCH=amd64 go build -trimpath -o bin/gwtester-sut ./cmd/gwtester-sut
       - run: bun test packages/app/src
       # the image build compiles the UI; make sure that path works on PRs too
       - run: npm run build
 
       # --- Go worker --------------------------------------------------------
       - name: Go vet + tests
-        working-directory: packages/worker
+        working-directory: packages/go
         run: |
           go vet ./...
           go test ./...
+      # The petstore is read by one goroutine per in-flight request, unlike the
+      # single-loop original it replaces; the worker hands a fresh pair of
+      # channels to a new tick goroutine on every run, and a stale one outliving
+      # its run is a data race before it is anything else. Both get the race
+      # detector rather than the whole module, which would make the suite slow
+      # enough that nobody waits for it.
+      - name: Go race detector (SUT, run lifecycle)
+        working-directory: packages/go
+        run: go test -race ./internal/sut/ ./internal/worker/
       - name: Go format
-        working-directory: packages/worker
+        working-directory: packages/go
         run: |
           if [ -n "$(gofmt -l .)" ]; then
             echo "gofmt would change:"; gofmt -d .; exit 1
@@ -112,8 +123,9 @@ jobs:
           echo "smoking $IMAGE"
           docker run -d --name apigw-tester-ci \
             -e APP_BASIC_AUTH=ci:ci-test-pass \
-            -p 18080:8080 "$IMAGE"
+            -p 18080:8080 -p 18081:8081 "$IMAGE"
           BASE=http://127.0.0.1:18080
+          SUT=http://127.0.0.1:18081
           AUTH=(-u ci:ci-test-pass)
 
           for i in $(seq 1 60); do
@@ -146,6 +158,30 @@ jobs:
           # note: `grep ... && { exit 1; }` would trip `set -e` on the healthy path
           if echo "$hdrs" | grep -qi "^x-powered-by:"; then echo "x-powered-by leaked"; exit 1; fi
           echo "non-root, versioned health, security headers ok"
+
+          # The petstore must be answering from its own process on its own port.
+          # This is the assertion that the split actually shipped: if the image
+          # ever falls back to the in-process petstore, 8080 starts serving
+          # /api/pets again and every measurement goes back to including the
+          # control plane's event loop without anything else looking wrong.
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$SUT/health" || true)
+            if [ "$code" = "200" ]; then break; fi
+            if [ "$i" = "30" ]; then docker logs apigw-tester-ci; echo "SUT never came up"; exit 1; fi
+            sleep 2
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$SUT/api/pets")" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$SUT/api/pets?size=5")" = "200"
+          # ...and the control plane must NOT be serving it any more
+          test "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/pets?size=5")" = "404"
+          # X-Server-Ms is the entire basis of overhead attribution; without it
+          # every run reports a null Δ and says nothing about the gateway
+          sut_hdrs=$(curl -sD - -o /dev/null "${AUTH[@]}" "$SUT/api/pets/1")
+          echo "$sut_hdrs" | grep -qi "^x-server-ms:" || { echo "SUT did not stamp X-Server-Ms"; echo "$sut_hdrs"; exit 1; }
+          for h in "content-security-policy" "x-content-type-options" "x-frame-options"; do
+            echo "$sut_hdrs" | grep -qi "^$h:" || { echo "SUT missing header $h"; exit 1; }
+          done
+          echo "petstore is a separate process on 8081, authed and stamped"
 
           # published contract definitions are downloadable and well-formed
           curl -sf "${AUTH[@]}" "$BASE/api/definitions/openapi.json" -o /tmp/openapi.json

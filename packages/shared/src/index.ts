@@ -400,6 +400,21 @@ export function isGatewayFault(status: number): boolean {
   return status === 0 || status === 502 || status === 503 || status === 504;
 }
 
+/**
+ * Measurement schema this build produces.
+ *
+ * 1 — latency only.
+ * 2 — per-request overhead: `ttfb − (serverMs + median direct probe)`, censored
+ *     at zero and gated on probe freshness. Withdrawn: subtracting a median
+ *     from each sample added the whole direct distribution's variance to every
+ *     observation, and dropping the negatives that produced biased the survivors
+ *     upward. Rows carrying it are not comparable with 3 and are ignored.
+ * 3 — raw residuals: `ttfbMs` and `serverMs` are recorded as observed and the
+ *     gateway's cost is read as a distribution difference against a concurrent
+ *     direct-to-SUT reference stream. See {@link BaselineSample}.
+ */
+export const MEASUREMENT_VERSION = 3;
+
 export interface RequestResult {
   runId: string;
   /** Correlation id echoed to the target as `X-Request-Id` (and as the span id
@@ -416,16 +431,49 @@ export interface RequestResult {
   /** Time to first byte: start → response headers arrived. Null when the
    *  request never got a response (network error / timeout). */
   ttfbMs: number | null;
-  /** Backend-reported processing duration plus calibrated direct transport.
-   * Only meaningful for subtraction when overheadReason is null. */
-  baselineMs: number;
-  /** Estimated added response-header time: ttfbMs - baselineMs. Missing,
-   * stale and negative estimates are unavailable. A locally contaminated
-   * observation is retained internally with an exclusion reason; the recent
-   * API and qualified aggregates expose it as unavailable. */
-  overheadMs: number | null;
+  /**
+   * The SUT's own processing time for this request, from its `X-Server-Ms`
+   * response header. Null when the response never reached the backend (the
+   * gateway answered it) or a gateway stripped the header.
+   *
+   * Recorded raw and never combined with a calibration constant: `ttfbMs -
+   * serverMs` is then a *directly observed* residual — everything outside the
+   * backend — for this one request, with no estimate inside it.
+   */
+  serverMs: number | null;
+  /**
+   * Time spent acquiring a socket for this request: a pool wait, or a DNS
+   * lookup plus TCP and TLS handshakes on a miss.
+   *
+   * It sits inside `ttfbMs` and is not a cost the gateway imposes per request,
+   * so the residual subtracts it — a measured quantity from this very request,
+   * not a constant borrowed from another distribution. Both arms of the
+   * comparison subtract their own, which they must: the reference stream runs
+   * at a fraction of the load and keeps a near-idle pool, so it pays setup on a
+   * different schedule entirely.
+   *
+   * Null means not measured, which is distinct from measured-and-zero. The
+   * in-process driver issues requests through `fetch`, which exposes no
+   * connection-level hook, so it always reports null and its residual carries
+   * setup on both arms alike.
+   */
+  connectMs?: number | null;
+  /** whether the socket came from the pool. Only meaningful when `connectMs`
+   *  is non-null; a false here is what `connSetups` counts. */
+  connReused?: boolean;
   measurementVersion?: number;
-  overheadReason?: string | null;
+  /**
+   * Why this observation's *timing* cannot be trusted: the generator was CPU
+   * saturated, its event loop stalled, or health coverage was missing for the
+   * window the request ran in. Null when the timing is sound.
+   *
+   * Only the residual is withheld — latency, status and throughput still count,
+   * because they are what the run actually delivered. The residual is singled
+   * out because a generator stall delays when we observe the response headers
+   * but not the SUT's self-reported processing time, so the whole stall lands
+   * inside `ttfbMs − serverMs` and would read as gateway overhead.
+   */
+  timingReason?: string | null;
   bytesReq: number;
   bytesResp: number;
   /**
@@ -439,6 +487,28 @@ export interface RequestResult {
   error: string | null;
 }
 
+/**
+ * One observation from the direct-to-SUT reference stream: the same request
+ * shapes, in the same class mix, issued concurrently with the load but with the
+ * gateway bypassed.
+ *
+ * This is the control arm of the overhead measurement. It is deliberately *not*
+ * a RequestResult: reference traffic is not gateway traffic, and folding it into
+ * the request metrics would inflate throughput and dilute every status, latency
+ * and contract number with requests the gateway never saw.
+ */
+export interface BaselineSample {
+  ts: number; // epoch ms when the probe started
+  class: ScenarioClass;
+  /**
+   * `ttfb − serverMs` for this probe, in ms. Signed: the two clocks are read at
+   * different layers, so a fast local call legitimately lands slightly below
+   * zero, and discarding those would shift the reference distribution up and
+   * understate the gateway by exactly that amount.
+   */
+  residualMs: number;
+}
+
 export interface IngestBatch {
   batchId: string; // idempotency token
   results: RequestResult[];
@@ -446,10 +516,264 @@ export interface IngestBatch {
    *  shed rows commit in the very transaction as the requests they explain —
    *  a window can never show issued load without the load it failed to issue. */
   shed?: LoadShedSample[];
+  /** Direct-to-SUT reference observations covering the same interval, ridden on
+   *  the same batch so a minute's two residual distributions commit together
+   *  and are always compared over matching time. */
+  baseline?: BaselineSample[];
 }
+
+// ---------- Pre-aggregated ingest ------------------------------------------
+//
+// An IngestBatch carries one object per request. That is the right shape for an
+// external poster and hopeless for a generator: at 10k rps it is 10k objects a
+// second to serialize, parse, structured-clone across a thread boundary and
+// walk — on the control plane's event loop, whose stalls are the very thing
+// this rig withholds measurements over. The generator already has to visit
+// every result once; rolling up there and shipping the roll-up costs the same
+// visit and ships a payload whose size no longer depends on the rate.
+//
+// What crosses the boundary per flush, at any rps: one cell per
+// (minute, protocol, endpoint, class) — a few dozen; one residual cell per
+// (health window, class, arm) — a few dozen; one run cell per (minute, run);
+// and a hard-capped tail of raw rows for the recent-requests table.
+
+/**
+ * One pre-rolled (minute, protocol, endpoint, class) cell — the same numbers
+ * `rollup_minute` stores, computed at the source.
+ *
+ * `hist` and `statusHist` are positional over HISTOGRAM_EDGES_MS and
+ * STATUS_BUCKETS respectively, exactly as they are on disk, and are merged
+ * positionally on arrival. A producer that disagrees about either table
+ * corrupts every row it touches, silently — which is why a producer that is not
+ * this package (the Go worker) declares its tables and is checked against these.
+ */
+export interface AggCell {
+  /** minute-aligned */
+  bucketTs: number;
+  firstTs: number;
+  lastTs: number;
+  protocol: Protocol;
+  endpoint: string;
+  cls: ScenarioClass;
+  count: number;
+  errors: number;
+  ok2xx: number;
+  rejected4xx: number;
+  rejected4xxGw: number;
+  reachedBackend: number;
+  latencySumMs: number;
+  maxLatencyMs: number;
+  bytesReq: number;
+  bytesResp: number;
+  /** Requests that opened a connection rather than reusing one, their total
+   *  acquisition time, and how many requests could be observed at all. Not a
+   *  correction — the residual already subtracts acquisition per request — but
+   *  the evidence for whether it mattered: a gateway that churns connections
+   *  shows up here instead of hiding inside a Δ nobody can explain.
+   *
+   *  `connMeasured` is what makes the share readable: it is 0 on a producer
+   *  that cannot see connection events, where a bare `connSetups` of 0 would
+   *  otherwise be indistinguishable from perfect reuse. */
+  connSetups: number;
+  connSetupSumMs: number;
+  connMeasured: number;
+  hist: number[];
+  statusHist: number[];
+}
+
+/** Which arm of the overhead comparison a residual belongs to. */
+export type ResidualArmPath = "gw" | "direct";
+
+/**
+ * Residuals for one health window, one class, one arm.
+ *
+ * Keyed by health window rather than by minute because health is the one
+ * judgement the source cannot make: only the control plane samples local health,
+ * and it does so per {@link HEALTH_WINDOW_MS}. Shipping residuals at that
+ * granularity lets the control plane drop exactly the contaminated windows —
+ * the same rows a per-request check would have withheld — and then fold what
+ * survives into the minute. A minute-grained cell would force a choice between
+ * discarding a whole minute and keeping a stall inside it.
+ */
+export interface ResidualCell {
+  /** HEALTH_WINDOW_MS-aligned */
+  windowTs: number;
+  cls: ScenarioClass;
+  path: ResidualArmPath;
+  count: number;
+  sumMs: number;
+  /** positional over RESIDUAL_EDGES_MS */
+  hist: number[];
+}
+
+/**
+ * How many requests a run contributed to a minute.
+ *
+ * Roll-ups carry no run id, so "how much of this window was somebody else's
+ * traffic" has to be answered from somewhere else. It used to be counted off
+ * the raw table, which works only while the raw table holds every request;
+ * once the tail is capped, those counts describe the sample, not the run. This
+ * is the exact count, and it costs one small row per (minute, run).
+ */
+export interface RunCell {
+  /** minute-aligned */
+  bucketTs: number;
+  runId: string;
+  count: number;
+}
+
+/**
+ * The generator's ingest unit: roll-ups plus a bounded raw tail.
+ *
+ * `tail` is for the recent-requests table alone. Every chart, percentile and
+ * verdict is read from the cells, which are exact — so the tail can be capped
+ * hard ({@link RAW_TAIL_PER_FLUSH}) without costing any aggregate its accuracy.
+ */
+export interface AggregateBatch {
+  batchId: string; // idempotency token
+  cells: AggCell[];
+  residuals: ResidualCell[];
+  runs: RunCell[];
+  tail: RequestResult[];
+  shed?: LoadShedSample[];
+  /**
+   * Per-window evidence about the process that took these measurements.
+   *
+   * Present — possibly empty — from any generator that measures its own health,
+   * and `undefined` from one that does not. That distinction is load-bearing:
+   * an empty array means "this window was quiet", `undefined` means "ask the
+   * control plane instead", and collapsing the two would silently apply the
+   * wrong gate. The in-process TS driver leaves it undefined by design; its
+   * clock *is* the control plane's event loop.
+   */
+  health?: WorkerHealthCell[];
+}
+
+/**
+ * One health window's evidence from the generator that holds the clock.
+ *
+ * The quantity that matters is scheduling latency, not CPU: a response arrives,
+ * the goroutine that will read the clock becomes runnable, and everything
+ * between those two moments is added to the request's measured TTFB without
+ * being added to the SUT's self-reported server time. It lands whole inside
+ * `ttfb − serverMs` and reads as gateway overhead that never happened.
+ *
+ * `fromTs`/`toTs` are the span actually covered by samples, which is what makes
+ * an unobserved window distinguishable from a quiet one — the same distinction
+ * the control-plane sampler draws with "health coverage unavailable".
+ */
+export interface WorkerHealthCell {
+  /** aligned to HEALTH_WINDOW_MS, matching the residual cells it qualifies */
+  windowTs: number;
+  fromTs: number;
+  toTs: number;
+  samples: number;
+  /** p99 of goroutine scheduling latency across the window, ms */
+  schedP99Ms: number;
+  /** worst single scheduling latency in the window, ms — diagnostic only */
+  schedMaxMs: number;
+  /** share of the runtime's available CPU that was busy, 0-100 */
+  cpuPct: number;
+  goroutines: number;
+}
+
+/**
+ * Raw rows a generator keeps per flush for the recent-requests table.
+ *
+ * The table shows at most LIMITS.recentLimit rows and the flush cadence is
+ * about a second, so a handful of flushes already overfills it. Everything
+ * above this is written, indexed, retained and then never read.
+ */
+export const RAW_TAIL_PER_FLUSH = 200;
+
+/**
+ * Width of a local-health verdict, in ms.
+ *
+ * The system sampler reads on this cadence, so it is the finest interval an
+ * observation can be qualified against — two requests inside one window share
+ * one verdict, and there is no more resolution to be had by asking per request.
+ * Shared because the Go worker keys its residual cells by the same window.
+ */
+export const HEALTH_WINDOW_MS = 2_000;
 
 // histogram bucket upper edges in ms (log-ish scale), 40 buckets
 export const HISTOGRAM_EDGES_MS: number[] = buildEdges();
+
+/**
+ * Bucket upper edges for residual (`ttfb − serverMs`) distributions, in ms.
+ *
+ * Separate from HISTOGRAM_EDGES_MS, which starts at 1 ms and cannot represent a
+ * negative value — both disqualifying for this metric. A residual on a local
+ * hop is tens of microseconds, so 1 ms buckets would put an entire reference
+ * distribution in one slot and report every gateway as costing "0 to 1 ms";
+ * and the signed low end is what keeps the reference distribution unbiased
+ * instead of floored at zero.
+ *
+ * Positive side: 20 µs upward at a 1.3 ratio, so a percentile read off a bucket
+ * is within ~13% of the true value — far inside the noise of a wall-clock TTFB.
+ * Negative side: coarse and bounded. A residual below −1 ms is a clock or
+ * header problem rather than a measurement, and all that is needed from it is
+ * a correct rank for the percentiles above.
+ *
+ * This array IS the on-disk layout of every residual histogram: entries may not
+ * be reordered or removed, and any change to it needs a new column, because
+ * stored rows merge positionally.
+ */
+export const RESIDUAL_EDGES_MS: number[] = buildResidualEdges();
+
+function buildResidualEdges(): number[] {
+  const edges: number[] = [-100, -30, -10, -3, -1, -0.5, -0.2, -0.1, -0.05, 0];
+  let v = 0.02;
+  while (v < 60_000) {
+    edges.push(Number(v.toPrecision(4)));
+    v *= 1.3;
+  }
+  return edges;
+}
+
+/**
+ * Observations a stream needs before a percentile drawn from it is reported.
+ *
+ * Ten beyond the percentile itself: p99 off 200 samples is two data points and
+ * a straight face. Applied to *both* arms of the comparison, since a difference
+ * is only as sound as its thinner side.
+ */
+export function minSamplesForPercentile(p: number): number {
+  if (p >= 100) return Infinity;
+  // 1000/(100−p) rather than 10/(1−p/100): the latter is the same number in
+  // exact arithmetic but rounds 90 up to 101 in binary floating point, which
+  // would make the thresholds look arbitrary to anyone reading them back
+  return Math.ceil(1000 / (100 - p));
+}
+
+/**
+ * Size of the direct-to-SUT reference stream, as a share of the load being
+ * generated. It has to scale: fixed-rate reference traffic is either a
+ * meaningful fraction of a 10 rps run (and perturbs it) or far too thin at
+ * 10k rps to support a p99.
+ *
+ * The ceiling is a backstop against a runaway target rate, not a governor. It
+ * used to be 50, which bound at any load above 2,500 rps and silently walked
+ * the share back down — 1% at 5k, 0.5% at 10k — so the reference became the
+ * thinner arm by an ever-widening margin and capped every percentile the Δ
+ * could report. At LIMITS.rps the declared share needs 200; 500 leaves the
+ * percentage in charge across the whole supported range.
+ */
+export const REFERENCE_STREAM = {
+  /** share of target rps mirrored directly to the SUT */
+  pctOfLoad: 2,
+  /** floor, so even an idle-rate run accumulates a reference distribution */
+  minRps: 2,
+  /** backstop, so a nonsense target rate cannot turn the control into the load */
+  maxRps: 500
+} as const;
+
+/** Reference-stream rate for a given target rate, in rps. */
+export function referenceRps(targetRps: number): number {
+  if (!Number.isFinite(targetRps) || targetRps <= 0) return 0;
+  const want = (targetRps * REFERENCE_STREAM.pctOfLoad) / 100;
+  return Math.min(REFERENCE_STREAM.maxRps, Math.max(REFERENCE_STREAM.minRps, want));
+}
 
 function buildEdges(): number[] {
   const edges: number[] = [];
@@ -461,6 +785,54 @@ function buildEdges(): number[] {
     v *= 1.35;
   }
   return edges;
+}
+
+/**
+ * The three positional tables an {@link AggregateBatch} producer must agree
+ * with. Any out-of-process producer declares its own copy at handshake time.
+ */
+export interface EdgeTables {
+  latency: number[];
+  residual: number[];
+  status: string[];
+}
+
+export function edgeTables(): EdgeTables {
+  return { latency: HISTOGRAM_EDGES_MS, residual: RESIDUAL_EDGES_MS, status: [...STATUS_BUCKETS] };
+}
+
+/**
+ * Compare a producer's declared bucket tables against ours, returning the first
+ * divergence or null.
+ *
+ * A second implementation of these tables is unavoidable — the Go worker cannot
+ * import TypeScript — and an undetected drift between them does not fail, it
+ * quietly mixes two different histograms into one column and answers every
+ * percentile wrong for as long as the database lives. Comparing lengths alone
+ * would catch an appended edge and miss a changed one, so this compares values.
+ */
+export function edgeTableMismatch(declared: Partial<EdgeTables> | undefined | null): string | null {
+  if (!declared) return "producer declared no bucket tables";
+  const ours = edgeTables();
+  for (const name of ["latency", "residual", "status"] as const) {
+    const theirs = declared[name];
+    const mine: (number | string)[] = ours[name];
+    if (!Array.isArray(theirs)) return `${name}: producer declared no table`;
+    if (theirs.length !== mine.length) {
+      return `${name}: producer has ${theirs.length} buckets, this build has ${mine.length}`;
+    }
+    for (let i = 0; i < mine.length; i++) {
+      // numbers travel through JSON, so compare with the tolerance a float
+      // round-trip needs rather than requiring bit equality
+      const a = theirs[i] as number | string;
+      const b = mine[i] as number | string;
+      const same = typeof b === "number" && typeof a === "number"
+        ? Math.abs(a - b) <= Math.abs(b) * 1e-9 + 1e-12
+        : a === b;
+      if (!same) return `${name}[${i}]: producer has ${String(a)}, this build has ${String(b)}`;
+    }
+  }
+  return null;
 }
 
 // ---------- Measurement validity ----------
@@ -482,6 +854,10 @@ export interface LoadShedSample {
   bucketTs: number;
   /** requests the concurrency ceiling prevented us from issuing */
   dropped: number;
+  /** measurements discarded for requests that WERE issued and answered.
+   *  Carried here so the loss commits into the same minute as the traffic it
+   *  silently thinned, and the window can be judged on it. */
+  resultsLost?: number;
   /** sum of the per-tick target rps, for the mean target over the bucket */
   targetSum: number;
   ticks: number;
@@ -502,8 +878,56 @@ export interface HostHealthSample {
 export const VALIDITY_LIMITS = {
   /** share of total machine capacity this process may burn */
   cpuProcessPct: 85,
-  /** event-loop stall that starts showing up in measured latency */
+  /**
+   * Event-loop stall that starts showing up in measured latency.
+   *
+   * Applies only when the control plane's own loop is the instrument — i.e.
+   * the in-process TS driver. With the Go backend every clock is read inside
+   * the worker, and this process's loop delay says nothing about the numbers;
+   * see workerSchedP99Ms.
+   */
   eventLoopP99Ms: 10,
+  /**
+   * Scheduling latency, p99 over a health window, past which the generator's
+   * own delay is a material part of what it measured.
+   *
+   * A p99 and not a max, deliberately. The metric this supersedes thresholded
+   * the worst single wakeup in a 2s interval, which is one unlucky event out
+   * of tens of thousands and is dominated by whatever the host did rather than
+   * by the generator's load — on an idle process it reported the platform's
+   * timer granularity and disqualified windows that were perfectly good.
+   *
+   * Calibrated against measured windows rather than picked, by asking where the
+   * number starts to move the measurement. Per-window scheduling p99 was plotted
+   * against the residual that window recorded, worker driving the Go SUT
+   * directly, 30s per rate, two independent passes:
+   *
+   *   200 rps   p90 0.000ms   no window over any candidate limit
+   *   1k  rps   p90 0.000ms   0 of 15 windows over 2ms
+   *   5k  rps   p90 6.29ms    2 of 15 over 2ms; residual 1.0-2.0ms in the
+   *                           windows kept, 3.8-4.8ms in those rejected — and
+   *                           the reference arm inflates with the gateway arm,
+   *                           which is the signature of the generator's own
+   *                           delay rather than of anything the gateway did
+   *   10k rps   p50 10.5ms    every window over; that run issued 101k of 300k
+   *                           requests and failed 40% of them, so rejecting it
+   *                           wholesale is the correct answer
+   *
+   * The distribution is bimodal at 5k — nothing observed between 1.3ms and
+   * 6.3ms — so 2ms sits in an empty gap and 2ms and 5ms rejected exactly the
+   * same windows in both passes. The limit is not on a knife edge, and no
+   * runtime bucket edge lands on it.
+   */
+  workerSchedP99Ms: 2,
+  /**
+   * Share of the generator runtime's available CPU, past which it is the story.
+   *
+   * A backstop, not the primary gate: Go's /cpu/classes metrics are refreshed on
+   * GC rather than continuously, so a quiet window can report a flat zero while
+   * the next reads 86%. Scheduling latency is sampled every 250ms and is what
+   * this gate actually rests on.
+   */
+  workerCpuPct: 85,
   /** share of intended load we may fail to issue before the window is suspect */
   shedPct: 1,
   /** share of a run report's window that may belong to other runs. Roll-ups are
@@ -519,12 +943,60 @@ export interface WindowValidity {
   droppedRequests: number;
   /** dropped ÷ (dropped + issued), as a percentage */
   shedPct: number;
+  /** measurements lost after the request was served; the window's percentiles
+   *  cover only issued − lost requests, and the loss is biased toward the
+   *  busiest moments */
+  resultsLost: number;
   /** mean rate the profile asked for over the window; null when not recorded */
   targetRps: number | null;
   /** rate actually issued */
   achievedRps: number;
   cpuProcessPctMax: number | null;
   eventLoopP99MsMax: number | null;
+}
+
+/**
+ * What the gateway costs, as a difference between two distributions.
+ *
+ * For every request we record `residual = ttfb − serverMs`: the time that was
+ * not the backend's. Two streams produce residuals over the same window and the
+ * same class mix — the load, through the gateway, and a concurrent reference
+ * stream straight to the SUT — and the gateway's cost is read off them at
+ * matched percentiles:
+ *
+ *     Δp = percentile(p, residual | through gateway)
+ *        − percentile(p, residual | direct)
+ *
+ * The p95 figure therefore answers "how much worse is the 95th percentile of
+ * this path than the 95th percentile of the same traffic without the gateway",
+ * which is the question an operator is actually asking. It is NOT the 95th
+ * percentile of a per-request overhead — that quantity is not measurable
+ * without pairing each request against a direct call it never had, and the
+ * previous build's attempt to synthesise one by subtracting a running median
+ * both inflated the variance and, by discarding the negative results, biased
+ * what survived upward.
+ *
+ * Δ may legitimately be negative. It means the two distributions differ by less
+ * than the measurement noise, i.e. the gateway's cost is below what this rig
+ * can resolve — reported as measured rather than clamped to zero, because a
+ * floor at zero is exactly how a rig talks itself into a finding it does not
+ * have.
+ */
+export interface OverheadDelta {
+  p50: number | null;
+  p90: number | null;
+  p95: number | null;
+  p99: number | null;
+  /** mean(gateway residual) − mean(direct residual) */
+  avg: number | null;
+  /** residuals behind the gateway arm; requests the gateway answered itself
+   *  have no backend time to subtract and cannot contribute one */
+  gwSamples: number;
+  /** residuals behind the direct arm */
+  directSamples: number;
+  /** set when a percentile above is null, saying which arm was too thin and
+   *  what it would take; null when every reported percentile is supported */
+  unavailable: string | null;
 }
 
 /** Full status distribution plus the roll-ups worth putting on a tile. */
@@ -558,8 +1030,12 @@ export interface MetricSummary {
   unexpectedFailurePct: number;
   rps: number;
   latencyMs: { p50: number; p90: number; p95: number; p99: number; avg: number; max: number };
-  /** Qualified added TTFB estimate; includes path differences, not just GW CPU. */
-  overheadMs: { p50: number | null; p90: number | null; p95: number | null; p99: number | null; avg: number | null; eligible?: number; excluded?: number; exclusionReasons?: Record<string, number> };
+  /** What the gateway path costs over the direct path, at matched percentiles.
+   *  Includes every difference between the two routes — extra hops and TLS
+   *  termination as well as the gateway's own work. */
+  overheadMs: OverheadDelta;
+  /** How often the load path had to open a connection rather than reuse one. */
+  connSetup: ConnSetupStats;
   bytes: { req: number; resp: number; respPerSec: number };
   status: StatusBreakdown;
   /** Whether this window's numbers are trustworthy at all. Read it before the
@@ -570,6 +1046,32 @@ export interface MetricSummary {
   perClass: ClassStat[];
   /** Contract-violating traffic and, crucially, *who* stopped it. */
   contract: ContractStats;
+}
+
+/**
+ * Connection reuse on the load path.
+ *
+ * The overhead Δ already subtracts each request's own acquisition time, so this
+ * is not a correction — it is the evidence for whether that correction was
+ * doing any work. A gateway that closes connections aggressively, caps
+ * keep-alive, or forces renegotiation makes every request pay a handshake; that
+ * is a real and serious property of the gateway, but it is not per-request
+ * latency and averaging it into one would misattribute it. Reported separately
+ * so it can be seen and judged on its own terms.
+ *
+ * `measured` is 0 when the generator cannot see connection events at all (the
+ * in-process driver), which is why `pct` is a share of measured requests rather
+ * than of all of them — a zero here would otherwise read as "perfect reuse".
+ */
+export interface ConnSetupStats {
+  /** requests that opened a connection instead of reusing one */
+  setups: number;
+  /** requests whose connection acquisition could be observed */
+  measured: number;
+  /** setups as a share of measured requests; null when nothing was measured */
+  pct: number | null;
+  /** mean acquisition time across the setups; null when there were none */
+  avgMs: number | null;
 }
 
 /**
@@ -620,7 +1122,9 @@ export interface ClassStat {
   gatewayErrors: number;
   rps: number;
   latencyMs: { p50: number; p95: number; p99: number; avg: number };
-  overheadMs: { p50: number | null; p95: number | null; p99: number | null; avg: number | null; eligible?: number; excluded?: number; exclusionReasons?: Record<string, number> };
+  /** Δ against the reference stream restricted to this same class, so a
+   *  big-response row is compared only with direct big-response calls. */
+  overheadMs: OverheadDelta;
   avgBytesReq: number;
   avgBytesResp: number;
 }
@@ -756,6 +1260,8 @@ export function sanitizePolicyConfig(input: unknown, base: PolicyConfig = DEFAUL
 
 /** Any field left null is simply not asserted. */
 export interface SloThresholds {
+  /** ceiling on Δp95 — how much worse the gateway path's 95th-percentile
+   *  residual may be than the direct path's. See {@link OverheadDelta}. */
   maxOverheadP95Ms: number | null;
   maxUnexpectedFailurePct: number | null;
   /** contract violations the gateway let reach the backend */
@@ -891,6 +1397,13 @@ export interface RunCounters {
   /** requests the concurrency ceiling stopped us from issuing this run — load
    *  the gateway was never actually offered, however healthy the charts look */
   droppedRequests: number;
+  /** measurements of requests that WERE issued and answered but never reached
+   *  the store: a full results queue or a failed batch write. The opposite
+   *  diagnosis to droppedRequests — the gateway did this work, the charts just
+   *  describe a subset of it, and a biased one, since results are lost exactly
+   *  when they arrive fastest. Non-zero means the percentiles are understated
+   *  in the tail. */
+  resultsLost: number;
   invalidSent: number;
   /** invalid requests the GATEWAY rejected (4xx with no backend fingerprint) */
   invalidRejectedByGateway: number;
@@ -900,7 +1413,7 @@ export interface RunCounters {
 
 export const EMPTY_RUN_COUNTERS: RunCounters = {
   sent: 0, ok: 0, errors: 0, clientErrors: 0, gatewayErrors: 0,
-  rateLimited: 0, unauthorized: 0, timeouts: 0, droppedRequests: 0,
+  rateLimited: 0, unauthorized: 0, timeouts: 0, droppedRequests: 0, resultsLost: 0,
   invalidSent: 0, invalidRejectedByGateway: 0, invalidLeaked: 0
 };
 

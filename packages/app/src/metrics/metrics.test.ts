@@ -2,17 +2,24 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LIMITS, type RequestResult, type SystemSample } from "@apigw/shared";
+import { HEALTH_WINDOW_MS, LIMITS, MEASUREMENT_VERSION, RAW_TAIL_PER_FLUSH, type BaselineSample, type RequestResult, type ScenarioClass, type SystemSample } from "@apigw/shared";
 import { createMetricsStore } from "./server.js";
+import { aggregateBatch } from "./aggregate.js";
 import { openDb } from "./db.js";
 
 let seq = 0;
+
+/** n reference observations of the same residual, all in the current minute. */
+function direct(n: number, residualMs: number, cls: ScenarioClass = "small-rest"): BaselineSample[] {
+  const ts = Date.now();
+  return Array.from({ length: n }, () => ({ ts, class: cls, residualMs }));
+}
 
 function mk(over: Partial<RequestResult> = {}): RequestResult {
   return {
     runId: "r1", requestId: `req${++seq}`, ts: Date.now(), protocol: "rest", endpoint: "GET /api/pets",
     class: "small-rest", method: "GET", status: 200,
-    latencyMs: 100, ttfbMs: 100, measurementVersion: 2, overheadReason: null, baselineMs: 0, overheadMs: 100,
+    latencyMs: 100, ttfbMs: 100, serverMs: 90, measurementVersion: MEASUREMENT_VERSION, timingReason: null,
     bytesReq: 10, bytesResp: 100, reachedBackend: true, error: null,
     ...over
   };
@@ -212,6 +219,46 @@ describe("measurement validity", () => {
     s.close();
   });
 
+  it("flags lost measurements separately from shed load", () => {
+    // shed load and lost measurements demand opposite conclusions: the first
+    // says the gateway was never offered the traffic, the second says it
+    // served traffic we failed to record. Folding them into one counter told
+    // the operator the wrong story at exactly the rates where it matters.
+    const s = createMetricsStore(":memory:");
+    const ts = Date.now();
+    const bucketTs = Math.floor(ts / 60_000) * 60_000;
+    s.ingestBatch({
+      batchId: "lost",
+      results: many(100, { ts }),
+      shed: [{ bucketTs, dropped: 0, resultsLost: 50, targetSum: 1000, ticks: 10 }]
+    });
+
+    const v = s.summary(300_000).validity;
+    expect(v.resultsLost).toBe(50);
+    expect(v.droppedRequests).toBe(0);
+    expect(v.shedPct).toBe(0);
+    expect(v.ok).toBe(false);
+    expect(v.reasons.join(" ")).toMatch(/measurements .* were lost/);
+    // 50 lost of 150 served
+    expect(v.reasons.join(" ")).toMatch(/33\.3%/);
+    s.close();
+  });
+
+  it("a window that recorded everything reports no loss", () => {
+    const s = createMetricsStore(":memory:");
+    const ts = Date.now();
+    const bucketTs = Math.floor(ts / 60_000) * 60_000;
+    s.ingestBatch({
+      batchId: "nolost",
+      results: many(10, { ts }),
+      shed: [{ bucketTs, dropped: 0, targetSum: 100, ticks: 10 }]
+    });
+    const v = s.summary(300_000).validity;
+    expect(v.resultsLost).toBe(0);
+    expect(v.reasons).toEqual([]);
+    s.close();
+  });
+
   it("flags a saturated generator separately from shed load", () => {
     const s = createMetricsStore(":memory:");
     const ts = Date.now();
@@ -288,6 +335,124 @@ describe("summaryBetween", () => {
     // a run that had the minute to itself reports a clean window
     const alone = s.windowScope("run-mine", now - 40 * 60_000, now - 40 * 60_000);
     expect(alone).toEqual({ foreignRequests: 0, totalRequests: 0, foreignPct: 0 });
+    s.close();
+  });
+});
+
+describe("pre-aggregated ingest", () => {
+  it("stores a generator's cells identically to the same traffic sent raw", () => {
+    // the generators ship cells and /api/ingest ships requests; both must land
+    // on the same rows, or the backend a run used would change its numbers
+    const now = Date.now();
+    const results = [
+      ...many(40, { ts: now, latencyMs: 12 }),
+      ...many(5, { ts: now, status: 500, latencyMs: 300 }),
+      ...many(3, { ts: now, class: "soap", protocol: "soap", endpoint: "SOAP getPetById" })
+    ];
+
+    const raw = createMetricsStore(":memory:");
+    raw.ingestBatch({ batchId: "raw", results, baseline: direct(30, 0.1) });
+    const pre = createMetricsStore(":memory:");
+    pre.ingestAggregate(aggregateBatch({ batchId: "pre", results, baseline: direct(30, 0.1) }));
+
+    const a = raw.summary(300_000);
+    const b = pre.summary(300_000);
+    expect(b.total).toBe(a.total);
+    expect(b.errorPct).toBe(a.errorPct);
+    expect(b.p95).toBe(a.p95);
+    expect(b.overheadMs.gwSamples).toBe(a.overheadMs.gwSamples);
+    expect(b.overheadMs.directSamples).toBe(a.overheadMs.directSamples);
+    expect(b.overheadMs.p50).toBe(a.overheadMs.p50);
+    raw.close();
+    pre.close();
+  });
+
+  it("folds a batch that straddles a minute into one hour row", () => {
+    // a cell is minute-keyed, so a flush spanning a boundary carries two cells
+    // for the same endpoint that share an hour — the hour layer must merge them
+    // rather than let the second overwrite the first
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    const edge = Math.floor(now / 60_000) * 60_000;
+    s.ingestAggregate(aggregateBatch({
+      batchId: "straddle",
+      results: [...many(10, { ts: edge - 1 }), ...many(10, { ts: edge + 1 })]
+    }));
+    const hour = s.timeseries(3600, now - 2 * 3600_000, now);
+    expect(hour.points.reduce((n, p) => n + p.total, 0)).toBe(20);
+    expect(s.summary(300_000).total).toBe(20);
+    s.close();
+  });
+
+  it("folds residual windows into the minute they belong to", () => {
+    // residual cells arrive at health-window grain so the control plane can
+    // withhold contaminated ones; by the time they reach a layer that
+    // distinction is spent and thirty of them are one minute
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    const agg = aggregateBatch({
+      batchId: "windows",
+      results: many(40, { ts: now, ttfbMs: 100, serverMs: 90 }),
+      baseline: direct(40, 0.5)
+    });
+    // one window per arm here; split the gw arm across two to prove they merge
+    const gw = agg.residuals.find((r) => r.path === "gw")!;
+    agg.residuals.push({ ...gw, windowTs: gw.windowTs - HEALTH_WINDOW_MS });
+    s.ingestAggregate(agg);
+
+    const d = s.summary(300_000).overheadMs;
+    expect(d.gwSamples).toBe(80);
+    expect(d.directSamples).toBe(40);
+    s.close();
+  });
+
+  it("reports connection reuse as a share of what could be measured", () => {
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    s.ingestBatch({
+      batchId: "conn",
+      results: [
+        ...many(90, { ts: now, connectMs: 0.05, connReused: true }),
+        ...many(10, { ts: now, connectMs: 20, connReused: false })
+      ]
+    });
+    const c = s.summary(300_000).connSetup;
+    expect(c.measured).toBe(100);
+    expect(c.setups).toBe(10);
+    expect(c.pct).toBeCloseTo(10, 6);
+    expect(c.avgMs).toBeCloseTo(20, 6);
+    s.close();
+  });
+
+  it("says nothing rather than 'perfect reuse' when the generator cannot see connections", () => {
+    // the in-process driver reports connectMs = null. A share computed off the
+    // request count would read 0% setups there, which is a claim about the
+    // gateway that nothing measured.
+    const s = createMetricsStore(":memory:");
+    s.ingestBatch({ batchId: "blind", results: many(50, { connectMs: null }) });
+    const c = s.summary(300_000).connSetup;
+    expect(c.measured).toBe(0);
+    expect(c.pct).toBeNull();
+    expect(c.avgMs).toBeNull();
+    s.close();
+  });
+
+  it("refuses to write a batch that is not a batch", () => {
+    const s = createMetricsStore(":memory:");
+    expect(() => s.ingestAggregate({ batchId: "", cells: [] } as never)).toThrow();
+    expect(() => s.ingestAggregate({ batchId: "x" } as never)).toThrow();
+    // a cell with no bucket has nowhere to go and must not be guessed at
+    expect(() => s.ingestAggregate({ batchId: "y", cells: [{} as never], residuals: [], runs: [], tail: [] }))
+      .toThrow("bucketTs");
+    s.close();
+  });
+
+  it("is idempotent on batchId whichever shape the batch arrived in", () => {
+    const s = createMetricsStore(":memory:");
+    const agg = aggregateBatch({ batchId: "dup", results: many(5) });
+    expect(s.ingestAggregate(agg).ingested).toBe(5);
+    expect(s.ingestAggregate(agg).duplicate).toBe(true);
+    expect(s.summary(300_000).total).toBe(5);
     s.close();
   });
 });
@@ -540,9 +705,8 @@ describe("timeseries partial buckets", () => {
   });
 });
 
-describe("recent-tail sampling", () => {
-  it("keeps every row below the sampling threshold", () => {
-    // 100 rows over a 5s flush = 20 rps — sampling must be a no-op here
+describe("recent-tail bounding", () => {
+  it("keeps every row of a batch that fits in the tail budget", () => {
     const s = createMetricsStore(":memory:");
     const now = Date.now();
     s.ingestBatch({ batchId: "small", results: Array.from({ length: 100 }, (_, i) => mk({ ts: now - i })) });
@@ -550,10 +714,9 @@ describe("recent-tail sampling", () => {
     s.close();
   });
 
-  it("downsamples crud at high rates while errors and non-crud classes survive", () => {
+  it("caps the raw tail per flush while errors and non-crud classes survive", () => {
     const s = createMetricsStore(":memory:");
     const now = Date.now();
-    // 5000 rows / 5s flush = 1000 rps → k = 10 for crud classes
     const results: ReturnType<typeof mk>[] = [
       ...Array.from({ length: 4990 }, (_, i) => mk({ ts: now - i })),
       ...Array.from({ length: 5 }, (_, i) => mk({ ts: now - i, status: 500, error: "boom" })),
@@ -561,13 +724,35 @@ describe("recent-tail sampling", () => {
     ];
     s.ingestBatch({ batchId: "huge", results });
 
+    // the tail is bounded by what the recent-requests table can show, not by a
+    // fraction of the rate: 5000 results or 500k, the write is the same size
     const tail = s.recent(500);
-    expect(tail.length).toBeGreaterThanOrEqual(400);
-    expect(tail.length).toBeLessThan(600);
+    expect(tail.length).toBe(RAW_TAIL_PER_FLUSH);
+    // the rows anyone actually opens that table for are taken first
     expect(tail.filter((r) => r.status >= 500).length).toBe(5);
     expect(tail.filter((r) => r.class === "soap").length).toBe(5);
-    // roll-ups are exact regardless of the raw sampling
+    // every aggregate stays exact regardless of what the tail kept
     expect(s.summary(300_000).total).toBe(5000);
+    s.close();
+  });
+
+  it("keeps the per-run attribution exact even though the tail is a sample", () => {
+    // foreignPct used to be counted off the raw table. Once that became a
+    // bounded tail, counting it there would have reported the mix of the
+    // sample — which is deliberately biased toward errors and rare classes.
+    const s = createMetricsStore(":memory:");
+    const now = Date.now();
+    s.ingestBatch({
+      batchId: "mixed",
+      results: [
+        ...Array.from({ length: 3000 }, (_, i) => mk({ ts: now - i, runId: "mine" })),
+        ...Array.from({ length: 1000 }, (_, i) => mk({ ts: now - i, runId: "theirs" }))
+      ]
+    });
+    const scope = s.windowScope("mine", now - 60_000, now);
+    expect(scope.totalRequests).toBe(4000);
+    expect(scope.foreignRequests).toBe(1000);
+    expect(scope.foreignPct).toBeCloseTo(25, 6);
     s.close();
   });
 });
@@ -609,7 +794,7 @@ describe("reset and prune", () => {
 });
 
 
-describe("qualified overhead and durable coverage", () => {
+describe("distributional gateway overhead and durable coverage", () => {
   it("uses the same full minute for the rate numerator and denominator", () => {
     const store = createMetricsStore(":memory:");
     try {
@@ -641,35 +826,129 @@ describe("qualified overhead and durable coverage", () => {
     } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it("preserves failures and totals but excludes unqualified overhead from averages and histograms", () => {
+  it("reads the gateway's cost as the gap between two distributions", () => {
+    // 300 requests whose residual is 12ms, against a reference stream whose
+    // residual is 2ms over the same minute: the gateway path costs ~10ms more
+    // at every percentile. No request here was sent both ways — that quantity
+    // is not measurable — so the number is a difference of distributions.
     const store = createMetricsStore(":memory:");
     try {
-      store.ingestBatch({ batchId: "qualified", results: [
-        mk({ overheadMs: 10 }),
-        mk({ overheadMs: 20 }),
-        mk({ overheadMs: 1000, overheadReason: "local event-loop stall" }),
-        mk({ overheadMs: null, ttfbMs: null, status: 0, error: "timeout", overheadReason: "no response headers" }),
-        mk({ measurementVersion: 1, overheadMs: 500 }),
-        mk({ class: "big-response", overheadMs: 900 })
-      ] });
-      const sum = store.summary(300_000);
-      expect(sum.total).toBe(6);
-      expect(sum.errors).toBe(1);
-      expect(sum.overheadMs.eligible).toBe(2);
-      expect(sum.overheadMs.excluded).toBe(3);
-      expect(sum.overheadMs.avg).toBe(15);
-      expect(sum.perClass.find(c => c.cls === "big-response")!.overheadMs.avg).toBe(900);
-      expect(store.recent(10).some(r => r.overheadReason === "local event-loop stall")).toBe(true);
-      expect(sum.overheadMs.p95!).toBeLessThan(30);
+      store.ingestBatch({
+        batchId: "delta",
+        results: many(300, { ttfbMs: 112, serverMs: 100 }),
+        baseline: direct(300, 2)
+      });
+      const d = store.summary(300_000).overheadMs;
+      expect(d.gwSamples).toBe(300);
+      expect(d.directSamples).toBe(300);
+      // read off log-scale buckets, so the estimate lands near 10 rather than on it
+      expect(d.p50!).toBeGreaterThan(9);
+      expect(d.p50!).toBeLessThan(12);
+      expect(d.p95!).toBeGreaterThan(9);
+      expect(d.avg!).toBeCloseTo(10, 5);
+      // 300 is short of the 1,000 a p99 needs, and it says so rather than
+      // quoting the third-largest of 300 samples as a 99th percentile
+      expect(d.p99).toBeNull();
+      expect(d.unavailable).toContain("p99");
     } finally { store.close(); }
   });
 
-  it("reports unavailable when all measurements use the old definition", () => {
+  it("keeps a negative reference residual instead of flooring it at zero", () => {
+    // The reference arm's low tail crosses zero because TTFB and the SUT's own
+    // clock are read at different layers. Clamping it — which the retired
+    // per-request estimate did — lifts the reference and subtracts the lift
+    // from the gateway. Here that would turn a real ~4ms gap into ~0.
     const store = createMetricsStore(":memory:");
     try {
-      store.ingestBatch({ batchId: "old", results: [mk({ measurementVersion: 1 })] });
-      expect(store.summary(300_000).overheadMs.p95).toBeNull();
-      expect(store.summary(300_000).overheadMs.avg).toBeNull();
+      store.ingestBatch({
+        batchId: "signed",
+        results: many(300, { ttfbMs: 100, serverMs: 100 }), // residual 0
+        baseline: direct(300, -4)
+      });
+      const d = store.summary(300_000).overheadMs;
+      expect(d.p50!).toBeGreaterThan(2);
+      expect(d.avg!).toBeCloseTo(4, 5);
+    } finally { store.close(); }
+  });
+
+  it("withholds a percentile the thinner arm cannot support, and says which", () => {
+    // Ten observations beyond the percentile or it is not reported. The direct
+    // arm is deliberately a small share of the load, so it is nearly always the
+    // side that runs out — and a p95 from 30 samples is one data point wearing
+    // a confident face.
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({
+        batchId: "thin",
+        results: many(1_000, { ttfbMs: 112, serverMs: 100 }),
+        baseline: direct(30, 2)
+      });
+      const d = store.summary(300_000).overheadMs;
+      expect(d.p50).not.toBeNull();   // 30 clears the 20 p50 needs
+      expect(d.p90).toBeNull();       // 100
+      expect(d.p95).toBeNull();       // 200
+      expect(d.p99).toBeNull();       // 1000
+      expect(d.unavailable).toContain("p90, p95, p99");
+      expect(d.unavailable).toContain("30 direct");
+    } finally { store.close(); }
+  });
+
+  it("reports no Δ at all when one arm is missing entirely", () => {
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({ batchId: "gw-only", results: many(500, { ttfbMs: 112, serverMs: 100 }) });
+      const d = store.summary(300_000).overheadMs;
+      expect(d.p50).toBeNull();
+      expect(d.avg).toBeNull();
+      expect(d.directSamples).toBe(0);
+      expect(d.unavailable).toContain("no direct reference traffic");
+    } finally { store.close(); }
+  });
+
+  it("gives a request no residual when it has no backend clock or a suspect one", () => {
+    // Both exclusions still count as traffic — they are what the run delivered.
+    // Only their residual is withheld: a gateway-manufactured response has no
+    // backend time to subtract, and a stalled generator's delay lands inside
+    // ttfb − serverMs in full, where it would read as the gateway's cost.
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({
+        batchId: "excluded",
+        results: [
+          ...many(50, { ttfbMs: 112, serverMs: 100 }),
+          ...many(50, { ttfbMs: 112, serverMs: null, reachedBackend: false, status: 401 }),
+          ...many(50, { ttfbMs: 9_999, serverMs: 100, timingReason: "local event-loop stall" }),
+          ...many(50, { ttfbMs: 112, serverMs: 100, measurementVersion: 2 })
+        ],
+        baseline: direct(50, 2)
+      });
+      const sum = store.summary(300_000);
+      expect(sum.total).toBe(200);
+      expect(sum.overheadMs.gwSamples).toBe(50);
+      // the stalled batch's 9.9s residual would dominate every percentile
+      expect(sum.overheadMs.p50!).toBeLessThan(15);
+    } finally { store.close(); }
+  });
+
+  it("compares each class against direct traffic of that same class", () => {
+    const store = createMetricsStore(":memory:");
+    try {
+      store.ingestBatch({
+        batchId: "per-class",
+        results: [
+          ...many(100, { ttfbMs: 112, serverMs: 100 }),
+          ...many(100, { class: "big-response", ttfbMs: 900, serverMs: 100 })
+        ],
+        baseline: [...direct(100, 2), ...direct(100, 400, "big-response")]
+      });
+      const perClass = store.summary(300_000).perClass;
+      const small = perClass.find((c) => c.cls === "small-rest")!.overheadMs;
+      const big = perClass.find((c) => c.cls === "big-response")!.overheadMs;
+      expect(small.avg!).toBeCloseTo(10, 5);
+      expect(big.avg!).toBeCloseTo(400, 5);
+      // and the headline leaves the bulk class out: a 400ms body copy is not
+      // the number anyone means by "what does the gateway add"
+      expect(store.summary(300_000).overheadMs.avg!).toBeCloseTo(10, 5);
     } finally { store.close(); }
   });
 });

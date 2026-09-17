@@ -7,6 +7,7 @@ import { createPetstoreRoutes, SERVER_MS_HEADER, type Handler, type RouteCtx } f
 import { buildOpenApiDocument, toYaml } from "./petstore/openapi.js";
 import { WSDL } from "./petstore/soap.js";
 import { Driver, type Driver as DriverType } from "./loadgen/driver.js";
+import { GoSutProcess, sutBinaryPath } from "./sut/goSut.js";
 import { readConfig, type AppConfig } from "./config.js";
 import { requireAuth, readBasicAuthCreds } from "./auth.js";
 import {
@@ -158,7 +159,42 @@ const json = (status: number, body: unknown, extra?: Record<string, string>): Re
 
 export function buildApp(cfg: AppConfig): BuiltApp {
   // ---------------- SUT: petstore ----------------
-  const petstore = createPetstoreRoutes();
+  // `runtime` is a copy because an ephemeral SUT port is not known until the
+  // child has bound it, and the caller's config object is not ours to rewrite.
+  const runtime: AppConfig = { ...cfg };
+
+  const wantsGoSut = runtime.sutBackend === "go";
+  const goSutAvailable = wantsGoSut && sutBinaryPath() !== null;
+  if (wantsGoSut && !goSutAvailable) {
+    console.warn("[sut] packages/go/bin/gwtester-sut is missing — falling back to the in-process ts petstore (build it under packages/go to use the default go backend)");
+  }
+  // Out of process, the petstore is not ours to route to: it answers on its own
+  // port and the gateway under test proxies to it directly.
+  const sutProcess = goSutAvailable ? new GoSutProcess() : null;
+  const petstore = goSutAvailable ? null : createPetstoreRoutes();
+
+  /**
+   * Point selfUrl and the default gateway at the port the child actually bound.
+   *
+   * Only entries still holding the placeholder are rewritten: an operator who
+   * pinned PETSTORE_SELF_URL or GW_*_BASE_URL meant it, and silently retargeting
+   * those would make the reference arm and the gateway arm terminate at
+   * different backends — which is the one way this measurement can be wrong
+   * without looking wrong.
+   */
+  const placeholder = `http://127.0.0.1:${runtime.sutPort}`;
+  const rebindSut = (boundPort: number): void => {
+    const url = `http://127.0.0.1:${boundPort}`;
+    if (runtime.selfUrl === placeholder) runtime.selfUrl = url;
+    runtime.defaultGateway = {
+      rest: runtime.defaultGateway.rest.baseUrl === placeholder
+        ? { ...runtime.defaultGateway.rest, baseUrl: url }
+        : runtime.defaultGateway.rest,
+      soap: runtime.defaultGateway.soap.baseUrl === placeholder
+        ? { ...runtime.defaultGateway.soap, baseUrl: url }
+        : runtime.defaultGateway.soap
+    };
+  };
 
   // ---------------- metrics store (in-process) ----------------
   const store = createMetricsClient(cfg.dbPath);
@@ -171,13 +207,21 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   sampler.start();
   driver.setHealthCheck((from, to) => {
     if (sampler.latest().ts < to) sampler.sampleNow();
-    return sampler.qualityBetween(from, to);
+    const reason = sampler.qualityBetween(from, to);
+    if (reason !== null) {
+      const l = sampler.latest();
+      console.log(`[metrics] healthCheck rejected [${from},${to}]: ${reason} (latest.ts=${l.ts}, intervalStart=${l.intervalStartTs}, now=${Date.now()})`);
+    }
+    return reason;
   });
+  // Batches reach here pre-rolled: a few dozen cells, a few dozen residual
+  // cells and a capped raw tail, whatever the request rate. Everything on this
+  // line — the structured clone into the metrics thread included — is therefore
+  // O(endpoints), not O(requests).
   driver.setIngest(async (batch) => {
     sampler.noteBatch(batch);
-    return await store.ingestBatch(batch);
+    return await store.ingestAggregate(batch);
   });
-  driver.setBaselineUrl(cfg.selfUrl);
   driver.onAutoStop((runId) => { if (runId) void store.recordRunStop(runId).catch(e => console.error("[metrics] run stop failed", e)); });
 
   const healthTimer = setInterval(async () => {
@@ -214,12 +258,18 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     policyTimer.unref?.();
   };
   const ready = (async () => {
+    // The SUT comes up before anything can be pointed at it: a run started
+    // against a backend that is not listening yet records connection failures
+    // and scores them against the gateway.
+    if (sutProcess) rebindSut(await sutProcess.start(runtime.sutPort));
+    driver.setBaselineUrl(runtime.selfUrl);
+
     await schedulePolicies();
     const savedGw = await store.readGateway();
     const savedProfile = await store.readProfile();
-    driver.setGw(sanitizeGwTargets(savedGw ?? cfg.defaultGateway, cfg.defaultGateway));
+    driver.setGw(sanitizeGwTargets(savedGw ?? runtime.defaultGateway, runtime.defaultGateway));
     driver.setProfile(sanitizeLoadProfile(savedProfile ?? cfg.defaultProfile, cfg.defaultProfile));
-    if (!savedGw) await store.writeGateway(cfg.defaultGateway);
+    if (!savedGw) await store.writeGateway(runtime.defaultGateway);
     if (!savedProfile) await store.writeProfile(cfg.defaultProfile);
     void driver.init().catch(e => console.error("driver init failed", e));
   })();
@@ -227,12 +277,12 @@ export function buildApp(cfg: AppConfig): BuiltApp {
 
   // ---------------- API contract definitions ----------------
   const specServerUrl = async (query: URLSearchParams, protocol: "rest" | "soap"): Promise<string> => {
-    const fallback = normalizeServerUrl(cfg.defaultGateway[protocol].baseUrl) ?? `http://127.0.0.1:${cfg.port}`;
+    const fallback = normalizeServerUrl(runtime.defaultGateway[protocol].baseUrl) ?? `http://127.0.0.1:${runtime.port}`;
     const override = query.get("server");
     if (typeof override === "string" && override.trim() !== "") {
       return normalizeServerUrl(override) ?? fallback;
     }
-    const gw = sanitizeGwTargets(await store.readGateway() ?? cfg.defaultGateway, cfg.defaultGateway)[protocol];
+    const gw = sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway)[protocol];
     const prefix = gw.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
     return normalizeServerUrl(`${gw.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}`) ?? fallback;
   };
@@ -339,16 +389,20 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const probe = sanitizeGwConfig(body, persisted[protocol]);
       const prefix = probe.pathPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
       // a SOAP endpoint answers POSTs, not GET /health — probe it with a real
-      // getPetById call so a healthy route is not reported as down
+      // getPetById call so a healthy route is not reported as down. Where the
+      // endpoint lives is deployment-specific: the bundled petstore serves it
+      // at <prefix>/soap/petservice, while a gateway may front the whole
+      // prefix as the SOAP service. Try the suffix first, then the bare
+      // prefix on a 404.
       const isSoap = protocol === "soap";
-      const url = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}${isSoap ? "/soap/petservice" : "/health"}`;
+      const basePrefix = `${probe.baseUrl.replace(/\/+$/, "")}${prefix ? "/" + prefix : ""}`;
 
       const headers: Record<string, string> = {};
       if (isSoap) {
         headers["Content-Type"] = "text/xml; charset=utf-8";
         headers["SOAPAction"] = '"getPetById"';
       }
-      if (forwardsBasicAuth(probe, cfg.selfUrl)) {
+      if (forwardsBasicAuth(probe, runtime.selfUrl)) {
         const creds = readBasicAuthCreds();
         if (creds) headers["authorization"] = `Basic ${Buffer.from(`${creds.user}:${creds.pass}`).toString("base64")}`;
       }
@@ -361,10 +415,17 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const soapProbeBody = '<?xml version="1.0" encoding="utf-8"?>' +
         '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tns="http://petstore.apigw.test/soap">' +
         '<soap:Body><tns:getPetByIdRequest><petId>1</petId></tns:getPetByIdRequest></soap:Body></soap:Envelope>';
+      const url = isSoap ? `${basePrefix}/soap/petservice` : `${basePrefix}/health`;
       try {
-        const upstream = await fetch(url, isSoap
+        let upstream = await fetch(url, isSoap
           ? { method: "POST", headers, body: soapProbeBody, signal: ac.signal }
           : { method: "GET", headers, signal: ac.signal });
+        if (isSoap && upstream.status === 404 && prefix !== "") {
+          // the gateway fronts the prefix itself as the SOAP endpoint — the
+          // petstore-style suffix is ours, not the deployment's
+          await upstream.arrayBuffer();
+          upstream = await fetch(basePrefix, { method: "POST", headers, body: soapProbeBody, signal: ac.signal });
+        }
         await upstream.arrayBuffer();
         // SOAP faults are 400 but still prove the service is reachable and
         // speaking SOAP — only a routing-level miss (404) is a failure
@@ -517,19 +578,25 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   }
 
   // ---------------- dispatcher ----------------
-  const petCompiled = compileRoutes(petstore.routes);
+  const petCompiled = petstore ? compileRoutes(petstore.routes) : [];
   const appCompiled = compileRoutes(appRoutes);
   const all = [...appCompiled, ...petCompiled];
 
   /** Routes the SUT stamps X-Server-Ms on — the petstore paths plus the three
    *  synthetic stress endpoints. Mirrors the old serverMsStamp middleware's
-   *  coverage exactly (petstore router + /api/slow /api/big /api/echo). */
+   *  coverage exactly (petstore router + /api/slow /api/big /api/echo).
+   *
+   *  Nothing is stamped when the petstore is out of process: those paths reach
+   *  a different binary, and stamping our own 404 for one would credit backend
+   *  time to a request this process never served. The Go SUT sets the header
+   *  itself. */
   const stampsServerMs = (pathname: string): boolean =>
-    pathname.startsWith("/api/pets") || pathname.startsWith("/api/store") ||
-    pathname.startsWith("/soap/") || pathname.startsWith("/admin/") ||
-    pathname === "/api/slow" || pathname.startsWith("/api/slow/") ||
-    pathname === "/api/big" || pathname.startsWith("/api/big/") ||
-    pathname === "/api/echo";
+    petstore !== null && (
+      pathname.startsWith("/api/pets") || pathname.startsWith("/api/store") ||
+      pathname.startsWith("/soap/") || pathname.startsWith("/admin/") ||
+      pathname === "/api/slow" || pathname.startsWith("/api/slow/") ||
+      pathname === "/api/big" || pathname.startsWith("/api/big/") ||
+      pathname === "/api/echo");
 
   const fetchHandler = async (req: Request): Promise<Response> => {
     await ready;
@@ -604,10 +671,13 @@ export function buildApp(cfg: AppConfig): BuiltApp {
     driver,
     sampler,
     async shutdown() {
-      await ready;
+      // the driver goes first: stopping the backend out from under in-flight
+      // requests would record its own teardown as a wave of gateway errors
+      await ready.catch(() => undefined);
       clearInterval(healthTimer);
       if (policyTimer) clearInterval(policyTimer);
       await driver.shutdown();
+      if (sutProcess) await sutProcess.stop();
       sampler.stop();
       await store.close();
     }

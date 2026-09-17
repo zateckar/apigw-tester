@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { readConfig } from "./config.js";
 
 const KEYS = [
-  "PORT", "DB_PATH", "PUBLIC_DIR", "PETSTORE_SELF_URL",
+  "PORT", "DB_PATH", "PUBLIC_DIR", "PETSTORE_SELF_URL", "SUT_BACKEND", "SUT_PORT",
   "GW_BASE_URL", "GW_API_KEY", "GW_API_KEY_HEADER", "GW_PATH_PREFIX",
   "GW_REST_BASE_URL", "GW_REST_API_KEY", "GW_REST_API_KEY_HEADER", "GW_REST_PATH_PREFIX",
   "GW_SOAP_BASE_URL", "GW_SOAP_API_KEY", "GW_SOAP_API_KEY_HEADER", "GW_SOAP_PATH_PREFIX"
@@ -50,7 +50,9 @@ describe("readConfig", () => {
     process.env["GW_API_KEY"] = "secret";
     process.env["GW_PATH_PREFIX"] = "/v2";
     const cfg = readConfig();
-    expect(cfg.selfUrl).toBe("http://127.0.0.1:9999");
+    // selfUrl follows the backend, not the dashboard: the petstore is its own
+    // process on its own port, and the reference arm has to reach *it*
+    expect(cfg.selfUrl).toBe("http://127.0.0.1:8081");
     expect(cfg.defaultGateway.rest).toMatchObject({
       baseUrl: "https://gw.example.com",
       apiKey: "secret",
@@ -61,6 +63,56 @@ describe("readConfig", () => {
       apiKey: "secret",
       pathPrefix: "/v2"
     });
+  });
+
+  it("defaults the SUT to its own process on its own port", () => {
+    const cfg = readConfig();
+    expect(cfg.sutBackend).toBe("go");
+    expect(cfg.sutPort).toBe(8081);
+    // the whole point of the split: the backend the load terminates at is not
+    // the process recording the measurements
+    expect(cfg.selfUrl).toBe("http://127.0.0.1:8081");
+    expect(cfg.selfUrl).not.toBe(`http://127.0.0.1:${cfg.port}`);
+  });
+
+  it("puts the petstore back in this process when SUT_BACKEND=ts", () => {
+    process.env["SUT_BACKEND"] = "ts";
+    process.env["PORT"] = "9100";
+    const cfg = readConfig();
+    expect(cfg.sutBackend).toBe("ts");
+    expect(cfg.selfUrl).toBe("http://127.0.0.1:9100");
+  });
+
+  it("only accepts 'ts' as an opt-out, so a typo does not silently disable the split", () => {
+    for (const raw of ["typescript", "TS", "go", "", "yes"]) {
+      process.env["SUT_BACKEND"] = raw;
+      expect(readConfig().sutBackend, raw).toBe("go");
+    }
+  });
+
+  it("honours SUT_PORT, including 0 for an ephemeral one", () => {
+    process.env["SUT_PORT"] = "9200";
+    expect(readConfig().sutPort).toBe(9200);
+    expect(readConfig().selfUrl).toBe("http://127.0.0.1:9200");
+
+    // 0 means "ask the OS"; buildApp rewrites the URL once the child reports
+    process.env["SUT_PORT"] = "0";
+    expect(readConfig().sutPort).toBe(0);
+
+    for (const bad of ["-1", "70000", "eight-thousand"]) {
+      process.env["SUT_PORT"] = bad;
+      expect(readConfig().sutPort, bad).toBe(8081);
+    }
+  });
+
+  it("lets an explicit PETSTORE_SELF_URL win over the split-out default", () => {
+    // this is the hook for pointing the rig at a real backend; if it stopped
+    // working, the Δ would compare two different backends and call the
+    // difference the gateway's cost
+    process.env["PETSTORE_SELF_URL"] = "https://backend.example.com/";
+    const cfg = readConfig();
+    expect(cfg.selfUrl).toBe("https://backend.example.com");
+    expect(cfg.defaultGateway.rest.baseUrl).toBe("https://backend.example.com");
   });
 
   it("lets protocol-specific variables override the legacy ones independently", () => {

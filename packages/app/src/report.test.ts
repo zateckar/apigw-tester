@@ -16,7 +16,8 @@ function summary(over: Partial<MetricSummary> = {}): MetricSummary {
     windowSec: 600, total: 1000, errors: 0, errorPct: 0,
     unexpectedFailures: 0, unexpectedFailurePct: 0, rps: 1.7,
     latencyMs: { p50: 10, p90: 20, p95: 25, p99: 40, avg: 12, max: 90 },
-    overheadMs: { p50: 2, p90: 5, p95: 6, p99: 9, avg: 3 },
+    overheadMs: { p50: 2, p90: 5, p95: 6, p99: 9, avg: 3, gwSamples: 900, directSamples: 400, unavailable: null },
+    connSetup: { setups: 12, measured: 1000, pct: 1.2, avgMs: 4 },
     bytes: { req: 1, resp: 1, respPerSec: 1 },
     status: {
       buckets: [{ bucket: "2xx", count: 1000 }],
@@ -200,12 +201,22 @@ describe("report rendering", () => {
 });
 
 
-it("does not pass overhead acceptance by discarding contaminated samples", () => {
+it("cannot pass overhead acceptance without a Δ to judge", () => {
+  // A thin reference arm leaves p95 null. Treating "we could not measure it" as
+  // "it was within budget" is the one failure mode an acceptance gate must not
+  // have, so the verdict is inconclusive and says which side ran out.
   const report = buildRunReport({
-    run: { id: 1, runId: "filtered", startedAt: 0, stoppedAt: 60_000, profile: DEFAULT_LOAD_PROFILE },
-    summary: summary({ overheadMs: { p50: 1, p90: 1, p95: 1, p99: 1, avg: 1, eligible: 99, excluded: 1 } }),
+    run: { id: 1, runId: "thin", startedAt: 0, stoppedAt: 60_000, profile: DEFAULT_LOAD_PROFILE },
+    summary: summary({
+      overheadMs: {
+        p50: 1, p90: null, p95: null, p99: null, avg: 1,
+        gwSamples: 900, directSamples: 30,
+        unavailable: "p90, p95, p99 need 1,000 residuals on each side; this window has 900 through the gateway and 30 direct"
+      }
+    }),
     scope: { totalRequests: 100, foreignRequests: 0, foreignPct: 0 },
     gateway: DEFAULT_GW_TARGETS, policies: [], policyConfig: DEFAULT_POLICY_CONFIG, slo: { ...DEFAULT_SLO, maxOverheadP95Ms: 10 }
   });
   expect(report.verdict.state).toBe("inconclusive");
+  expect(report.verdict.reasons[0]).toContain("30 direct");
 });

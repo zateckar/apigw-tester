@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { VALIDITY_LIMITS } from "@apigw/shared";
 import { readFileSync } from "node:fs";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import type { IngestBatch, SystemSample } from "@apigw/shared";
+import type { AggregateBatch, SystemSample } from "@apigw/shared";
 
 export interface SystemSamplerOpts {
   /** Sample cadence; default 2s matches the dashboard poll. */
@@ -27,7 +27,7 @@ export interface SystemSampler {
   history(n?: number): SystemSample[];
   /** Called once per ingested batch so appInBps/appOutBps can be derived
    *  without the sampler reaching into the metrics store. */
-  noteBatch(batch: IngestBatch): void;
+  noteBatch(batch: AggregateBatch): void;
 }
 
 interface BytePair {
@@ -214,6 +214,27 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
 
   // A 20ms-resolution histogram trades a pinch of low-end accuracy for a
   // permanent memory cap; enabled once because the histogram survives reset().
+  //
+  // Note for anyone tuning this: qualityBetween thresholds eventLoopMaxMs —
+  // the worst single timer wakeup in a 2s interval — against a 10ms limit, and
+  // on an idle process that number is the platform's timer granularity rather
+  // than this process's load. Measured here on Windows (15.6ms system tick):
+  // a Bun process with no application in it at all reports a max lateness of
+  // ~20ms at this resolution and ~27ms at 1ms resolution. Both are above the
+  // limit. Three things that look like levers are not:
+  //
+  //   - finer resolution makes it worse, by catching more outliers;
+  //   - p99 is indistinguishable from max here (~100 samples per interval), so
+  //     reading the statistic the limit is named for changes nothing;
+  //   - it is not caused by anything the control plane does. With the petstore
+  //     in this process and with it split out, 200rps disqualifies 94.9% and
+  //     92.7% of windows respectively, at 0% process CPU either way.
+  //
+  // What it means in practice: when the control plane is idle — which is now
+  // the intended state, since neither the load nor the backend runs here — a
+  // "local event-loop stall" verdict can be the host's timer behaviour and not
+  // evidence about the measurement at all. Deciding what the gate should read
+  // instead is a change to the trustworthiness model, not a tuning knob.
   let loopHist: ReturnType<typeof monitorEventLoopDelay> | null = null;
   try {
     loopHist = monitorEventLoopDelay({ resolution: 20 });
@@ -334,8 +355,8 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
     if (samples.length > historySize) samples.splice(0, samples.length - historySize);
   }
 
-  function noteBatch(batch: IngestBatch): void {
-    if (!batch || !Array.isArray(batch.results)) return;
+  function noteBatch(batch: AggregateBatch): void {
+    if (!batch || !Array.isArray(batch.cells)) return;
     const now = Date.now();
     if (appTs !== null && now > appTs) {
       // publish the rate accumulated since the previous batch, then restart —
@@ -347,9 +368,12 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
       appOutAcc = 0;
     }
     appTs = now;
-    for (const r of batch.results) {
-      appInAcc += Number.isFinite(r?.bytesReq) ? r.bytesReq : 0;
-      appOutAcc += Number.isFinite(r?.bytesResp) ? r.bytesResp : 0;
+    // summed over cells, not requests: the byte totals are already in the
+    // roll-up, and walking every result here would put the per-request pass
+    // this batch shape exists to remove straight back onto the event loop
+    for (const c of batch.cells) {
+      appInAcc += Number.isFinite(c?.bytesReq) ? c.bytesReq : 0;
+      appOutAcc += Number.isFinite(c?.bytesResp) ? c.bytesResp : 0;
     }
   }
 
@@ -369,15 +393,9 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
     },
     sampleNow: tick,
     qualityBetween(from, to) {
-      // Samples describe the interval since the previous read, not one
-      // instant: a sample with intervalStartTs <= from and ts >= to covers
-      // the whole window. Cover the left edge with the newest sample that
-      // starts at/before `from` and the right edge with any sample that
-      // reaches `to`; a not-yet-closed window is reported as unavailable.
-      const tillTo = samples.filter(s => s.intervalStartTs !== undefined && s.ts >= from && s.ts <= to);
-      if (tillTo.length === 0 || tillTo[0]!.intervalStartTs! > from) return "health coverage unavailable";
-      const overlap = tillTo.filter(s => s.intervalStartTs! <= to);
-      if (!overlap.length || overlap[overlap.length - 1]!.ts < to - 1) return "health coverage unavailable";
+      // Samples describe the interval since the previous read, not one instant.
+      const overlap = samples.filter(s => s.intervalStartTs !== undefined && s.ts >= from && s.intervalStartTs <= to);
+      if (!overlap.length || overlap[0]!.intervalStartTs! > from || overlap[overlap.length - 1]!.ts < to - 1) return "health coverage unavailable";
       for (const s of overlap) {
         if (s.cpuCorePct === null || s.cpuCorePct === undefined || s.eventLoopMaxMs == null) return "health unavailable";
         if ((s.cpuThrottledMs ?? 0) > 0) return "local CPU throttling";

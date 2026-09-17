@@ -1,31 +1,35 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type {
+  AggregateBatch,
+  BaselineSample,
   GwConfig,
   GwTargets,
-  IngestBatch,
   LoadProfile,
   LoadShedSample,
   RequestResult,
   RunCounters,
   RunState,
-  RunStatus,
-  ScenarioClass
+  RunStatus
 } from "@apigw/shared";
 import {
   DEFAULT_GW_TARGETS as defaultGwTargets,
   DEFAULT_LOAD_PROFILE as defaultProfile,
   EMPTY_RUN_COUNTERS,
   LIMITS,
+  MEASUREMENT_VERSION,
   isGatewayFault,
   isSuccess,
+  referenceRps,
   sanitizeGwTargets,
   sanitizeLoadProfile
 } from "@apigw/shared";
 import { TokenBucket, peakTargetRps } from "./scheduler.js";
 import {
-  buildSpec, buildBaselineProbe, bigRequestBytes, type ReqSpec, type SpecContext
+  buildSpec, bigRequestBytes, type ReqSpec, type SpecContext
 } from "./scenarios.js";
 import { GoWorkerClient, workerBinaryPath, type GoStatusMsg } from "./goClient.js";
+import { filterHealthyResiduals, stampHealthWindows, windowHealth } from "./health.js";
+import { aggregateBatch } from "../metrics/aggregate.js";
 import { expectedAuthHeader } from "../auth.js";
 import { SERVER_MS_HEADER } from "../petstore/server.js";
 import { probeContext, type ProbeContext } from "./policy.js";
@@ -35,6 +39,19 @@ function parseServerMs(raw: string | null): number | null {
   if (raw === null || raw.trim() === "") return null;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/** How long to wait on a request of this shape. The bulk and slow-upstream
+ *  classes are deliberately slow; a 15s budget would time them out by design. */
+function requestBudgetMs(spec: ReqSpec): number {
+  switch (spec.class) {
+    case "slow-upstream":
+    case "big-response":
+    case "big-request":
+      return 60_000;
+    default:
+      return 15_000;
+  }
 }
 
 /**
@@ -88,15 +105,29 @@ function originOf(url: string): string | null {
 // same sockets to saturate while short-lived ones pile up. On Windows loopback
 // the fallback is the better default. Keep Node's default dispatcher.
 
-/** fewer wakeups, larger but still sub-second bursts (bucket allows 1s) */
-const TICK_MS = 20;
+/**
+ * Scheduler cadence, and with it the depth of the burst the target sees.
+ *
+ * A tick releases the whole interval's worth of requests at one instant, so the
+ * gateway is offered `rps × TICK_MS/1000` arrivals simultaneously and then
+ * nothing until the next tick. At the old 20ms that was 100 at once at 5k rps —
+ * an impulse train, not an arrival process — and the queueing it caused at the
+ * burst front was measured as the gateway's latency. Worse for the overhead Δ:
+ * the reference stream runs at 2% of the load and so never bursts, so the
+ * self-inflicted queueing landed on the gateway arm alone and was reported as
+ * the gateway's cost, growing with the rate.
+ *
+ * 5ms here against 1ms in the Go worker, deliberately. This driver issues every
+ * request on the event loop it is also measuring, so a 1ms interval would be
+ * missed under load — and a missed tick hands its tokens to the next one, which
+ * makes the bursts deeper rather than shallower. The Go worker ticks on its own
+ * goroutine and has no such ceiling. That the two differ is a real fidelity
+ * difference between the backends, and one more reason go is the default.
+ */
+const TICK_MS = 5;
 /** must match FLUSH_MS in metrics/server.ts — the store's ingest-rate
  *  estimate and liveness window are derived from the same cadence */
 const FLUSH_MS = 10_000;
-/** must match intervalMs in metrics/system.ts — health-stamp grouping keys
- *  results by the sampler's own cadence; if they drift, grouping degrades to
- *  finer resolution (correct, just marginally more checks per flush) */
-const HEALTH_SAMPLE_MS = 2_000;
 
 /**
  * Drain the response body chunk-by-chunk, keeping only the total size. Never
@@ -144,12 +175,30 @@ async function readOrDrain(res: Response, wantBody: boolean): Promise<{ bytes: n
   }
 }
 
-/** baselines drift slowly; probing every minute (7 sequential fetches incl. a
- *  streamed 4MB response) lands an event-loop burst exactly once a minute */
-const BASELINE_PROBE_MS = 120_000;
-const BASELINE_SAMPLES_PER_CLASS = 8;
-const BASELINE_PROBE_TIMEOUT_MS = 15_000;
 const MAX_SPOOL = 50_000;
+/**
+ * Reference observations held before a flush.
+ *
+ * Generous next to the rate the stream actually runs at — tens of seconds of
+ * buffer even at its ceiling — so this only fills when ingest is already
+ * wedged, at which point the load's own spool is being shed too. Overflow drops
+ * the oldest and is not counted: unlike a lost request measurement, a thinner
+ * reference arm is not silent, it shows up directly as `directSamples` in the
+ * reported Δ.
+ */
+const MAX_REFERENCE_SPOOL = 5_000;
+/**
+ * Concurrent reference probes. The reference arm must never queue behind
+ * itself: a slow SUT would otherwise accumulate probes whose measured residual
+ * is mostly our own backlog, and that inflated reference would be subtracted
+ * from the gateway arm — flattering the gateway exactly when things are worst.
+ * Hitting this ceiling thins the arm instead, which the Δ reports.
+ *
+ * Sized off the stream's own rate: the declared share needs 200 probes a second
+ * at LIMITS.rps, so the old 64 would have bound on any SUT answering in much
+ * over 300ms and thinned the control arm for a reason unrelated to the SUT.
+ */
+export const MAX_REFERENCE_INFLIGHT = 256;
 /** how long stop() waits for in-flight requests before giving up on them */
 const DRAIN_TIMEOUT_MS = 10_000;
 const DRAIN_POLL_MS = 250;
@@ -163,12 +212,15 @@ const MAX_SHED_BUCKETS = 2_000;
  *  (rate × latency) says that is how much in-flight the target rate needs at
  *  5s mean latency — generous, most targets answer far faster */
 const LATENCY_ALLOWANCE_SEC = 5;
-/** consecutive capped ticks (~10 × 100ms = 1s) before throttling is reported */
-const THROTTLE_TICKS_TO_WARN = 10;
+/** how long the concurrency cap must stay saturated before it is reported —
+ *  a duration, not a tick count, so changing the scheduler cadence does not
+ *  silently change how twitchy the warning is */
+const THROTTLE_WARN_AFTER_MS = 200;
+export const THROTTLE_TICKS_TO_WARN = Math.max(1, Math.round(THROTTLE_WARN_AFTER_MS / TICK_MS));
 /** once throttled, re-warn at most this often */
 const THROTTLE_WARN_MS = 10_000;
 
-export type IngestFn = (batch: IngestBatch) => { ingested: number } | Promise<{ ingested: number }>;
+export type IngestFn = (batch: AggregateBatch) => { ingested: number } | Promise<{ ingested: number }>;
 
 /** Which load-generation backend the driver uses. Default "go" — measured
  *  ~10× cheaper CPU and ~10× tighter event-loop latency than in-process TS
@@ -183,7 +235,8 @@ function readBackend(): LoadgenBackend {
 
 /**
  * In-process load driver. One Driver per app: scheduler, scenario emitters,
- * direct-to-SUT baseline probes (for GW-overhead math), and batched ingest.
+ * the direct-to-SUT reference stream (the control arm of the overhead
+ * measurement), and batched ingest.
  * Backend "go" delegates generation to the Go worker process (goClient.ts);
  * this class stays the control plane: config push, run lifecycle, status,
  * health-stamping of incoming batches, ingest.
@@ -199,7 +252,6 @@ export class Driver {
   private bucket = new TokenBucket();
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private baselineTimer: ReturnType<typeof setInterval> | null = null;
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   /** arm-only deadline for the Go path: tickTimer does not run there, so a one-
    *  shot watchdog is what enforces durationMinutes for Go-driven runs */
@@ -212,6 +264,11 @@ export class Driver {
   private counters: RunCounters = { ...EMPTY_RUN_COUNTERS };
   private ids = new RequestIds();
   private spool: RequestResult[] = [];
+  /** direct-to-SUT reference observations awaiting the next flush */
+  private referenceSpool: BaselineSample[] = [];
+  private referenceTokens = 0;
+  private referenceLastMs: number | null = null;
+  private referenceInFlight = 0;
   /** per-minute scheduler accounting awaiting the next flush */
   private shed = new Map<number, LoadShedSample>();
   /** called when durationMinutes elapses, so the run can be closed out */
@@ -223,7 +280,6 @@ export class Driver {
   private lastThrottleWarnMs = 0;
   private droppedTokens = 0;          // load the cap kept us from issuing, per run
   private errLogBudget = 30; // log first N request errors per run
-  private baselineAt = new Map<ScenarioClass, number>();
   private healthCheck: (from: number, to: number) => string | null = () => "health unavailable";
 
   /** Resolved at construction; tests pin LOADGEN_BACKEND=ts explicitly.
@@ -236,7 +292,6 @@ export class Driver {
 
   setHealthCheck(check: (from: number, to: number) => string | null): void { this.healthCheck = check; }
 
-  private probing = false;   // re-entrancy guard for baseline probes
   private flushing = false;
   private ingestAttempts = 0;
 
@@ -260,19 +315,16 @@ export class Driver {
    *  and was charged to a few thousand requests */
   private authHeader: string | null = null;
 
-  // baseline endpoint: which host to hit directly for class-level baselines.
-  // Doubles as "which origin is us", for forwardBasicAuth: "auto".
+  // Where the SUT answers with no gateway in front of it: the target of the
+  // reference stream. Doubles as "which origin is us", for
+  // forwardBasicAuth: "auto".
   private baselineUrl = "http://127.0.0.1:8080";
-  // per-class baselines from direct calls — used to compute GW overhead per request
-  private baselines = new Map<ScenarioClass, number[]>();
 
   private ingestFn: IngestFn | null = null;
 
-  /** Redirect baseline probing (useful in tests and custom setups). Also
+  /** Redirect the reference stream (useful in tests and custom setups). Also
    *  defines "us" for forwardBasicAuth: "auto", so it must be re-resolved. */
   setBaselineUrl(url: string): void {
-    this.baselines.clear();
-    this.baselineAt.clear();
     this.baselineUrl = url.replace(/\/+$/, "");
     this.refreshUrlPrefixes();
     this.goClient?.configure(this.gw, this.profile, this.baselineUrl);
@@ -295,30 +347,21 @@ export class Driver {
   }
 
   /** Lazily create the Go worker control client and wire its events into the
-   *  plain Driver surface: batches arrive health-stamped (the client applies
-   *  the same 2s-window grouping the ts flush path uses) and land in
-   *  ingestFn; baseline broadcasts feed the same maps probeBaselines fills. */
+   *  plain Driver surface: batches arrive already rolled up by the worker and
+   *  health-qualified by the client (the same window grouping the ts flush path
+   *  uses, over both arms of the overhead comparison), and land in ingestFn. */
   private go(): GoWorkerClient | null {
     if (this.backend !== "go") return null;
     if (workerBinaryPath() === null) {
       // the image bakes the binary but a source checkout may not have it built;
       // auto-fall back so LOADGEN_BACKEND=ts doesn't have to be remembered
-      console.warn("[driver] packages/worker/bin/gwtester-worker is missing — falling back to in-process ts driver (build it under packages/worker to use the default go backend)");
+      console.warn("[driver] packages/go/bin/gwtester-worker is missing — falling back to in-process ts driver (build it under packages/go to use the default go backend)");
       this.backend = "ts";
       return null;
     }
     if (!this.goClient) {
       const client = new GoWorkerClient({
         onStatus: (s) => { this.goLastStatus = s; },
-        onBaseline: (b) => {
-          for (const cls of Object.keys(b.byClass) as ScenarioClass[]) {
-            const samples = b.byClass[cls];
-            if (samples) this.baselines.set(cls, samples.slice());
-          }
-          for (const [cls, at] of Object.entries(b.at)) {
-            this.baselineAt.set(cls as ScenarioClass, at);
-          }
-        },
         onBatch: async (batch) => {
           if (!this.ingestFn) return;
           try { await this.ingestFn(batch); } catch (e) {
@@ -361,86 +404,93 @@ export class Driver {
     return { seedId: this.seedId, createdIds: this.createdIds };
   }
 
+  // stays async although nothing is awaited here any more: every caller awaits
+  // it, and the go path starts a child process whose readiness this will need
+  // to wait on again
   async init(): Promise<void> {
     if (this.go()) {
-      // the flush timer and the baseline probe timer exist only for the ts
-      // backend: the worker streams its own 10s batches and does its own
-      // probing, pushing both as events instead
+      // the flush timer exists only for the ts backend: the worker streams its
+      // own batches — reference observations included — and pushes them as
+      // events instead
       return;
     }
     this.flushTimer = setInterval(() => void this.flush(), FLUSH_MS);
     this.flushTimer.unref?.();
-    this.baselineTimer = setInterval(() => void this.probeBaselines(), BASELINE_PROBE_MS);
-    this.baselineTimer.unref?.();
-    // establish baselines immediately so the first minute of a run reports
-    // real overhead instead of "overhead == latency"
-    await this.probeBaselines();
   }
 
-  /** Hit the SUT directly (no GW) to establish per-class baseline latencies. */
-  private async probeBaselines(): Promise<void> {
-    if (this.probing) return; // a previous probe is still outstanding
-    this.probing = true;
-    try {
-      for (const spec of buildBaselineProbe(this.ctx)) {
-        const lat = await this.timeDirect(spec);
-        if (lat !== null) {
-          let arr = this.baselines.get(spec.class);
-          if (!arr) this.baselines.set(spec.class, (arr = []));
-          arr.push(lat);
-          this.baselineAt.set(spec.class, Date.now());
-          if (arr.length > BASELINE_SAMPLES_PER_CLASS) arr.shift();
-        }
-      }
-    } finally {
-      this.probing = false;
+  /**
+   * Issue this tick's share of the direct-to-SUT reference stream.
+   *
+   * The control arm of the overhead measurement: the same scenario generator,
+   * so the class mix matches the load's by construction, aimed straight at the
+   * SUT. Matching mixes is what makes it legitimate to pool residuals across
+   * classes and still read the difference as the gateway's cost.
+   *
+   * It is paced continuously alongside the load rather than run as a probe
+   * cycle, for three reasons. Its connections stay warm, so it is not measuring
+   * TCP setup the load path has long since amortised. It covers the same
+   * minutes as the traffic it is compared against, so a comparison is never
+   * made across different machine conditions. And it scales with the load, so
+   * it neither perturbs a small run nor runs too thin to support a p99 on a
+   * large one.
+   */
+  private pumpReference(nowMs: number, targetRps: number): void {
+    const rps = referenceRps(targetRps);
+    if (this.referenceLastMs === null) {
+      this.referenceLastMs = nowMs;
+      return;
     }
+    const dtSec = Math.max(0, (nowMs - this.referenceLastMs) / 1000);
+    this.referenceLastMs = nowMs;
+    this.referenceTokens = Math.min(rps, this.referenceTokens + dtSec * rps);
+    const whole = Math.floor(this.referenceTokens);
+    this.referenceTokens -= whole;
+    const due = Math.min(whole, Math.max(0, MAX_REFERENCE_INFLIGHT - this.referenceInFlight));
+    for (let i = 0; i < due; i++) void this.fireReference();
   }
 
-  private async timeDirect(spec: ReqSpec): Promise<number | null> {
-    const url = `${this.baselineUrl}${spec.path}`;
+  /** One reference observation: same request shape as the load, gateway
+   *  bypassed, residual recorded as measured. */
+  private async fireReference(): Promise<void> {
+    if (this.state !== "running") return;
+    const spec = buildSpec(this.profile, this.ctx);
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), BASELINE_PROBE_TIMEOUT_MS);
-    const startedAt = Date.now();
+    const timeout = setTimeout(() => ac.abort(), requestBudgetMs(spec));
+    this.activeRequests.add(ac);
+    this.referenceInFlight++;
+    const started = Date.now();
     const t0 = performance.now();
     try {
       const headers: Record<string, string> = { ...spec.headers };
+      // straight to the SUT, so this rig's own credential is the right one and
+      // the gateway's API key is not
       const auth = expectedAuthHeader();
       if (auth) headers["authorization"] = auth.toString("utf-8");
-      const res = await fetch(url, { method: spec.method, headers, body: spec.body, signal: ac.signal });
-      // headers arrived: transport incl. connect+send+backend is now known
-      const ttfb = performance.now() - t0;
-      await readOrDrain(res, false);
-      // subtract the SUT's own time and batch the remainder (transport + client
-      // stack) across all classes; body transfer after TTFB is excluded so the
-      // baseline matches the run-time overhead, which is also TTFB-based
+      const res = await fetch(`${this.baselineUrl}${spec.path}`, {
+        method: spec.method, headers, body: spec.body, signal: ac.signal
+      });
+      const ttfbMs = performance.now() - t0;
       const serverMs = parseServerMs(res.headers.get(SERVER_MS_HEADER));
-      if (serverMs === null || this.healthCheck(startedAt, Date.now()) !== null) return null;
-      return Math.max(0, ttfb - serverMs);
+      await readOrDrain(res, false);
+      // no backend clock means no residual — the same rule the gateway arm is
+      // held to, so neither side is filtered more leniently than the other
+      if (serverMs === null) return;
+      this.recordReference({ ts: started, class: spec.class, residualMs: ttfbMs - serverMs });
     } catch {
-      return null;
+      // a reference probe that never answered contributes nothing; it is not
+      // an error of the gateway's and must not be reported as one
     } finally {
-      clearTimeout(timer);
+      clearTimeout(timeout);
+      this.activeRequests.delete(ac);
+      this.referenceInFlight--;
     }
   }
 
-  /** What the SUT cannot tell us: direct-path transport for this class. */
-  private baselineFor(cls: ScenarioClass): number {
-    const arr = this.baselines.get(cls) ?? [];
-    if (arr.length === 0) return 0; // until baseline measured, overhead is unknown → 0
-    const sorted = [...arr].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length * 0.5)] ?? sorted[0] ?? 0;
-  }
-
-  /** Added response-header time, requiring a recent healthy direct probe.
-   * Network and scheduling differences remain in this estimate. */
-  private overheadFor(cls: ScenarioClass, ttfbMs: number | null, serverMs: number | null): { baselineMs: number; overheadMs: number | null; overheadReason: string | null } {
-    const baselineMs = (serverMs ?? 0) + this.baselineFor(cls);
-    const reason = ttfbMs === null ? "no response headers"
-      : serverMs === null ? "backend timing unavailable"
-      : Date.now() - (this.baselineAt.get(cls) ?? 0) > 2 * BASELINE_PROBE_MS ? "calibration unavailable or stale"
-      : ttfbMs < baselineMs ? "negative residual: calibration mismatch" : null;
-    return { baselineMs, overheadMs: reason === null ? ttfbMs! - baselineMs : null, overheadReason: reason };
+  private recordReference(s: BaselineSample): void {
+    if (this.referenceSpool.length >= MAX_REFERENCE_SPOOL) {
+      this.referenceSpool.splice(0, Math.ceil(MAX_REFERENCE_SPOOL / 10));
+    }
+    this.referenceSpool.push(s);
   }
 
   start(runId: string): { ok: true; runId: string } {
@@ -492,6 +542,9 @@ export class Driver {
     this.lastThrottleWarnMs = 0;
     this.droppedTokens = 0;
     this.shed.clear();
+    this.referenceSpool.length = 0;
+    this.referenceTokens = 0;
+    this.referenceLastMs = null;
     this.refreshUrlPrefixes();
     // the creds are constant for the run; refresh them here instead of per request
     this.authHeader = expectedAuthHeader()?.toString("utf-8") ?? null;
@@ -588,6 +641,9 @@ export class Driver {
     const { due, targetRps, missed } = this.bucket.tick(now, this.profile, this.startedAt);
     this.targetRps = targetRps;
     this.noteSchedulerTick(now, targetRps);
+    // the reference arm is paced off the same tick as the load, so the two
+    // distributions always cover the same moments
+    this.pumpReference(now, targetRps);
     const headroom = Math.max(0, this.effectiveMaxConcurrency - this.inFlight);
     const cap = Math.min(due, headroom);
     const dropped = due - cap + (missed ?? 0);
@@ -633,6 +689,15 @@ export class Driver {
     this.shedBucket(nowMs).dropped += dropped;
   }
 
+  /** Measurements thrown away for requests the gateway really served. Counted
+   *  into the minute they were lost in, so the window carrying the surviving
+   *  requests is judged on how much of the sample went missing. */
+  private noteResultsLost(lost: number): void {
+    this.counters.resultsLost += lost;
+    const b = this.shedBucket(Date.now());
+    b.resultsLost = (b.resultsLost ?? 0) + lost;
+  }
+
   private shedBucket(nowMs: number): LoadShedSample {
     const bucketTs = Math.floor(nowMs / 60_000) * 60_000;
     let b = this.shed.get(bucketTs);
@@ -643,7 +708,7 @@ export class Driver {
         const oldest = this.shed.keys().next();
         if (!oldest.done) this.shed.delete(oldest.value);
       }
-      this.shed.set(bucketTs, (b = { bucketTs, dropped: 0, targetSum: 0, ticks: 0 }));
+      this.shed.set(bucketTs, (b = { bucketTs, dropped: 0, resultsLost: 0, targetSum: 0, ticks: 0 }));
     }
     return b;
   }
@@ -672,10 +737,8 @@ export class Driver {
     const started = Date.now();
     const timerStarted = performance.now();
     const ac = new AbortController();
-    const budgetMs =
-      spec.class === "slow-upstream" || spec.class === "big-response" || spec.class === "big-request" ? 60_000 : 15_000;
     this.activeRequests.add(ac);
-    const timeout = setTimeout(() => ac.abort(), budgetMs);
+    const timeout = setTimeout(() => ac.abort(), requestBudgetMs(spec));
     let status = 0;
     let bytesResp = 0;
     let ttfbMs: number | null = null;
@@ -756,12 +819,14 @@ export class Driver {
     }
 
     const latencyMs = performance.now() - timerStarted;
-    // Overhead uses TTFB, not end-of-body: what the gateway adds to finding
-    // and proxying the request. Body transfer time after headers (which for a
-    // multi-MB response dwarfs everything else and mostly charges link speed
-    // to the gateway) stays in total latency, not in "GW overhead".
-    const { baselineMs, overheadMs, overheadReason } = this.overheadFor(spec.class, ttfbMs, serverMs);
 
+    // TTFB and the SUT's own time are both recorded raw. The residual between
+    // them — everything that was not the backend — is what the store compares
+    // against the reference stream. Deliberately not reduced to a single
+    // "overhead" number here: a per-request overhead would need a direct call
+    // this request never made, and inventing one from a running median is what
+    // the previous measurement did. Body transfer after headers stays out of
+    // it, and in total latency, where it belongs.
     this.record({
       runId,
       requestId,
@@ -773,10 +838,16 @@ export class Driver {
       status,
       latencyMs,
       ttfbMs,
-      baselineMs,
-      overheadMs,
-      overheadReason: error === null ? overheadReason : "request failed",
-      measurementVersion: 2,
+      serverMs,
+      // Null, not 0: `fetch` exposes no connection-level hook, so this driver
+      // genuinely cannot tell a pool hit from a fresh TLS handshake. Claiming
+      // zero would let the residual subtract a setup cost it never measured.
+      // Both arms are equally blind here, so the Δ stays internally consistent
+      // — it just carries setup on both sides. The Go worker uses httptrace and
+      // does separate them, which is one more reason it is the default.
+      connectMs: null,
+      timingReason: null,
+      measurementVersion: MEASUREMENT_VERSION,
       bytesReq: spec.class === "big-request" ? bigRequestBytes(spec.body) : Buffer.byteLength(spec.body ?? ""),
       bytesResp,
       reachedBackend: serverMs !== null,
@@ -818,8 +889,13 @@ export class Driver {
 
   private record(r: RequestResult): void {
     if (this.spool.length >= MAX_SPOOL) {
-      // drop the oldest decile in one splice rather than shifting per insert
-      this.spool.splice(0, Math.ceil(MAX_SPOOL / 10));
+      // drop the oldest decile in one splice rather than shifting per insert.
+      // These are measurements of requests the gateway really served, so the
+      // loss is counted: silently thinning the spool understates the tail
+      // exactly when the rig is busiest.
+      const lost = Math.ceil(MAX_SPOOL / 10);
+      this.spool.splice(0, lost);
+      this.noteResultsLost(lost);
     }
     this.spool.push(r);
   }
@@ -831,35 +907,27 @@ export class Driver {
     // scheduler accounting must flush even with no results: a fully throttled
     // tick issues nothing, and that is precisely the case worth recording
     const shed = this.takeShed(final);
-    if (this.spool.length === 0 && shed.length === 0) return;
+    if (this.spool.length === 0 && shed.length === 0 && this.referenceSpool.length === 0) return;
     if (!this.ingestFn) {
       this.restoreShed(shed); // metrics module not wired yet
       return;
     }
     this.flushing = true;
     const chunk = this.spool.splice(0, this.spool.length);
-    // Health is sampled every ~2s, so the old per-request qualityBetween() here
-    // was an O(batch × history) scan on the event loop (50k × 600 samples) —
-    // a stall inflating the very latencies being stamped. The flip side is
-    // that the sampler's granularity makes per-request windows meaningless:
-    // two requests 100ms apart share the same 2s health sample. Group by
-    // sample window instead — one check per distinct window in the batch —
-    // which keeps healthy neighbors of a stall valid while staying O(batch)
-    // with no per-result array scan.
-    if (chunk.length > 0) {
-      const byWindow = new Map<number, string | null>();
-      for (const r of chunk) {
-        if (r.overheadReason !== null) continue;
-        const w = Math.floor(r.ts / HEALTH_SAMPLE_MS);
-        let reason = byWindow.get(w);
-        if (reason === undefined) {
-          reason = this.healthCheck(w * HEALTH_SAMPLE_MS, (w + 1) * HEALTH_SAMPLE_MS);
-          byWindow.set(w, reason);
-        }
-        if (reason !== null) r.overheadReason = reason;
-      }
-    }
-    const batch: IngestBatch = { batchId: randomUUID(), results: chunk, shed };
+    const baseline = this.referenceSpool.splice(0, this.referenceSpool.length);
+    // One verdict source for the whole flush, so a row and its own residual can
+    // never be judged differently at the window boundary.
+    const health = windowHealth(this.healthCheck);
+    if (chunk.length > 0) stampHealthWindows(chunk, health);
+    // Roll up here rather than shipping every result: what crosses into the
+    // store is then a few dozen cells plus a capped tail regardless of the rate,
+    // instead of one object per request on the event loop whose stalls are the
+    // very thing this rig withholds measurements over.
+    const batch = aggregateBatch({ batchId: randomUUID(), results: chunk, shed, baseline });
+    // both arms are filtered by the same health rule: keeping contaminated
+    // reference samples while withholding contaminated gateway ones would
+    // shift the reference up and understate the gateway by our own stalls
+    batch.residuals = filterHealthyResiduals(batch.residuals, health);
     try {
       await this.ingestFn(batch);
       this.ingestAttempts = 0;
@@ -868,6 +936,7 @@ export class Driver {
       if (this.ingestAttempts >= MAX_INGEST_ATTEMPTS) {
         // never let one poison batch wedge the pipeline forever; the shed rows
         // go with it rather than being replayed against a store that refuses them
+        this.noteResultsLost(chunk.length);
         console.error(
           `[driver] dropping ${chunk.length} results after ${this.ingestAttempts} failed ingest attempts:`,
           (e as Error).message
@@ -876,7 +945,14 @@ export class Driver {
       } else {
         // put them back at the front, newest data still wins if we overflow
         this.spool = chunk.concat(this.spool);
-        if (this.spool.length > MAX_SPOOL) this.spool = this.spool.slice(this.spool.length - MAX_SPOOL);
+        if (this.spool.length > MAX_SPOOL) {
+          const lost = this.spool.length - MAX_SPOOL;
+          this.spool = this.spool.slice(lost);
+          this.noteResultsLost(lost);
+        }
+        // the reference arm goes back too: retrying the gateway arm without it
+        // would leave that minute's Δ comparing full traffic against a gap
+        this.referenceSpool = baseline.concat(this.referenceSpool).slice(-MAX_REFERENCE_SPOOL);
         this.restoreShed(shed);
       }
     } finally {
@@ -902,13 +978,19 @@ export class Driver {
     for (const s of samples) {
       const b = this.shedBucket(s.bucketTs);
       b.dropped += s.dropped;
+      b.resultsLost = (b.resultsLost ?? 0) + (s.resultsLost ?? 0);
       b.targetSum += s.targetSum;
       b.ticks += s.ticks;
     }
   }
 
   status(): RunStatus {
-    if (this.goClient && this.state !== "idle") {
+    // The Go worker owns the counters for its own runs, so they are read from
+    // its last status message even once the run is idle: the worker emits a
+    // final tally after draining, and falling back to this process's (empty)
+    // counters the moment a run ended reported every finished Go run as zero
+    // traffic.
+    if (this.goClient && this.goLastStatus !== null) {
       const s = this.goLastStatus;
       return {
         state: this.state,
@@ -916,7 +998,7 @@ export class Driver {
         startedAt: this.startedAt,
         uptimeSec: this.startedAt ? Math.floor((Date.now() - this.startedAt) / 1000) : null,
         profile: { ...this.profile },
-        targetRps: s?.targetRps ?? 0,
+        targetRps: this.state === "running" ? s?.targetRps ?? 0 : 0,
         effectiveMaxConcurrency: this.effectiveMaxConcurrency,
         throttledSinceMs: null,
         counters: {
@@ -929,6 +1011,7 @@ export class Driver {
           unauthorized: s?.unauthorized ?? 0,
           timeouts: 0,
           droppedRequests: s?.dropped ?? 0,
+          resultsLost: s?.resultsLost ?? 0,
           invalidSent: s?.invalidSent ?? 0,
           invalidRejectedByGateway: s?.invalidRejectedByGateway ?? 0,
           invalidLeaked: s?.invalidLeaked ?? 0
@@ -979,8 +1062,7 @@ export class Driver {
       // stop the timers the ts path may have armed before the client came up
       if (this.tickTimer) clearInterval(this.tickTimer);
       if (this.flushTimer) clearInterval(this.flushTimer);
-      if (this.baselineTimer) clearInterval(this.baselineTimer);
-      this.tickTimer = this.flushTimer = this.baselineTimer = null;
+      this.tickTimer = this.flushTimer = null;
       const client = this.goClient;
       this.goClient = null;
       this.state = "idle";
@@ -990,9 +1072,8 @@ export class Driver {
     }
     if (this.tickTimer) clearInterval(this.tickTimer);
     if (this.flushTimer) clearInterval(this.flushTimer);
-    if (this.baselineTimer) clearInterval(this.baselineTimer);
     if (this.drainTimer) clearTimeout(this.drainTimer);
-    this.tickTimer = this.flushTimer = this.baselineTimer = null;
+    this.tickTimer = this.flushTimer = null;
     this.drainTimer = null;
     this.state = "idle";
     const deadline = performance.now() + 5000;

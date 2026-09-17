@@ -28,7 +28,11 @@ async function fire(spec: ReqSpec): Promise<{ status: number; body: string }> {
 }
 
 beforeAll(async () => {
-  built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
+  // This suite is the in-process petstore's specification, so it pins that
+  // backend rather than inheriting the deployed default. goSut.contract.test.ts
+  // runs the same generated traffic against the Go build over HTTP, which is
+  // what makes the two interchangeable rather than merely both present.
+  built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
   server = built.listen(0);
   base = `http://127.0.0.1:${server.port}`;
 });

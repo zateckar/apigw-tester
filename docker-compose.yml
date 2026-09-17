@@ -8,12 +8,19 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${PORT:-8080}:8080"
+      # the backend under test, in its own process. Published because the
+      # gateway being measured proxies to it.
+      - "${SUT_PORT:-8081}:8081"
     environment:
       # Mandatory. The container refuses to start if APP_BASIC_AUTH is missing.
       APP_BASIC_AUTH: ${APP_BASIC_AUTH:?set APP_BASIC_AUTH=name:password before running}
       NODE_ENV: production
       DB_PATH: /app/data/metrics.db
-      PETSTORE_SELF_URL: http://127.0.0.1:8080
+      # The bundled petstore runs as its own process on 8081. This must follow
+      # it: it is where the reference arm of the overhead comparison is sent,
+      # and pointing it at the control plane — which no longer serves petstore
+      # routes — would leave every run with a Δ of null.
+      PETSTORE_SELF_URL: http://127.0.0.1:8081
       # Point the driver at a real gateway without editing any config.
       # Empty means "target my own built-in petstore". REST and SOAP have their
       # own targets; the legacy GW_* values apply to both when the specific

@@ -13,4 +13,4 @@ coverage/
 .kilo/*
 
 # Go loadgen worker — built locally or in CI, never committed
-packages/worker/bin/
+packages/go/bin/

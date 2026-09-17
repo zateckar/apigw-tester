@@ -27,6 +27,10 @@ export function openDb(path: string): DbHandle {
       latency_ms REAL NOT NULL,
       baseline_ms REAL NOT NULL DEFAULT 0,
       overhead_ms REAL NOT NULL DEFAULT 0,
+      server_ms REAL,
+      timing_reason TEXT,
+      connect_ms REAL,
+      conn_reused INTEGER,
       bytes_req INTEGER NOT NULL,
       bytes_resp INTEGER NOT NULL,
       reached_backend INTEGER NOT NULL DEFAULT 0,
@@ -51,6 +55,9 @@ export function openDb(path: string): DbHandle {
       bytes_resp INTEGER NOT NULL,
       reached_backend INTEGER NOT NULL DEFAULT 0,
       rejected4xx_gw INTEGER NOT NULL DEFAULT 0,
+      conn_setups INTEGER NOT NULL DEFAULT 0,
+      conn_setup_sum_ms REAL NOT NULL DEFAULT 0,
+      conn_measured INTEGER NOT NULL DEFAULT 0,
       hist TEXT NOT NULL,
       overhead_hist TEXT NOT NULL DEFAULT '[]',
       status_hist TEXT NOT NULL DEFAULT '[]',
@@ -74,6 +81,9 @@ export function openDb(path: string): DbHandle {
       bytes_resp INTEGER NOT NULL,
       reached_backend INTEGER NOT NULL DEFAULT 0,
       rejected4xx_gw INTEGER NOT NULL DEFAULT 0,
+      conn_setups INTEGER NOT NULL DEFAULT 0,
+      conn_setup_sum_ms REAL NOT NULL DEFAULT 0,
+      conn_measured INTEGER NOT NULL DEFAULT 0,
       hist TEXT NOT NULL,
       overhead_hist TEXT NOT NULL DEFAULT '[]',
       status_hist TEXT NOT NULL DEFAULT '[]',
@@ -86,8 +96,57 @@ export function openDb(path: string): DbHandle {
     CREATE TABLE IF NOT EXISTS load_shed (
       bucket_ts INTEGER PRIMARY KEY,
       dropped INTEGER NOT NULL DEFAULT 0,
+      -- measurements lost for requests that WERE served: the opposite
+      -- diagnosis to dropped, and just as invalidating
+      results_lost INTEGER NOT NULL DEFAULT 0,
       target_sum REAL NOT NULL DEFAULT 0,
       ticks INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Residual (ttfb - serverMs) distributions, one row per bucket per class
+    -- per path. 'gw' is the load, through the gateway; 'direct' is the
+    -- concurrent reference stream straight to the SUT. The gateway's cost is
+    -- the difference between the two at matched percentiles, which is only
+    -- sound if both arms cover the same minutes and the same class mix —
+    -- hence the shared key rather than a single table of signed overheads.
+    --
+    -- Its own table, not more columns on rollup_*: the residual histogram has a
+    -- different (signed, sub-millisecond) edge layout, and endpoint granularity
+    -- would multiply these rows for no gain, since the residual tracks payload
+    -- shape — which is what class already names.
+    CREATE TABLE IF NOT EXISTS residual_minute (
+      bucket_ts INTEGER NOT NULL,
+      cls TEXT NOT NULL,
+      path TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      sum_ms REAL NOT NULL DEFAULT 0,
+      hist TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY (bucket_ts, cls, path)
+    );
+
+    CREATE TABLE IF NOT EXISTS residual_hour (
+      bucket_ts INTEGER NOT NULL,
+      cls TEXT NOT NULL,
+      path TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      sum_ms REAL NOT NULL DEFAULT 0,
+      hist TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY (bucket_ts, cls, path)
+    );
+
+    -- Requests each run contributed to each minute.
+    --
+    -- The roll-ups deliberately carry no run id — endpoint × class × minute is
+    -- already the granularity that makes them cheap — so a per-run report is
+    -- "everything in the minutes this run touched" and needs a way to say how
+    -- much of that was someone else's. requests_raw used to answer it, back
+    -- when it held every request; it now holds a bounded tail, and a count off
+    -- a sample is not a count. Two integers and a string per (minute, run).
+    CREATE TABLE IF NOT EXISTS run_minute (
+      bucket_ts INTEGER NOT NULL,
+      run_id TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bucket_ts, run_id)
     );
 
     -- Host health per minute, so a window older than the sampler's in-memory

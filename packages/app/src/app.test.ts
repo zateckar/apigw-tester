@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { buildApp } from "./app.js";
 import { readConfig } from "./config.js";
-import { POLICY_LIMITS, type RequestResult, type SystemMetrics } from "@apigw/shared";
+import { MEASUREMENT_VERSION, POLICY_LIMITS, type RequestResult, type SystemMetrics } from "@apigw/shared";
 
 // Auth: tests run with a fixed known credential
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
@@ -27,7 +27,8 @@ async function authed(path: string, init?: RequestInit): Promise<Omit<Response, 
 function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", cls = "small-rest"): RequestResult {
   const latencyMs = 50 + (i % 100);
   return {
-    runId: "test-run", requestId: `r-${i}`, ttfbMs: latencyMs, reachedBackend: true, measurementVersion: 2, overheadReason: null,
+    runId: "test-run", requestId: `r-${i}`, ttfbMs: latencyMs, serverMs: 40,
+    reachedBackend: true, measurementVersion: MEASUREMENT_VERSION, timingReason: null,
     ts,
     protocol,
     endpoint: protocol === "soap" ? "SOAP getPetById" : "GET /api/pets",
@@ -35,8 +36,6 @@ function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", c
     method: "GET",
     status: i % 10 === 9 ? 500 : 200,
     latencyMs,
-    baselineMs: 40,
-    overheadMs: Math.max(0, latencyMs - 40),
     bytesReq: 100,
     bytesResp: 500 + i,
     error: i % 10 === 9 ? "chaos" : null
@@ -44,7 +43,9 @@ function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", c
 }
 
 beforeAll(async () => {
-  built = buildApp({ ...readConfig(), dbPath: ":memory:", publicDir: "nope" });
+  // in-process petstore: this suite asserts on the control plane's own routing
+  // and on petstore paths answering from the same port
+  built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
   server = built.listen(0);
   base = `http://127.0.0.1:${server.port}`;
 });
@@ -146,7 +147,12 @@ describe("apigw-tester app (auth protected)", () => {
     const results = Array.from({ length: 40 }, (_, i) =>
       makeResult(i, now - i * 100, i % 4 === 0 ? "soap" : "rest", i % 4 === 0 ? "soap" : "small-rest")
     );
-    const batch = { batchId: "batch-1", results };
+    // reference observations ride the same batch; without a direct arm the
+    // summary has nothing to difference the gateway residuals against
+    const baseline = Array.from({ length: 40 }, (_, i) => ({
+      ts: now - i * 100, class: i % 4 === 0 ? "soap" as const : "small-rest" as const, residualMs: 5
+    }));
+    const batch = { batchId: "batch-1", results, baseline };
     const r = await authed("/api/ingest", {
       method: "POST",
       body: JSON.stringify(batch)

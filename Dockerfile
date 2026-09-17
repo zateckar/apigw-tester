@@ -11,18 +11,25 @@ COPY packages/shared packages/shared
 COPY packages/ui packages/ui
 RUN bun run --cwd packages/ui build
 
-# Go loadgen worker — stdlib only, no CGO, static binary. A BUILDPLATFORM-
-# pinned native stage so cross-builds (`--platform=linux/arm64`) stay cheap:
-# TARGETOS/TARGETARCH fan out to the running platform's toolchain output.
-FROM golang:1.24-alpine AS worker
-WORKDIR /src/packages/worker
-COPY packages/worker/go.mod ./
-COPY packages/worker/internal ./internal
-COPY packages/worker/cmd ./cmd
+# Go binaries — stdlib only, no CGO, static. A BUILDPLATFORM-pinned native
+# stage so cross-builds (`--platform=linux/arm64`) stay cheap: TARGETOS/
+# TARGETARCH fan out to the running platform's toolchain output.
+#
+# Two of them: the load generator, and the petstore that the load terminates at.
+# The petstore is a separate process so that the control plane's event loop is
+# not a term in the measurements the control plane records — see
+# packages/go/internal/sut.
+FROM golang:1.24-alpine AS gobuild
+WORKDIR /src/packages/go
+COPY packages/go/go.mod ./
+COPY packages/go/internal ./internal
+COPY packages/go/cmd ./cmd
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
-      -o /out/gwtester-worker ./cmd/gwtester-worker
+      -o /out/gwtester-worker ./cmd/gwtester-worker \
+ && GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+      -o /out/gwtester-sut ./cmd/gwtester-sut
 
 # App stage: no emit step — the app is TypeScript run directly by Bun at
 # runtime. Only the workspace manifests + source need to ship.
@@ -45,16 +52,24 @@ COPY --from=server /repo/packages ./packages
 COPY package.json ./
 # UI bundle baked in, served from the same process
 COPY --from=ui /repo/packages/ui/dist ./packages/app/public
-# Go loadgen worker — the spawn path looks for packages/worker/bin/gwtester-worker
+# Go load generator — the spawn path looks for packages/go/bin/gwtester-worker
 # (no .exe suffix on linux). Default LOADGEN_BACKEND is "go"; the image ships the
-# binary so that default is safisfied — set LOADGEN_BACKEND=ts to opt out.
-COPY --from=worker /out/gwtester-worker ./packages/worker/bin/gwtester-worker
+# binary so that default is satisfied — set LOADGEN_BACKEND=ts to opt out.
+COPY --from=gobuild /out/gwtester-worker ./packages/go/bin/gwtester-worker
+# Go petstore — spawned by the app on SUT_PORT. Default SUT_BACKEND is "go"; the
+# image ships the binary so that default is satisfied — set SUT_BACKEND=ts to
+# put the petstore back inside the Bun process.
+COPY --from=gobuild /out/gwtester-sut ./packages/go/bin/gwtester-sut
 # chown before VOLUME so a fresh named volume inherits bun-owned /app/data.
 # A volume that already has content is mounted verbatim and never re-seeded —
 # docker-entrypoint.sh is what covers that case.
 RUN mkdir -p /app/data && chown -R bun:bun /app
 ENV PORT=8080
-EXPOSE 8080
+ENV SUT_PORT=8081
+# 8080 is the dashboard and control API; 8081 is the backend under test. The
+# gateway being measured is pointed at 8081, so it has to be reachable from
+# wherever that gateway runs — it carries the same Basic-auth gate as 8080.
+EXPOSE 8080 8081
 VOLUME ["/app/data"]
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh

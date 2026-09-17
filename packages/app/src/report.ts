@@ -1,4 +1,5 @@
 import type {
+  ConnSetupStats,
   GwTargets,
   MetricSummary,
   PolicyConfig,
@@ -78,7 +79,7 @@ export function buildRunReport(input: BuildReportInput): RunReport {
     summary.total === 0 ? null : (100 * summary.status.gatewayErrors) / summary.total,
     slo.maxGatewayErrorPct, atMost
   ));
-  push(check("overhead-p95", "Qualified added TTFB p95 (ms)", summary.overheadMs.p95, slo.maxOverheadP95Ms, atMost));
+  push(check("overhead-p95", "Added TTFB at p95 vs direct (ms)", summary.overheadMs.p95, slo.maxOverheadP95Ms, atMost));
   // only assert contract leakage when invalid traffic was actually generated —
   // a run with invalidRatioPct = 0 has nothing to say about it either way
   push(check(
@@ -117,9 +118,15 @@ export function buildRunReport(input: BuildReportInput): RunReport {
     // the measurement itself is suspect, so neither pass nor fail is honest
     state = "inconclusive";
     reasons.unshift(...summary.validity.reasons);
-  } else if (slo.maxOverheadP95Ms != null && (summary.overheadMs.p95 === null || (summary.overheadMs.excluded ?? 0) > 0)) {
+  } else if (slo.maxOverheadP95Ms != null && summary.overheadMs.p95 === null) {
+    // a Δ that could not be computed is not a pass. Unlike the old censored
+    // estimate, this one says exactly what was missing, so the reason is worth
+    // quoting verbatim rather than paraphrasing as "incomplete coverage".
     state = "inconclusive";
-    reasons.unshift("overhead acceptance requires complete qualified measurement coverage; excluded or legacy samples cannot establish a pass");
+    reasons.unshift(
+      `added-TTFB acceptance needs a p95 difference against the direct reference stream, and none was available: ` +
+      `${summary.overheadMs.unavailable ?? "reason unrecorded"}`
+    );
   } else if (scope.foreignPct > VALIDITY_LIMITS.foreignPct) {
     // the window is mostly somebody else's traffic: judging this run on it
     // would be judging the wrong run
@@ -180,6 +187,17 @@ export function renderRunReportMarkdown(r: RunReport): string {
   const iso = (ms: number | null): string => (ms === null ? "—" : new Date(ms).toISOString());
   const ms = (n: number | null): string => n === null ? "unavailable" : `${n.toFixed(1)} ms`;
   const pct = (n: number): string => `${n.toFixed(2)} %`;
+  /** Reuse reads better than churn, but the count is what is auditable.
+   *  Tolerates the field being absent: a summary rendered from a build that
+   *  predates connection tagging should read as "unmeasured", not throw and
+   *  cost the whole report. */
+  const connSetupLine = (c: ConnSetupStats | undefined): string => {
+    if (!c || c.measured === 0) return "not measured by this generator";
+    const reusePct = 100 - (c.pct ?? 0);
+    return `${reusePct.toFixed(1)} % reused — ${c.setups.toLocaleString()} of ` +
+      `${c.measured.toLocaleString()} requests opened a connection` +
+      (c.avgMs === null ? "" : `, averaging ${c.avgMs.toFixed(1)} ms to acquire`);
+  };
   const L: string[] = [];
 
   L.push(`# Gateway test report — ${r.runId}`);
@@ -227,9 +245,26 @@ export function renderRunReportMarkdown(r: RunReport): string {
   L.push(`| Rate limited | ${s.status.rateLimited.toLocaleString()} |`);
   L.push(`| Unauthorized | ${s.status.unauthorized.toLocaleString()} |`);
   L.push(`| Latency p50 / p95 / p99 | ${ms(s.latencyMs.p50)} / ${ms(s.latencyMs.p95)} / ${ms(s.latencyMs.p99)} |`);
-  L.push(`| Overhead exclusions | ${Object.entries(s.overheadMs.exclusionReasons ?? {}).map(([reason, count]) => `${reason}: ${count}`).join("; ") || "none"} |`);
-  L.push(`| Overhead coverage | ${s.overheadMs.eligible ?? "unknown"} eligible / ${s.overheadMs.excluded ?? "unknown"} excluded |`);
-  L.push(`| **Qualified added TTFB p50 / p95 / p99** | **${ms(s.overheadMs.p50)} / ${ms(s.overheadMs.p95)} / ${ms(s.overheadMs.p99)}** |`);
+  L.push(`| Residuals compared | ${s.overheadMs.gwSamples.toLocaleString()} through the gateway vs ${s.overheadMs.directSamples.toLocaleString()} direct |`);
+  if (s.overheadMs.unavailable !== null) L.push(`| Comparison gaps | ${s.overheadMs.unavailable} |`);
+  L.push(`| Connection reuse | ${connSetupLine(s.connSetup)} |`);
+  L.push(`| **Added TTFB vs direct, p50 / p95 / p99** | **${ms(s.overheadMs.p50)} / ${ms(s.overheadMs.p95)} / ${ms(s.overheadMs.p99)}** |`);
+  L.push("");
+  L.push(
+    "Added TTFB is the difference between two distributions measured over the same minutes: the residual " +
+    "(`ttfb − serverMs − connect`) of traffic through the gateway, and the residual of a concurrent reference " +
+    "stream sent straight to the backend in the same scenario mix. A value at p95 says how much worse the 95th " +
+    "percentile of the gateway path is — not how much the gateway added to any one request, which is not " +
+    "measurable without a direct call that request never made. A negative value means the two distributions " +
+    "differ by less than this rig can resolve."
+  );
+  L.push("");
+  L.push(
+    "Connection acquisition is measured per request and subtracted from both sides, so a gateway is not " +
+    "charged for handshakes. That makes the reuse rate above a finding in its own right rather than a " +
+    "footnote: a gateway that refuses keep-alive makes every caller pay a handshake this number will show " +
+    "and the added-TTFB figure deliberately will not."
+  );
   L.push("");
 
   L.push("### Status distribution");
