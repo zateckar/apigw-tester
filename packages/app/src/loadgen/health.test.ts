@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { HEALTH_WINDOW_MS, VALIDITY_LIMITS, type ResidualCell, type WorkerHealthCell } from "@apigw/shared";
-import { filterHealthyResiduals, stampHealthWindows, windowHealth, workerWindowHealth } from "./health.js";
+import { HEALTH_PENDING, filterHealthyResiduals, stampHealthWindows, windowHealth, workerWindowHealth } from "./health.js";
 
 const W = HEALTH_WINDOW_MS;
 const t0 = Math.floor(Date.now() / W) * W;
@@ -30,11 +30,35 @@ describe("workerWindowHealth", () => {
     expect(health(t0 + W - 1)).toBeNull();
   });
 
-  test("a window nobody reported on is not assumed healthy", () => {
+  test("a gap between reported windows is not assumed healthy", () => {
     // silence and health are different things: a residual with no evidence
     // behind it must be withheld, not waved through
-    const health = workerWindowHealth([cell()]);
+    const health = workerWindowHealth([cell(), cell({ windowTs: t0 + 2 * W })]);
     expect(health(t0 + W)).toBe("generator health unavailable");
+  });
+
+  test("a window past the newest report is pending, not unavailable", () => {
+    // The worker releases a cell only once the window closes, so the newest
+    // rows in every batch belong to a window no cell can exist for yet.
+    // Calling that a generator fault marked most of the visible request rows
+    // with one, which is how a working run came to look unwell.
+    const health = workerWindowHealth([cell()]);
+    expect(health(t0 + W)).toBe(HEALTH_PENDING);
+    expect(health(t0 + 5 * W)).toBe(HEALTH_PENDING);
+  });
+
+  test("a pending window still withholds its residuals", () => {
+    // unmarked is not the same as usable: a residual nothing has qualified
+    // cannot be rescued by a later batch, so it is dropped exactly as before
+    const health = workerWindowHealth([cell()]);
+    expect(filterHealthyResiduals([residual(t0 + W)], health)).toEqual([]);
+  });
+
+  test("a pending window leaves the row unmarked", () => {
+    const health = workerWindowHealth([cell()]);
+    const rows = [{ ts: t0 + W, timingReason: null }] as Parameters<typeof stampHealthWindows>[0];
+    stampHealthWindows(rows, health);
+    expect(rows[0]!.timingReason).toBeNull();
   });
 
   test("a window reported with no samples is not assumed healthy either", () => {
@@ -72,8 +96,13 @@ describe("workerWindowHealth", () => {
   });
 
   test("malformed cells are ignored rather than trusted", () => {
+    // nothing valid to read means no verdict can be drawn, and a residual with
+    // no verdict behind it is withheld — which is the property that matters,
+    // whatever the reason string says
     const junk = [{ samples: 8 } as WorkerHealthCell, null as unknown as WorkerHealthCell];
-    expect(workerWindowHealth(junk)(t0)).toBe("generator health unavailable");
+    const health = workerWindowHealth(junk);
+    expect(health(t0)).not.toBeNull();
+    expect(filterHealthyResiduals([residual(t0)], health)).toEqual([]);
   });
 
   test("both residual arms go through the one verdict", () => {

@@ -61,18 +61,44 @@ export function windowHealth(healthCheck: (from: number, to: number) => string |
  * Windows are released by the worker only once closed, so a cell that arrives
  * at all describes a complete window.
  */
+/**
+ * Verdict for a window whose evidence has not arrived *yet*, as opposed to one
+ * whose evidence is missing.
+ *
+ * The worker releases a window's health cell only once the window has closed,
+ * but the raw tail ships on the next flush regardless — so the newest rows in
+ * every batch belong to a window no cell can exist for yet. Treating that as
+ * "unavailable" stamped roughly 60% of the visible request rows with a
+ * generator fault that had not happened: on a batch flushed before any window
+ * closed, 190 of 200 rows.
+ *
+ * Callers must decide what pending means for them. A residual is withheld —
+ * an unqualified measurement is not usable and a later batch cannot rescue it.
+ * A tail row is left unmarked, because "we have not heard yet" is not a defect
+ * to report against a request the gateway really served.
+ */
+export const HEALTH_PENDING = "generator health pending";
+
 export function workerWindowHealth(cells: Iterable<WorkerHealthCell>): WindowVerdict {
   const byWindow = new Map<number, WorkerHealthCell>();
+  let newest = -Infinity;
   for (const c of cells) {
     if (typeof c?.windowTs !== "number") continue;
     const w = Math.floor(c.windowTs / HEALTH_WINDOW_MS);
+    if (w > newest) newest = w;
     const prev = byWindow.get(w);
     // a window can be reported once; if it ever is not, keep the worse report
     if (prev === undefined || c.schedP99Ms > prev.schedP99Ms) byWindow.set(w, c);
   }
   return (ts: number): string | null => {
-    const cell = byWindow.get(Math.floor(ts / HEALTH_WINDOW_MS));
-    if (cell === undefined || cell.samples <= 0) return "generator health unavailable";
+    const w = Math.floor(ts / HEALTH_WINDOW_MS);
+    const cell = byWindow.get(w);
+    // Past the newest window anyone has reported on, silence is the protocol
+    // working: that window has not closed. Before it, silence means the
+    // evidence is genuinely missing and whatever it would have qualified
+    // cannot be trusted.
+    if (cell === undefined) return w > newest ? HEALTH_PENDING : "generator health unavailable";
+    if (cell.samples <= 0) return "generator health unavailable";
     if (cell.schedP99Ms > VALIDITY_LIMITS.workerSchedP99Ms) return "generator scheduling delay";
     if (cell.cpuPct > VALIDITY_LIMITS.workerCpuPct) return "generator CPU saturation";
     return null;
@@ -88,12 +114,17 @@ export function workerWindowHealth(cells: Iterable<WorkerHealthCell>): WindowVer
  * as gateway overhead that never happened. The row still counts toward
  * throughput, status and latency — those are what the run delivered — but its
  * residual is withheld.
+ *
+ * A pending window is left unmarked: see {@link HEALTH_PENDING}. The row is
+ * already on its way to the dashboard and no later batch can revise it, so the
+ * choice is between an annotation that may be wrong and none at all — and
+ * "the generator was unwell" is not a claim to make on a guess.
  */
 export function stampHealthWindows(results: RequestResult[], health: WindowVerdict): void {
   for (const r of results) {
     if (r.timingReason !== null && r.timingReason !== undefined) continue;
     const reason = health(r.ts);
-    if (reason !== null) r.timingReason = reason;
+    if (reason !== null && reason !== HEALTH_PENDING) r.timingReason = reason;
   }
 }
 
