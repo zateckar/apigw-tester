@@ -50,8 +50,24 @@ const MINUTE_MS = 60_000;
  * runs a near-idle pool and pays setup on a schedule of its own.
  */
 export function residualOf(r: RequestResult): number | null {
-  if ((r.measurementVersion ?? 1) < MEASUREMENT_VERSION) return null;
   if (r.timingReason != null) return null;
+  return nonBackendMsOf(r);
+}
+
+/**
+ * Time a request spent outside the backend: `ttfb − serverMs − connectMs`.
+ *
+ * The same quantity {@link residualOf} feeds to the gateway arm, without the
+ * health gate. That gate exists to protect a *difference* between two
+ * distributions, where a generator stall lands entirely on one side; here every
+ * request carries its own observation and a stall shows up as a fat tail in the
+ * same histogram, which is a truer thing to look at than a withheld number.
+ *
+ * Still refused: a row from an older measurement version, because the field
+ * meant something else then and mixing the two silently changes the metric.
+ */
+export function nonBackendMsOf(r: RequestResult): number | null {
+  if ((r.measurementVersion ?? 1) < MEASUREMENT_VERSION) return null;
   if (r.ttfbMs == null || r.serverMs == null) return null;
   const v = r.ttfbMs - r.serverMs - (r.connectMs ?? 0);
   return Number.isFinite(v) ? v : null;
@@ -122,7 +138,8 @@ class Aggregator {
         count: 0, errors: 0, ok2xx: 0, rejected4xx: 0, rejected4xxGw: 0, reachedBackend: 0,
         latencySumMs: 0, maxLatencyMs: 0, bytesReq: 0, bytesResp: 0,
         connSetups: 0, connSetupSumMs: 0, connMeasured: 0,
-        hist: emptyHistogram(), statusHist: emptyStatusHistogram()
+        hist: emptyHistogram(), statusHist: emptyStatusHistogram(),
+        nonBackendCount: 0, nonBackendSumMs: 0, nonBackendHist: emptyResidualHistogram()
       };
       this.cells.set(key, c);
     }
@@ -163,9 +180,19 @@ class Aggregator {
     if (run) run.count++;
     else this.runs.set(runKey, { bucketTs, runId: r.runId, count: 1 });
 
-    // The gateway arm. Requests the gateway answered itself contribute nothing
-    // here — there is no backend time to subtract — and that shows up as a
-    // smaller gwSamples, not as a silent substitution.
+    // Time spent outside the backend, per request, in the same cell as
+    // everything else — so it is readable per endpoint and per class at any
+    // percentile. A request the gateway answered itself carries no backend
+    // clock and contributes nothing, which shows up as a smaller
+    // nonBackendCount rather than as a substituted number.
+    const nonBackend = nonBackendMsOf(r);
+    if (nonBackend !== null) {
+      c.nonBackendCount++;
+      c.nonBackendSumMs += nonBackend;
+      addToResidualHistogram(c.nonBackendHist, nonBackend);
+    }
+
+    // The gateway arm of the two-arm Δ.
     const residual = residualOf(r);
     if (residual !== null) this.addResidual(r.ts, r.class as ScenarioClass, "gw", residual);
   }

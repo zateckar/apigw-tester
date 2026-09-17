@@ -16,6 +16,7 @@ import type {
   AggregateBatch,
   ClassStat,
   ConnSetupStats,
+  NonBackendStats,
   ContractStats,
   EndpointStat,
   GwTargets,
@@ -127,6 +128,9 @@ interface RollupRow {
   conn_measured: number;
   hist: string;
   status_hist: string;
+  nb_count: number;
+  nb_sum_ms: number;
+  nb_hist: string;
 }
 
 interface Combined {
@@ -148,6 +152,9 @@ interface Combined {
   connMeasured: number;
   hist: Histogram;
   statusHist: StatusHistogram;
+  nbCount: number;
+  nbSumMs: number;
+  nbHist: ResidualHistogram;
 }
 
 function newCombined(r: RollupRow): Combined {
@@ -156,7 +163,35 @@ function newCombined(r: RollupRow): Combined {
     count: 0, errors: 0, ok2xx: 0, rejected4xx: 0, rejected4xxGw: 0, reachedBackend: 0,
     latencySumMs: 0, maxLatencyMs: 0, bytesReq: 0, bytesResp: 0,
     connSetups: 0, connSetupSumMs: 0, connMeasured: 0,
-    hist: emptyHistogram(), statusHist: emptyStatusHistogram()
+    hist: emptyHistogram(), statusHist: emptyStatusHistogram(),
+    nbCount: 0, nbSumMs: 0, nbHist: emptyResidualHistogram()
+  };
+}
+
+/** The reported shape of non-backend time over a set of rolled-up rows. */
+function nonBackendStats(rows: Iterable<Combined>): NonBackendStats {
+  const hist = emptyResidualHistogram();
+  let count = 0;
+  let sumMs = 0;
+  for (const c of rows) {
+    mergeHistograms(hist, c.nbHist);
+    count += c.nbCount;
+    sumMs += c.nbSumMs;
+  }
+  // No gate beyond "did anything measure it". Every request carrying both
+  // clocks contributes one observation, so a percentile here is drawn from the
+  // traffic itself rather than from a 2% control stream — which is the whole
+  // reason this replaced the two-arm Δ as the headline.
+  if (count === 0) {
+    return { p50: null, p90: null, p95: null, p99: null, avg: null, count: 0 };
+  }
+  return {
+    p50: residualPercentile(hist, 50),
+    p90: residualPercentile(hist, 90),
+    p95: residualPercentile(hist, 95),
+    p99: residualPercentile(hist, 99),
+    avg: sumMs / count,
+    count
   };
 }
 
@@ -326,8 +361,24 @@ function rowsToCombined(rows: RollupRow[], scope: "endpoint" | "class"): Map<str
     c.connMeasured += r.conn_measured ?? 0;
     mergeHistograms(c.hist, parseHist(r.hist));
     mergeHistograms(c.statusHist, parseHist(r.status_hist));
+    c.nbCount += r.nb_count ?? 0;
+    c.nbSumMs += r.nb_sum_ms ?? 0;
+    mergeHistograms(c.nbHist, parseResidualHist(r.nb_hist));
   }
   return map;
+}
+
+/** Residual histograms are a different width from latency ones; a row written
+ *  before the column existed parses to an all-zero array of the right size. */
+function parseResidualHist(s: string | null | undefined): ResidualHistogram {
+  if (typeof s !== "string") return emptyResidualHistogram();
+  try {
+    const parsed = JSON.parse(s) as unknown;
+    if (!Array.isArray(parsed)) return emptyResidualHistogram();
+    return parsed as ResidualHistogram;
+  } catch {
+    return emptyResidualHistogram();
+  }
 }
 
 function parseHist(s: string): Histogram {
@@ -370,14 +421,14 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   // scalar columns stay cheap SQL arithmetic. Rows written by an older build
   // (hist='[]') merge positionally as all-zero.
   function selectRow(table: string): string {
-    return `SELECT hist, status_hist FROM ${table}
+    return `SELECT hist, status_hist, nb_hist FROM ${table}
      WHERE bucket_ts = ? AND protocol = ? AND endpoint = ? AND cls = ?`;
   }
 
   function layer(table: string): string {
     return `
-     INSERT INTO ${table} (first_ts, last_ts, bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, rejected4xx_gw, reached_backend, latency_sum_ms, max_latency_ms, bytes_req, bytes_resp, conn_setups, conn_setup_sum_ms, conn_measured, hist, status_hist)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     INSERT INTO ${table} (first_ts, last_ts, bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, rejected4xx_gw, reached_backend, latency_sum_ms, max_latency_ms, bytes_req, bytes_resp, conn_setups, conn_setup_sum_ms, conn_measured, hist, status_hist, nb_count, nb_sum_ms, nb_hist)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(bucket_ts, protocol, endpoint, cls) DO UPDATE SET
        first_ts = MIN(COALESCE(first_ts, bucket_ts), excluded.first_ts),
        last_ts = MAX(COALESCE(last_ts, bucket_ts + ${table === "rollup_minute" ? MINUTE_BUCKETS : HOUR_BUCKETS} - 1000), excluded.last_ts),
@@ -395,7 +446,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
        conn_setup_sum_ms = conn_setup_sum_ms + excluded.conn_setup_sum_ms,
        conn_measured = conn_measured + excluded.conn_measured,
        hist = excluded.hist,
-       status_hist = excluded.status_hist`;
+       status_hist = excluded.status_hist,
+       nb_count = nb_count + excluded.nb_count,
+       nb_sum_ms = nb_sum_ms + excluded.nb_sum_ms,
+       nb_hist = excluded.nb_hist`;
   }
   const selectMinute = db.prepare(selectRow("rollup_minute"));
   const selectHour = db.prepare(selectRow("rollup_hour"));
@@ -459,7 +513,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     db.prepare(
       `SELECT first_ts, last_ts, bucket_ts, protocol, endpoint, cls, count, errors, ok2xx, rejected4xx, rejected4xx_gw,
               reached_backend, latency_sum_ms, max_latency_ms, bytes_req, bytes_resp,
-              conn_setups, conn_setup_sum_ms, conn_measured, hist, status_hist
+              conn_setups, conn_setup_sum_ms, conn_measured, hist, status_hist,
+              nb_count, nb_sum_ms, nb_hist
        FROM ${table} WHERE bucket_ts >= ? AND bucket_ts <= ?`
     ).all(fromBucket, toBucket) as unknown as RollupRow[];
 
@@ -513,8 +568,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
   // Persisted rollup state carried across flushes so the open minute/hour
   // rows are not re-SELECTed and re-parsed every 10s. Cleared by any write
   // path that can change rollup tables behind ingestBatch's back.
-  const minuteRollupCache = new Map<string, { reasons: Record<string, number>; hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram }>();
-  const hourRollupCache = new Map<string, { reasons: Record<string, number>; hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram }>();
+  const minuteRollupCache = new Map<string, { reasons: Record<string, number>; hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram; nbHist: ResidualHistogram }>();
+  const hourRollupCache = new Map<string, { reasons: Record<string, number>; hist: Histogram; qualifiedHist: Histogram; statusHist: Histogram; nbHist: ResidualHistogram }>();
   const clearRollupCaches = () => { minuteRollupCache.clear(); hourRollupCache.clear(); };
 
   function windowRows(from: number, to: number): RollupRow[] {
@@ -687,6 +742,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       bytes_req: number; bytes_resp: number;
       conn_setups: number; conn_setup_sum_ms: number; conn_measured: number;
       hist: Histogram; status_hist: StatusHistogram;
+      nb_count: number; nb_sum_ms: number; nb_hist: ResidualHistogram;
     }
     const minute = new Map<string, Bucket>();
     const hour = new Map<string, Bucket>();
@@ -714,7 +770,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           latency_sum_ms: 0, max_latency_ms: 0,
           bytes_req: 0, bytes_resp: 0,
           conn_setups: 0, conn_setup_sum_ms: 0, conn_measured: 0,
-          hist: emptyHistogram(), status_hist: emptyStatusHistogram()
+          hist: emptyHistogram(), status_hist: emptyStatusHistogram(),
+          nb_count: 0, nb_sum_ms: 0, nb_hist: emptyResidualHistogram()
         };
         table.set(key, b);
       }
@@ -735,6 +792,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       b.conn_measured += c.connMeasured ?? 0;
       mergeHistograms(b.hist, c.hist);
       mergeHistograms(b.status_hist, c.statusHist);
+      // absent on a producer that predates the metric; merge what is there
+      b.nb_count += c.nonBackendCount ?? 0;
+      b.nb_sum_ms += c.nonBackendSumMs ?? 0;
+      if (Array.isArray(c.nonBackendHist)) mergeHistograms(b.nb_hist, c.nonBackendHist);
     };
 
     /** Residual arms this batch touches, keyed bucket|class|path per layer. */
@@ -801,7 +862,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           Math.max(0, Math.round(r.count) || 0)
         );
       }
-      type StoredHists = { hist: string; status_hist: string };
+      type StoredHists = { hist: string; status_hist: string; nb_hist: string };
       type Bind = string | number | bigint | null | Uint8Array | boolean;
       // Merge the stored histograms into the in-memory buckets first, then
       // write the full merged arrays back; scalar columns stay SQL-side deltas.
@@ -809,7 +870,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         b.first_ts, b.last_ts, b.bucket_ts, b.protocol, b.endpoint, b.cls, b.count, b.errors, b.ok2xx, b.rejected4xx,
         b.rejected4xx_gw, b.reached_backend, b.latency_sum_ms, b.max_latency_ms, b.bytes_req, b.bytes_resp,
         b.conn_setups, b.conn_setup_sum_ms, b.conn_measured,
-        JSON.stringify(b.hist), JSON.stringify(b.status_hist)
+        JSON.stringify(b.hist), JSON.stringify(b.status_hist),
+        b.nb_count, b.nb_sum_ms, JSON.stringify(b.nb_hist)
       ];
       // Every flush touches the same open minute/hour rows — previously a
       // SELECT + JSON.parse × 3 histograms + merge + JSON.stringify × 3, per
@@ -820,7 +882,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       // (kept by reference; the per-batch Bucket objects are discarded after
       // the upsert, so the reference stays valid and exact).
       const storeKey = (b: Bucket) => `${b.bucket_ts}|${b.protocol}|${b.endpoint}|${b.cls}`;
-      interface StoredState { hist: Histogram; statusHist: Histogram }
+      interface StoredState { hist: Histogram; statusHist: Histogram; nbHist: ResidualHistogram }
       const mergeIntoAndUpsert = (
         buckets: Map<string, Bucket>,
         select: typeof selectMinute,
@@ -843,17 +905,19 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           if (cached !== undefined) {
             mergeHistograms(b.hist, cached.hist);
             mergeHistograms(b.status_hist, cached.statusHist);
+            mergeHistograms(b.nb_hist, cached.nbHist);
           } else {
             const row = select.get(b.bucket_ts, b.protocol, b.endpoint, b.cls) as StoredHists | undefined;
             if (row) {
               mergeHistograms(b.hist, parseHist(row.hist));
               mergeHistograms(b.status_hist, parseHist(row.status_hist));
+              mergeHistograms(b.nb_hist, parseResidualHist(row.nb_hist));
             }
           }
           // the upsert writes exactly b's (merged) state, so b becomes the
           // cached stored state for the next flush — scalar columns are
           // SQL-side deltas and never need the cache
-          cache.set(key, { hist: b.hist, statusHist: b.status_hist });
+          cache.set(key, { hist: b.hist, statusHist: b.status_hist, nbHist: b.nb_hist });
           upsert.run(...upsertParams(b));
         }
       };
@@ -966,7 +1030,8 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         p50: percentile(c.hist, 50),
         p95: percentile(c.hist, 95),
         avgLatencyMs: meanFromRollup(c.latencySumMs, c.count),
-        avgRespBytes: c.count === 0 ? 0 : c.bytesResp / c.count
+        avgRespBytes: c.count === 0 ? 0 : c.bytesResp / c.count,
+        nonBackendMs: nonBackendStats([c])
       });
       const acc = protoAcc.get(c.protocol) ?? { total: 0, errors: 0 };
       acc.total += c.count;
@@ -1007,6 +1072,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           p99: percentile(c.hist, 99),
           avg: meanFromRollup(c.latencySumMs, c.count)
         },
+        nonBackendMs: nonBackendStats([c]),
         overheadMs: overheadDelta(residualByClass.get(cls) ?? emptyPair()),
         avgBytesReq: c.bytesReq / c.count,
         avgBytesResp: c.bytesResp / c.count
@@ -1051,6 +1117,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         avg: latencySum / Math.max(total, 1),
         max: rows.reduce((m, r) => Math.max(m, r.max_latency_ms), 0)
       },
+      nonBackendMs: nonBackendStats(byEndpointCls.values()),
       overheadMs: overheadDelta(headline),
       connSetup: connSetupStats(byEndpointCls.values()),
       bytes: { req: bytesReq, resp: bytesResp, respPerSec: perSec(bytesResp) },
@@ -1364,6 +1431,13 @@ function migrate(db: DbHandle): void {
     ensureColumn(db, table, "conn_setups", "INTEGER NOT NULL DEFAULT 0");
     ensureColumn(db, table, "conn_setup_sum_ms", "REAL NOT NULL DEFAULT 0");
     ensureColumn(db, table, "conn_measured", "INTEGER NOT NULL DEFAULT 0");
+    // Counts again, so 0 is honest: a window written before this metric
+    // existed measured no non-backend time, and nb_count = 0 is exactly how
+    // the reader is told there is nothing to draw a percentile from. The
+    // empty histogram merges positionally as all-zero.
+    ensureColumn(db, table, "nb_count", "INTEGER NOT NULL DEFAULT 0");
+    ensureColumn(db, table, "nb_sum_ms", "REAL NOT NULL DEFAULT 0");
+    ensureColumn(db, table, "nb_hist", "TEXT NOT NULL DEFAULT '[]'");
   }
   ensureColumn(db, "load_shed", "results_lost", "INTEGER NOT NULL DEFAULT 0");
   // 0 reads as "none recorded", which for a pre-migration bucket is the honest

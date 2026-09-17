@@ -61,6 +61,11 @@ export function openDb(path: string): DbHandle {
       hist TEXT NOT NULL,
       overhead_hist TEXT NOT NULL DEFAULT '[]',
       status_hist TEXT NOT NULL DEFAULT '[]',
+      -- time spent outside the backend (ttfb - serverMs - connectMs), one
+      -- observation per request, so it reads at any percentile over any window
+      nb_count INTEGER NOT NULL DEFAULT 0,
+      nb_sum_ms REAL NOT NULL DEFAULT 0,
+      nb_hist TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (bucket_ts, protocol, endpoint, cls)
     );
 
@@ -87,6 +92,11 @@ export function openDb(path: string): DbHandle {
       hist TEXT NOT NULL,
       overhead_hist TEXT NOT NULL DEFAULT '[]',
       status_hist TEXT NOT NULL DEFAULT '[]',
+      -- time spent outside the backend (ttfb - serverMs - connectMs), one
+      -- observation per request, so it reads at any percentile over any window
+      nb_count INTEGER NOT NULL DEFAULT 0,
+      nb_sum_ms REAL NOT NULL DEFAULT 0,
+      nb_hist TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (bucket_ts, protocol, endpoint, cls)
     );
 

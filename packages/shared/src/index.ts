@@ -583,6 +583,26 @@ export interface AggCell {
   connMeasured: number;
   hist: number[];
   statusHist: number[];
+  /**
+   * Time this request spent anywhere other than the backend:
+   * `ttfb − serverMs − connectMs`, in milliseconds, signed.
+   *
+   * Every request that carried both clocks contributes one observation, so
+   * this is readable at any percentile, at any rate, over any window — which
+   * is what the two-arm Δ it replaces could not do. The reference stream was
+   * 2% of the load and then split by class, so its p95 and p99 were withheld
+   * on essentially every real run.
+   *
+   * What it is not: the gateway's processing cost alone. It includes the
+   * network between this generator and the gateway. Name it accordingly
+   * wherever it is shown — the number is honest, the label has to be too.
+   * Connection acquisition is subtracted because it is paid on a schedule of
+   * its own; it is reported separately in connSetups/connSetupSumMs.
+   */
+  nonBackendCount: number;
+  nonBackendSumMs: number;
+  /** positional over RESIDUAL_EDGES_MS */
+  nonBackendHist: number[];
 }
 
 /** Which arm of the overhead comparison a residual belongs to. */
@@ -1009,6 +1029,38 @@ export interface WindowValidity {
  * floor at zero is exactly how a rig talks itself into a finding it does not
  * have.
  */
+/**
+ * Time spent anywhere other than the backend: `ttfb − serverMs − connectMs`,
+ * summarised over whatever rows were asked for.
+ *
+ * The headline overhead measurement. Every request that carried both clocks
+ * contributes one observation, so this reads at any percentile, over any
+ * window, per endpoint or per class, at 10 rps and at 10,000 — none of which
+ * the two-arm {@link OverheadDelta} could do, because its control stream was
+ * 2% of the load and then split seven ways by class.
+ *
+ * What it includes, and what to call it: the network between this generator
+ * and the gateway, plus the gateway's own work. It is *not* the gateway's
+ * processing cost in isolation — no single-stream measurement can be, since
+ * there is nothing to subtract the path itself against. Label it "non-backend
+ * time", not "gateway overhead"; the number is honest and the name has to be
+ * too. Connection acquisition is excluded and reported in {@link ConnSetupStats}.
+ *
+ * May be negative: the backend's clock starts a little after ours stops
+ * counting, and at sub-millisecond scale that shows. Reported as measured
+ * rather than clamped, because a floor at zero is how a rig talks itself into
+ * a finding it does not have.
+ */
+export interface NonBackendStats {
+  p50: number | null;
+  p90: number | null;
+  p95: number | null;
+  p99: number | null;
+  avg: number | null;
+  /** requests that carried both clocks; the rest could not be measured */
+  count: number;
+}
+
 export interface OverheadDelta {
   p50: number | null;
   p90: number | null;
@@ -1057,9 +1109,13 @@ export interface MetricSummary {
   unexpectedFailurePct: number;
   rps: number;
   latencyMs: { p50: number; p90: number; p95: number; p99: number; avg: number; max: number };
-  /** What the gateway path costs over the direct path, at matched percentiles.
-   *  Includes every difference between the two routes — extra hops and TLS
-   *  termination as well as the gateway's own work. */
+  /** Time not spent in the backend, per request. The headline overhead
+   *  number: always available, at every percentile. */
+  nonBackendMs: NonBackendStats;
+  /** What the gateway path costs over the direct reference path, at matched
+   *  percentiles. Requires the reference stream and is withheld unless both
+   *  arms carry enough samples, which at realistic run lengths is rare above
+   *  p50 — see nonBackendMs for the number that is always there. */
   overheadMs: OverheadDelta;
   /** How often the load path had to open a connection rather than reuse one. */
   connSetup: ConnSetupStats;
@@ -1136,6 +1192,8 @@ export interface EndpointStat {
   p95: number;
   avgLatencyMs: number;
   avgRespBytes: number;
+  /** Time not spent in the backend, for this endpoint alone. */
+  nonBackendMs: NonBackendStats;
 }
 
 export interface ClassStat {
@@ -1149,8 +1207,11 @@ export interface ClassStat {
   gatewayErrors: number;
   rps: number;
   latencyMs: { p50: number; p95: number; p99: number; avg: number };
-  /** Δ against the reference stream restricted to this same class, so a
-   *  big-response row is compared only with direct big-response calls. */
+  /** Time not spent in the backend, for this class alone. */
+  nonBackendMs: NonBackendStats;
+  /** Δ against the reference stream restricted to this same class. Almost
+   *  always withheld: the reference arm is 2% of the load and then split by
+   *  class, so a single class rarely clears even the p50 bar. */
   overheadMs: OverheadDelta;
   avgBytesReq: number;
   avgBytesResp: number;

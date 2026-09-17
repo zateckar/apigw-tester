@@ -914,6 +914,77 @@ describe("distributional gateway overhead and durable coverage", () => {
     } finally { store.close(); }
   });
 
+  describe("non-backend time", () => {
+    it("measures every request, at every percentile, with no control stream", () => {
+      // The Δ above needs 1,000 observations on *each* arm for a p99 and the
+      // reference arm is 2% of the load, so on real runs it is withheld. This
+      // is the same quantity read per request, so 300 requests give a p99.
+      const store = createMetricsStore(":memory:");
+      try {
+        store.ingestBatch({ batchId: "nb", results: many(300, { ttfbMs: 112, serverMs: 100 }) });
+        const s = store.summary(300_000);
+        expect(s.nonBackendMs.count).toBe(300);
+        // every observation is exactly 12ms; the band is the residual
+        // histogram's bucket width at that magnitude, not measurement spread
+        for (const p of [s.nonBackendMs.p50, s.nonBackendMs.p90, s.nonBackendMs.p95, s.nonBackendMs.p99]) {
+          expect(p).not.toBeNull();
+          expect(p!).toBeGreaterThan(9);
+          expect(p!).toBeLessThan(15);
+        }
+        expect(s.nonBackendMs.avg!).toBeCloseTo(12, 5);
+        // and it needs no reference traffic at all to say that
+        expect(s.overheadMs.directSamples).toBe(0);
+      } finally { store.close(); }
+    });
+
+    it("agrees with the two-arm Δ where the Δ is available", () => {
+      // gateway residual 12ms, reference residual 2ms. The Δ reports the
+      // difference, ~10ms; non-backend time reports the gateway arm itself,
+      // ~12ms. The gap between them is the reference path's own cost, which is
+      // exactly what the single-stream number cannot subtract and must not
+      // claim to have.
+      const store = createMetricsStore(":memory:");
+      try {
+        store.ingestBatch({
+          batchId: "agree",
+          results: many(300, { ttfbMs: 112, serverMs: 100 }),
+          baseline: direct(300, 2)
+        });
+        const s = store.summary(300_000);
+        expect(s.nonBackendMs.avg!).toBeCloseTo(12, 5);
+        expect(s.overheadMs.avg!).toBeCloseTo(10, 5);
+        expect(s.nonBackendMs.avg! - s.overheadMs.avg!).toBeCloseTo(2, 5);
+      } finally { store.close(); }
+    });
+
+    it("is reported per endpoint and per class", () => {
+      const store = createMetricsStore(":memory:");
+      try {
+        store.ingestBatch({ batchId: "split", results: many(200, { ttfbMs: 112, serverMs: 100 }) });
+        const s = store.summary(300_000);
+        expect(s.perEndpoint[0]!.nonBackendMs.count).toBeGreaterThan(0);
+        expect(s.perEndpoint[0]!.nonBackendMs.p95).not.toBeNull();
+        expect(s.perClass[0]!.nonBackendMs.count).toBeGreaterThan(0);
+        expect(s.perClass[0]!.nonBackendMs.p95).not.toBeNull();
+      } finally { store.close(); }
+    });
+
+    it("counts only requests that carried both clocks", () => {
+      // a response the gateway manufactured has no backend time to subtract;
+      // it is absent from the count rather than contributing a wrong number
+      const store = createMetricsStore(":memory:");
+      try {
+        store.ingestBatch({
+          batchId: "partial",
+          results: [...many(100, { ttfbMs: 112, serverMs: 100 }), ...many(50, { ttfbMs: 112, serverMs: null })]
+        });
+        const s = store.summary(300_000);
+        expect(s.total).toBe(150);
+        expect(s.nonBackendMs.count).toBe(100);
+      } finally { store.close(); }
+    });
+  });
+
   it("keeps a negative reference residual instead of flooring it at zero", () => {
     // The reference arm's low tail crosses zero because TTFB and the SUT's own
     // clock are read at different layers. Clamping it — which the retired

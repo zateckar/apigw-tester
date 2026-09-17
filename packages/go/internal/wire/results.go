@@ -115,6 +115,15 @@ type AggCell struct {
 	ConnMeasured   int64   `json:"connMeasured"`
 	Hist           []int64 `json:"hist"`
 	StatusHist     []int64 `json:"statusHist"`
+	// NonBackend* is time spent anywhere other than the backend, per request:
+	// ttfb − serverMs − connectMs. Every request carrying both clocks
+	// contributes, so it is readable at any percentile over any window, unlike
+	// the two-arm Δ whose control stream was 2% of the load. It includes the
+	// network to the gateway and is not the gateway's processing cost alone.
+	// NonBackendHist is positional over hist.ResidualEdges.
+	NonBackendCount int64   `json:"nonBackendCount"`
+	NonBackendSumMs float64 `json:"nonBackendSumMs"`
+	NonBackendHist  []int64 `json:"nonBackendHist"`
 }
 
 // ResidualCell is one health window's residuals for one class on one arm

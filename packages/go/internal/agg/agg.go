@@ -92,6 +92,7 @@ func (a *Aggregator) Add(r *wire.RequestResult) {
 			BucketTS: bucketTS, FirstTS: r.TS, LastTS: r.TS,
 			Protocol: r.Protocol, Endpoint: r.Endpoint, Class: r.Class,
 			Hist: hist.NewLatency(), StatusHist: hist.NewStatus(),
+			NonBackendHist: hist.NewResidual(),
 		}
 		a.cells[k] = c
 	}
@@ -149,20 +150,25 @@ func (a *Aggregator) Add(r *wire.RequestResult) {
 		a.runs[rk] = &wire.RunCell{BucketTS: bucketTS, RunID: r.RunID, Count: 1}
 	}
 
-	// The gateway arm. A request the gateway answered itself carries no backend
-	// time to subtract and contributes nothing here — which shows up as a
-	// smaller sample count on that arm, not as a silent substitution.
+	// Time spent outside the backend. A request the gateway answered itself
+	// carries no backend clock and contributes nothing — which shows up as a
+	// smaller NonBackendCount, not as a silent substitution.
 	//
-	// Connection acquisition comes off the residual because it is not a cost the
-	// gateway imposes per request. Subtracting it is not the estimation the
-	// retired measurement did: this is a value observed on this very request,
-	// so nothing borrowed from another distribution enters the number.
+	// Connection acquisition comes off it because it is not a cost the gateway
+	// imposes per request; it is reported separately in ConnSetups. This is a
+	// value observed on this very request, so nothing borrowed from another
+	// distribution enters the number.
 	if r.TTFBMs != nil && r.ServerMs != nil {
 		connect := 0.0
 		if r.ConnectMs != nil {
 			connect = *r.ConnectMs
 		}
-		a.addResidual(r.TS, r.Class, "gw", *r.TTFBMs-*r.ServerMs-connect)
+		nonBackend := *r.TTFBMs - *r.ServerMs - connect
+		c.NonBackendCount++
+		c.NonBackendSumMs += nonBackend
+		hist.Add(c.NonBackendHist, hist.ResidualEdges, nonBackend)
+		// the gateway arm of the two-arm Δ, same quantity at a coarser key
+		a.addResidual(r.TS, r.Class, "gw", nonBackend)
 	}
 
 	if notable(r) {
