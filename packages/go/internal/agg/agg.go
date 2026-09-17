@@ -104,6 +104,11 @@ func (a *Aggregator) Add(r *wire.RequestResult) {
 	}
 	c.Count++
 	switch {
+	// a request that never left this process is not evidence about the target:
+	// it stays in Count, because it was issued and the rate must not quietly
+	// improve when the generator fails, but charging it to the gateway's error
+	// rate would report a dial storm as the gateway falling over
+	case r.GenFault:
 	case r.Status == 0 || r.Status >= 500:
 		c.Errors++
 	case r.Status >= 200 && r.Status < 300:

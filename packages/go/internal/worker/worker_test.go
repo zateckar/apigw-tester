@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/apigw-tester/go/internal/config"
+	"github.com/apigw-tester/go/internal/fire"
 	"github.com/apigw-tester/go/internal/wire"
 )
 
@@ -58,6 +59,24 @@ func TestRunsCanBeStartedAndStoppedRepeatedly(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		w.Start("run-" + string(rune('a'+i)))
 		w.Stop()
+	}
+}
+
+func TestTheConnectionBackstopStaysAboveTheConcurrencyCeiling(t *testing.T) {
+	// fire.MaxConnsPerHost is a backstop against a socket storm, not a working
+	// limit. If it ever slipped to or below the concurrency ceiling, a run that
+	// was behaving perfectly would start waiting for connections, and that wait
+	// would be added to measured latency and read as gateway overhead — the rig
+	// would quietly begin charging the gateway for its own throttling.
+	if fire.MaxConnsPerHost <= LimitMaxConcurrency {
+		t.Fatalf("fire.MaxConnsPerHost (%d) must exceed LimitMaxConcurrency (%d)",
+			fire.MaxConnsPerHost, LimitMaxConcurrency)
+	}
+	// and the idle pool must hold every connection that ceiling permits, or
+	// steady-state traffic closes and reopens sockets for no reason
+	if fire.IdlePoolPerHost < LimitMaxConcurrency {
+		t.Fatalf("fire.IdlePoolPerHost (%d) is below LimitMaxConcurrency (%d)",
+			fire.IdlePoolPerHost, LimitMaxConcurrency)
 	}
 }
 

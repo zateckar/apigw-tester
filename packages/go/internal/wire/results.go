@@ -42,6 +42,11 @@ type RequestResult struct {
 	BytesResp      int64   `json:"bytesResp"`
 	ReachedBackend bool    `json:"reachedBackend"`
 	Error          *string `json:"error"`
+	// GenFault marks a failure that never left this process — see
+	// fire.NeverLeftTheGenerator. Such a request is not evidence about the
+	// target and is kept out of its error rate; it is counted per minute in
+	// LoadShedSample.GenFaults instead, where it invalidates the window.
+	GenFault bool `json:"genFault"`
 }
 
 // MeasurementVersion must match MEASUREMENT_VERSION in
@@ -68,9 +73,13 @@ type LoadShedSample struct {
 	// ResultsLost is measurements discarded in this minute for requests that
 	// were issued and answered — the window's numbers describe a subset of
 	// what the gateway actually served.
-	ResultsLost int64   `json:"resultsLost"`
-	TargetSum   float64 `json:"targetSum"`
-	Ticks       int64   `json:"ticks"`
+	ResultsLost int64 `json:"resultsLost"`
+	// GenFaults is requests that failed before reaching the target at all.
+	// Shed load was never issued and these were, but neither says anything
+	// about the gateway, and both belong to the generator's own accounting.
+	GenFaults int64   `json:"genFaults"`
+	TargetSum float64 `json:"targetSum"`
+	Ticks     int64   `json:"ticks"`
 }
 
 // AggCell is one pre-rolled (minute, protocol, endpoint, class) cell, mirroring

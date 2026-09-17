@@ -858,6 +858,16 @@ export interface LoadShedSample {
    *  Carried here so the loss commits into the same minute as the traffic it
    *  silently thinned, and the window can be judged on it. */
   resultsLost?: number;
+  /**
+   * Requests that failed before reaching the target at all — a refused or
+   * timed-out TCP connect, or a name that would not resolve.
+   *
+   * These were issued, unlike `dropped`, and they failed, unlike a normal
+   * request — but they are not evidence about the gateway, so they are kept
+   * out of its error rate and accounted here. Absent from generators that
+   * cannot tell the two apart, which is distinct from a reported zero.
+   */
+  genFaults?: number;
   /** sum of the per-tick target rps, for the mean target over the bucket */
   targetSum: number;
   ticks: number;
@@ -930,6 +940,17 @@ export const VALIDITY_LIMITS = {
   workerCpuPct: 85,
   /** share of intended load we may fail to issue before the window is suspect */
   shedPct: 1,
+  /**
+   * Share of issued requests that may fail before reaching the target at all.
+   *
+   * Tighter than shedPct, and deliberately so: shed load is a ceiling working
+   * as designed, while a request that was issued and could not be connected is
+   * the generator failing at the one thing it must do. It also rarely arrives
+   * alone — a refused connection costs a concurrency slot for the dial
+   * timeout, so a handful of them is the leading edge of a collapse, and the
+   * window it starts in is the one worth disbelieving.
+   */
+  genFaultPct: 0.1,
   /** share of a run report's window that may belong to other runs. Roll-ups are
    *  minute-granular, so a short run shares its first and last bucket with
    *  whatever ran either side of it. */
@@ -947,6 +968,8 @@ export interface WindowValidity {
    *  cover only issued − lost requests, and the loss is biased toward the
    *  busiest moments */
   resultsLost: number;
+  /** requests that never reached the target; see LoadShedSample.genFaults */
+  genFaults: number;
   /** mean rate the profile asked for over the window; null when not recorded */
   targetRps: number | null;
   /** rate actually issued */

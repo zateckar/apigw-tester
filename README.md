@@ -121,10 +121,21 @@ A load generator that cannot keep up makes the *gateway* look better: it issues 
 | Signal | Invalid when | Why |
 |---|---|---|
 | `shedPct` | > 1 % of the intended load was never issued | the concurrency ceiling throttled the generator — the target rate was never actually offered to the gateway |
+| `genFaults` | > 0.1 % of issued requests never reached the target | the connection was refused or timed out before the gateway saw them; this is the generator or the network between, and it is deliberately kept out of the gateway's error rate |
+| `resultsLost` | > 0 | the gateway served these and we failed to record them, so the percentiles cover a sample biased toward the quiet moments |
 | `cpuProcessPctMax` | > 85 % | the rig is competing with itself for CPU |
-| `eventLoopP99MsMax` | > 100 ms | every latency in the window is inflated by that stall, whatever the gateway did |
+| `eventLoopP99MsMax` | > 10 ms | only with `LOADGEN_BACKEND=ts`, where the control plane's event loop *is* the instrument |
+
+With the default Go backend the clock lives in the worker, so the window is judged on the worker's own goroutine scheduling latency (p99 > 2 ms) and its CPU share instead — the control plane times nothing and its event-loop delay is not evidence. See `VALIDITY_LIMITS` in `packages/shared/src/index.ts`, where each limit records the measurements it was set from.
 
 `droppedRequests` is counted by the scheduler itself — tokens it wanted to spend and could not — so "8 rps target → 7.9 rps achieved" appears as a KPI instead of being silently invisible. A window that fails the gate cannot produce a pass verdict (see below).
+
+### Running at high request rates
+
+The generator holds one connection per in-flight request, so a run at *R* rps with mean latency *L* needs roughly `R × L` sockets — about 1,650 at 10k rps against a backend answering in 165 ms. Two things are worth knowing before pushing past a few thousand rps:
+
+- **Ephemeral ports.** Each connection consumes one, and a closed connection holds it through `TIME_WAIT` — 120 s on Windows, which ships with only 16,384 ports (`netsh int ipv4 show dynamicport tcp`). Back-to-back high-rate runs accumulate; leave a couple of minutes between them, or widen the range. Linux defaults are roughly double and recycle faster.
+- **Connection establishment is the usual wall, not throughput.** When dials start failing, each one costs a concurrency slot for the dial timeout, and the ceiling turns that into a throughput collapse while the backend is still answering normally. The rig reports this honestly rather than blaming the gateway: failed dials land in `genFaults`, and the window is marked invalid.
 
 ## Bounded runs, SLOs and the per-run report
 

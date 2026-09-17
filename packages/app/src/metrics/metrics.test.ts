@@ -244,6 +244,67 @@ describe("measurement validity", () => {
     s.close();
   });
 
+  it("flags requests that never reached the target, separately again", () => {
+    // Three different failures, three different conclusions: shed load was
+    // never issued, lost measurements were served but not recorded, and these
+    // were issued and could not be connected. Only the last one is the
+    // generator failing at its job, and none of the three is the gateway.
+    const s = createMetricsStore(":memory:");
+    const ts = Date.now();
+    const bucketTs = Math.floor(ts / 60_000) * 60_000;
+    s.ingestBatch({
+      batchId: "genfault",
+      results: many(100, { ts }),
+      shed: [{ bucketTs, dropped: 0, genFaults: 40, targetSum: 1000, ticks: 10 }]
+    });
+
+    const v = s.summary(300_000).validity;
+    expect(v.genFaults).toBe(40);
+    expect(v.droppedRequests).toBe(0);
+    expect(v.resultsLost).toBe(0);
+    expect(v.ok).toBe(false);
+    expect(v.reasons.join(" ")).toMatch(/never reached the target/);
+    // and it names the generator rather than the gateway
+    expect(v.reasons.join(" ")).toMatch(/not the gateway/);
+    s.close();
+  });
+
+  it("does not invalidate a window for a single stray connection failure", () => {
+    // the limit is tight but not zero: one refused connect in a big window is
+    // noise, and a gate that fires on noise gets ignored when it matters
+    const s = createMetricsStore(":memory:");
+    const ts = Date.now();
+    const bucketTs = Math.floor(ts / 60_000) * 60_000;
+    s.ingestBatch({
+      batchId: "one-stray",
+      results: many(5000, { ts }),
+      shed: [{ bucketTs, dropped: 0, genFaults: 1, targetSum: 5000, ticks: 10 }]
+    });
+    const v = s.summary(300_000).validity;
+    expect(v.genFaults).toBe(1);
+    expect(v.reasons).toEqual([]);
+    expect(v.ok).toBe(true);
+    s.close();
+  });
+
+  it("a generator that cannot tell the two apart reports no faults, not zero faults", () => {
+    // genFaults is absent from the in-process TS driver, whose fetch failures
+    // are not separable. Absent must read as "nothing claimed" and leave the
+    // window judged on everything else.
+    const s = createMetricsStore(":memory:");
+    const ts = Date.now();
+    const bucketTs = Math.floor(ts / 60_000) * 60_000;
+    s.ingestBatch({
+      batchId: "no-claim",
+      results: many(50, { ts }),
+      shed: [{ bucketTs, dropped: 0, targetSum: 500, ticks: 10 }]
+    });
+    const v = s.summary(300_000).validity;
+    expect(v.genFaults).toBe(0);
+    expect(v.ok).toBe(true);
+    s.close();
+  });
+
   it("a window that recorded everything reports no loss", () => {
     const s = createMetricsStore(":memory:");
     const ts = Date.now();

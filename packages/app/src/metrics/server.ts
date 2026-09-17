@@ -415,10 +415,11 @@ export function createMetricsStore(dbPath: string): MetricsStore {
      ON CONFLICT(bucket_ts, run_id) DO UPDATE SET count = count + excluded.count`
   );
   const upsertShed = db.prepare(
-    `INSERT INTO load_shed (bucket_ts, dropped, results_lost, target_sum, ticks) VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO load_shed (bucket_ts, dropped, results_lost, gen_faults, target_sum, ticks) VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(bucket_ts) DO UPDATE SET
        dropped = dropped + excluded.dropped,
        results_lost = results_lost + excluded.results_lost,
+       gen_faults = gen_faults + excluded.gen_faults,
        target_sum = target_sum + excluded.target_sum,
        ticks = ticks + excluded.ticks`
   );
@@ -551,9 +552,12 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     const toB = Math.floor(to / MINUTE_BUCKETS) * MINUTE_BUCKETS;
     const shed = db.prepare(
       `SELECT COALESCE(SUM(dropped),0) AS dropped, COALESCE(SUM(results_lost),0) AS resultsLost,
+              COALESCE(SUM(gen_faults),0) AS genFaults,
               COALESCE(SUM(target_sum),0) AS targetSum, COALESCE(SUM(ticks),0) AS ticks
        FROM load_shed WHERE bucket_ts >= ? AND bucket_ts <= ?`
-    ).get(fromB, toB) as { dropped: number; resultsLost: number; targetSum: number; ticks: number };
+    ).get(fromB, toB) as {
+      dropped: number; resultsLost: number; genFaults: number; targetSum: number; ticks: number;
+    };
     const health = db.prepare(
       `SELECT COALESCE(MAX(cpu_max),-1) AS cpuMax, COALESCE(MAX(loop_p99_max),-1) AS loopMax,
               COALESCE(SUM(samples),0) AS samples
@@ -562,6 +566,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 
     const dropped = Number(shed.dropped) || 0;
     const resultsLost = Number(shed.resultsLost) || 0;
+    const genFaults = Number(shed.genFaults) || 0;
     const issued = total;
     const intended = issued + dropped;
     const shedPct = intended === 0 ? 0 : (100 * dropped) / intended;
@@ -587,6 +592,18 @@ export function createMetricsStore(dbPath: string): MetricsStore {
         `the percentiles below describe the requests that survived, and loss is biased toward the busiest moments`
       );
     }
+    const genFaultPct = issued === 0 ? 0 : (100 * genFaults) / issued;
+    if (genFaultPct > VALIDITY_LIMITS.genFaultPct) {
+      // These never reached the gateway, so they are absent from its error rate
+      // by design — which is exactly why the window has to say so out loud.
+      // Silently excluding them would leave a run reporting a healthy gateway
+      // over a fraction of the traffic it was supposed to be judged on.
+      reasons.push(
+        `${genFaults.toLocaleString()} requests (${genFaultPct.toFixed(1)}%) never reached the target — ` +
+        "the connection was refused or timed out before the gateway saw them, so this is the generator " +
+        "or the network between, not the gateway; the rates and percentiles below cover only the requests that got through"
+      );
+    }
     if (cpuMax !== null && cpuMax > VALIDITY_LIMITS.cpuProcessPct) {
       reasons.push(`generator CPU utilization or throttling indicator peaked at ${cpuMax.toFixed(0)}% (limit ${VALIDITY_LIMITS.cpuProcessPct}%) — measured latency includes our own queueing`);
     }
@@ -600,6 +617,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
       droppedRequests: dropped,
       shedPct,
       resultsLost,
+      genFaults,
       targetRps,
       achievedRps: issued / windowSec,
       cpuProcessPctMax: cpuMax,
@@ -863,6 +881,7 @@ export function createMetricsStore(dbPath: string): MetricsStore {
           Math.floor(s.bucketTs / MINUTE_BUCKETS) * MINUTE_BUCKETS,
           Math.max(0, Math.round(s.dropped) || 0),
           Math.max(0, Math.round(s.resultsLost ?? 0) || 0),
+          Math.max(0, Math.round(s.genFaults ?? 0) || 0),
           Number.isFinite(s.targetSum) ? s.targetSum : 0,
           Math.max(0, Math.round(s.ticks) || 0)
         );
@@ -1339,6 +1358,11 @@ function migrate(db: DbHandle): void {
     ensureColumn(db, table, "conn_measured", "INTEGER NOT NULL DEFAULT 0");
   }
   ensureColumn(db, "load_shed", "results_lost", "INTEGER NOT NULL DEFAULT 0");
+  // 0 reads as "none recorded", which for a pre-migration bucket is the honest
+  // answer: those windows counted their dial failures as gateway errors, and
+  // nothing here can retroactively take that back — but they will not now be
+  // invalidated for a fault count nobody ever wrote.
+  ensureColumn(db, "load_shed", "gen_faults", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "requests_raw", "request_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "requests_raw", "reached_backend", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "requests_raw", "ttfb_ms", "REAL");

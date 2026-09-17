@@ -90,6 +90,38 @@ func TestCellCountersMatchTheControlPlane(t *testing.T) {
 	}
 }
 
+func TestAFailureThatNeverLeftTheGeneratorIsNotTheTargetsError(t *testing.T) {
+	// It still counts as issued — the achieved rate must not improve when the
+	// generator breaks — but it is not evidence about the gateway, and the old
+	// behaviour reported a dial storm as the gateway erroring on two thirds of
+	// its traffic.
+	a := newAgg()
+	a.Add(res(func(r *wire.RequestResult) { r.Status = 0; r.GenFault = true; r.ReachedBackend = false }))
+	a.Add(res(func(r *wire.RequestResult) { r.Status = 0; r.ReachedBackend = false })) // really failed at the target
+	a.Add(res(func(r *wire.RequestResult) { r.Status = 503; r.ReachedBackend = false }))
+
+	c := a.Drain("g1", nil).Cells[0]
+	if c.Count != 3 {
+		t.Fatalf("count: %d — an issued request is issued whoever failed it", c.Count)
+	}
+	if c.Errors != 2 {
+		t.Fatalf("errors: %d want 2", c.Errors)
+	}
+	// nothing is hidden: the status histogram still carries all three
+	if totalOf(c.StatusHist) != 3 {
+		t.Fatalf("status histogram: %v", c.StatusHist)
+	}
+}
+
+func TestAGeneratorFaultIsNotCountedAsASuccessEither(t *testing.T) {
+	a := newAgg()
+	a.Add(res(func(r *wire.RequestResult) { r.Status = 200; r.GenFault = true }))
+	c := a.Drain("g2", nil).Cells[0]
+	if c.OK2xx != 0 || c.Errors != 0 {
+		t.Fatalf("a generator fault landed in a verdict bucket: %+v", c)
+	}
+}
+
 func TestResidualsAreKeyedByHealthWindow(t *testing.T) {
 	// contaminated windows are withheld whole, which cannot be done at the
 	// minute grain the other cells use

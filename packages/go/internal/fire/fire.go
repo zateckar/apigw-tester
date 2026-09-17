@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -26,6 +27,35 @@ const (
 	budgetSmallMs = 15_000
 	budgetLargeMs = 60_000
 )
+
+// NeverLeftTheGenerator reports whether a request failed before it was ever
+// offered to the target — name resolution or the TCP connect itself.
+//
+// The distinction is the whole point. A request the gateway refused, answered
+// with a 5xx or dropped mid-flight is evidence about the gateway, and belongs
+// in its error rate. A request that never reached it is evidence about us: a
+// dial storm, an exhausted ephemeral port range, a listener whose accept queue
+// overflowed. Counting the second as the first is how a rig accuses a gateway
+// of failing under load when what actually happened is that the generator
+// could not open a socket — and at 10k rps on Windows that was 66,329
+// "gateway errors" against a SUT that was answering every request it received
+// in 90ms.
+//
+// Deliberately narrow: only dial and DNS. A connection reset once the request
+// was on the wire is left to count against the target, because from here it is
+// indistinguishable from the target hanging up, and guessing in the
+// generator's favour is the bias this function exists to avoid.
+func NeverLeftTheGenerator(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return true
+	}
+	var op *net.OpError
+	return errors.As(err, &op) && op.Op == "dial"
+}
 
 // BudgetFor returns the per-request timeout budget in milliseconds.
 func BudgetFor(class string) int64 {
@@ -157,6 +187,7 @@ func (f *Firer) Fire(j *Job) {
 			msg = "timeout/abort"
 		}
 		r.Error = &msg
+		r.GenFault = NeverLeftTheGenerator(err)
 		r.LatencyMs = f.clock() - t0
 		return
 	}

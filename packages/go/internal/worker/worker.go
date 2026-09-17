@@ -552,15 +552,40 @@ func (w *Worker) flush(final bool) {
 // what bounds this loop is the channel, which the hot path never waits on.
 func (w *Worker) drainResults() int {
 	n := 0
+	// Generator faults are tallied here rather than on the request goroutine:
+	// this one is single-threaded, so the whole flush costs one shedMu
+	// acquisition instead of one per failure — and they arrive in storms.
+	var faults map[int64]int64
 	for {
 		select {
 		case j := <-w.results:
+			if j.Result.GenFault {
+				if faults == nil {
+					faults = make(map[int64]int64, 4)
+				}
+				faults[j.Result.TS/60_000*60_000]++
+			}
 			w.agg.Add(&j.Result)
 			fire.PutJob(j)
 			n++
 		default:
+			w.noteGenFaults(faults)
 			return n
 		}
+	}
+}
+
+// noteGenFaults attributes failures that never reached the target to the
+// minutes they happened in, so the window can disown them rather than
+// presenting them as the gateway's error rate.
+func (w *Worker) noteGenFaults(faults map[int64]int64) {
+	if len(faults) == 0 {
+		return
+	}
+	w.shedMu.Lock()
+	defer w.shedMu.Unlock()
+	for bts, n := range faults {
+		w.shedBucket(bts).GenFaults += n
 	}
 }
 

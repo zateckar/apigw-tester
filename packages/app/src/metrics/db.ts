@@ -99,6 +99,12 @@ export function openDb(path: string): DbHandle {
       -- measurements lost for requests that WERE served: the opposite
       -- diagnosis to dropped, and just as invalidating
       results_lost INTEGER NOT NULL DEFAULT 0,
+      -- requests issued that never reached the target: a refused connect, a
+      -- dial timeout, a name that would not resolve. Kept out of the gateway's
+      -- error rate and accounted here instead, because they are the
+      -- generator's failure and reporting them as the gateway's is a lie the
+      -- numbers cannot be walked back from
+      gen_faults INTEGER NOT NULL DEFAULT 0,
       target_sum REAL NOT NULL DEFAULT 0,
       ticks INTEGER NOT NULL DEFAULT 0
     );
