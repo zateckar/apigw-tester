@@ -53,8 +53,10 @@ COPY package.json ./
 # UI bundle baked in, served from the same process
 COPY --from=ui /repo/packages/ui/dist ./packages/app/public
 # Go load generator — the spawn path looks for packages/go/bin/gwtester-worker
-# (no .exe suffix on linux). Default LOADGEN_BACKEND is "go"; the image ships the
-# binary so that default is satisfied — set LOADGEN_BACKEND=ts to opt out.
+# (no .exe suffix on linux). This is the only supported generator and there is
+# no fallback: without this binary the container starts but refuses every run,
+# with the reason on the dashboard. (LOADGEN_BACKEND=ts selects an in-process
+# test fixture that cannot time connections — not a way to run this rig.)
 COPY --from=gobuild /out/gwtester-worker ./packages/go/bin/gwtester-worker
 # Go petstore — spawned by the app on SUT_PORT. Default SUT_BACKEND is "go"; the
 # image ships the binary so that default is satisfied — set SUT_BACKEND=ts to

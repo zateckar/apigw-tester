@@ -126,9 +126,12 @@ A load generator that cannot keep up makes the *gateway* look better: it issues 
 | `genFaults` | > 0.1 % of issued requests never reached the target | the connection was refused or timed out before the gateway saw them; this is the generator or the network between, and it is deliberately kept out of the gateway's error rate |
 | `resultsLost` | > 0 | the gateway served these and we failed to record them, so the percentiles cover a sample biased toward the quiet moments |
 | `cpuProcessPctMax` | > 85 % | the rig is competing with itself for CPU |
-| `eventLoopP99MsMax` | > 10 ms | only with `LOADGEN_BACKEND=ts`, where the control plane's event loop *is* the instrument |
+| `workerSchedP99MsMax` | > 2 ms | the generator's goroutine sat runnable this long before it could read the clock; that delay is added to TTFB and not to the backend's own clock, so it reads as non-backend time that never happened |
+| `eventLoopP99MsMax` | > 50 ms | only with `LOADGEN_BACKEND=ts`, where the control plane's event loop *is* the instrument |
 
-With the default Go backend the clock lives in the worker, so the window is judged on the worker's own goroutine scheduling latency (p99 > 2 ms) and its CPU share instead — the control plane times nothing and its event-loop delay is not evidence. See `VALIDITY_LIMITS` in `packages/shared/src/index.ts`, where each limit records the measurements it was set from.
+Exactly one of the last two applies to any window, and the report names which instrument it is quoting. With the Go worker the clock lives over there, so the control plane times nothing and its event-loop delay is not evidence — it used to be consulted anyway, and disqualified idle windows for the host's timer granularity. See `VALIDITY_LIMITS` in `packages/shared/src/index.ts`, where each limit records the measurements it was set from.
+
+**There is one load generator.** The Go worker is it. If its binary is missing or it fails to spawn, the rig refuses to start a run and says why, on the dashboard and as a `503` from `POST /api/run/start`. It does not fall back: the in-process TypeScript driver (`LOADGEN_BACKEND=ts`) is a **test fixture**, it cannot observe connection events at all — `connectMs` is null on every request it takes, so non-backend time silently absorbs socket acquisition — and its windows are judged against a different instrument. A rig that swaps instruments without saying so produces numbers that look identical and mean something else.
 
 `droppedRequests` is counted by the scheduler itself — tokens it wanted to spend and could not — so "8 rps target → 7.9 rps achieved" appears as a KPI instead of being silently invisible. A window that fails the gate cannot produce a pass verdict (see below).
 

@@ -38,8 +38,11 @@ const PKG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   fallback for when the binary is missing, and as the executable spec the Go
  *   port is checked against.
  *
- * Mirrors LOADGEN_BACKEND, including falling back to `ts` when the binary is
- * absent rather than refusing to start.
+ * Unlike LOADGEN_BACKEND, this still falls back to `ts` when the binary is
+ * absent. The asymmetry is deliberate but not obviously right: the load
+ * generator is the instrument and must never be swapped silently, while this is
+ * the thing being measured — but the in-process petstore does share the control
+ * plane's event loop, so its X-Server-Ms is not independent of it either.
  */
 export type SutBackend = "go" | "ts";
 

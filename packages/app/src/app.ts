@@ -510,10 +510,15 @@ export function buildApp(cfg: AppConfig): BuiltApp {
       const profile = sanitizeLoadProfile(await store.readProfile() ?? cfg.defaultProfile, cfg.defaultProfile);
       const gateway = sanitizeGwTargets(await store.readGateway() ?? runtime.defaultGateway, runtime.defaultGateway);
       const runId = `run-${Date.now()}`;
-      await store.recordRunStart(runId, profile);
       driver.setGw(gateway);
       driver.setProfile(profile);
+      // The run is recorded only once the generator has accepted it. There is
+      // no fallback generator, so a refusal here means no traffic will be
+      // issued at all, and a runs row for a run that never happened would show
+      // up in every report window it touched.
       const out = driver.start(runId);
+      if (!out.ok) return json(503, { error: out.error });
+      await store.recordRunStart(runId, profile);
       void runPolicies();
       return json(200, out);
       } finally { startingRun = false; }

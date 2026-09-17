@@ -1353,7 +1353,28 @@ export interface RunStatus {
    * the dashboard must say so rather than reporting "0% blocked" in red.
    */
   targetIsSelf: { rest: boolean; soap: boolean };
+  /**
+   * Which process generates the load. "go" is the only supported one; "ts" is a
+   * test fixture, reported so a window measured by it is never mistaken for a
+   * production measurement — it cannot see connection events at all, and its
+   * validity rests on the control plane's event loop rather than on the
+   * generator's scheduler.
+   */
+  backend: LoadgenBackend;
+  /**
+   * Why no load can be generated right now, or null.
+   *
+   * There used to be a silent fallback here: a missing or unstartable worker
+   * binary quietly handed generation to the in-process driver, and the run went
+   * ahead on a different instrument with a different validity story and no
+   * connection timing, with nothing in the UI to say so. A rig that changes
+   * instrument without telling anyone is worse than one that stops.
+   */
+  generatorError: string | null;
 }
+
+/** Which process generates the load. Only "go" is supported; see RunStatus. */
+export type LoadgenBackend = "ts" | "go";
 
 export interface RunCounters {
   sent: number;

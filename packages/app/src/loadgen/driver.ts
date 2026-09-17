@@ -3,6 +3,7 @@ import type {
   AggregateBatch,
   GwConfig,
   GwTargets,
+  LoadgenBackend,
   LoadProfile,
   LoadShedSample,
   RequestResult,
@@ -217,13 +218,25 @@ const THROTTLE_WARN_MS = 10_000;
 
 export type IngestFn = (batch: AggregateBatch) => { ingested: number } | Promise<{ ingested: number }>;
 
-/** Which load-generation backend the driver uses. Default "go" — measured
- *  ~10× cheaper CPU and ~10× tighter event-loop latency than in-process TS
- *  (the JS loop no longer touches requests, so its own stalls no longer
- *  inflate what it measures). Set LOADGEN_BACKEND=ts to opt back into the
- *  in-process driver, useful on hosts where the worker binary isn't built. */
-export type LoadgenBackend = "ts" | "go";
-
+/**
+ * Which process generates the load. "go" always, in production.
+ *
+ * LOADGEN_BACKEND=ts selects the in-process driver, which is a **test fixture**
+ * and not a supported way to run this rig. It exists because a few thousand
+ * lines of scheduler, scenario and outcome logic are worth exercising in-process
+ * where a test can reach into them, and because it is the reference the Go
+ * worker's behaviour is asserted against in driver.go.test.ts.
+ *
+ * It is not an alternative generator. It cannot observe connection events at
+ * all, so connectMs is null on every request it takes and non-backend time
+ * silently includes socket acquisition. It reads every clock on the same event
+ * loop it schedules on, so its own stalls land inside what it measures — which
+ * is why its windows are judged against the control plane's loop delay, a
+ * number whose floor on Windows is the 15.6ms system tick. And it costs roughly
+ * 10× the CPU per request.
+ *
+ * There is deliberately no automatic fallback to it. See Driver.go().
+ */
 function readBackend(): LoadgenBackend {
   return process.env["LOADGEN_BACKEND"] === "ts" ? "ts" : "go";
 }
@@ -272,9 +285,11 @@ export class Driver {
   private droppedTokens = 0;          // load the cap kept us from issuing, per run
   private errLogBudget = 30; // log first N request errors per run
 
-  /** Resolved at construction; tests pin LOADGEN_BACKEND=ts explicitly.
-   *  Flips to "ts" if the worker binary is missing or fails to start. */
-  private backend: LoadgenBackend = readBackend();
+  /** Resolved at construction and never reassigned: tests pin
+   *  LOADGEN_BACKEND=ts explicitly, and nothing else may change instrument. */
+  private readonly backend: LoadgenBackend = readBackend();
+  /** Why the Go worker cannot generate load, or null. Never falls back. */
+  private generatorError: string | null = null;
   /** Control-plane client for the Go worker; created lazily on first use. */
   private goClient: GoWorkerClient | null = null;
   /** last status broadcast from the worker (arrives ~every 10s while running) */
@@ -333,16 +348,33 @@ export class Driver {
     this.goClient?.configure(this.gw, this.profile, this.sutUrl);
   }
 
-  /** Lazily create the Go worker control client and wire its events into the
-   *  plain Driver surface: batches arrive already rolled up by the worker and
-   *  land in ingestFn. */
+  /** Where the worker binary is, or null. A method rather than a direct call so
+   *  a test can stand in a missing binary without touching the filesystem —
+   *  refusing the run when it is absent is behaviour worth covering. */
+  protected workerBinary(): string | null {
+    return workerBinaryPath();
+  }
+
+  /**
+   * Lazily create the Go worker control client and wire its events into the
+   * plain Driver surface: batches arrive already rolled up by the worker and
+   * land in ingestFn.
+   *
+   * Returns null only when the TS fixture was explicitly selected. A Go backend
+   * that cannot be had records generatorError and returns null too — the caller
+   * must refuse the run rather than generate it some other way. Both failures
+   * used to silently switch this.backend to "ts": the run went ahead on an
+   * instrument that cannot time connections and whose stalls land inside its own
+   * measurements, and nothing anywhere said so. The numbers looked identical.
+   */
   private go(): GoWorkerClient | null {
     if (this.backend !== "go") return null;
-    if (workerBinaryPath() === null) {
-      // the image bakes the binary but a source checkout may not have it built;
-      // auto-fall back so LOADGEN_BACKEND=ts doesn't have to be remembered
-      console.warn("[driver] packages/go/bin/gwtester-worker is missing — falling back to in-process ts driver (build it under packages/go to use the default go backend)");
-      this.backend = "ts";
+    if (this.workerBinary() === null) {
+      // cleared on the next attempt: an operator who builds the binary and
+      // presses start again should not have to restart the process
+      this.generatorError =
+        "the load generator binary is missing (packages/go/bin/gwtester-worker) — " +
+        "build it with `go build -o bin/gwtester-worker ./cmd/gwtester-worker` in packages/go";
       return null;
     }
     if (!this.goClient) {
@@ -368,15 +400,33 @@ export class Driver {
           this.stoppedAt = null;
         }
       });
-      void client.ensureStarted().catch((e) => {
-        console.error("[driver] go worker failed to start — falling back to ts:", (e as Error).message);
-        this.goClient = null;
-        this.backend = "ts";
-      });
+      void client.ensureStarted().catch((e) => this.generatorFailed(e as Error));
       client.configure(this.gw, this.profile, this.sutUrl);
       this.goClient = client;
     }
     return this.goClient;
+  }
+
+  /**
+   * The worker could not be spawned, or died on the way up.
+   *
+   * Spawning is async, so this can land after start() has already answered the
+   * API. End the run here: a dashboard showing "running" against a generator
+   * that does not exist is the one outcome worse than refusing up front, and
+   * there is nothing else to hand the load to.
+   */
+  private generatorFailed(e: Error): void {
+    this.generatorError = `the load generator failed to start: ${e.message}`;
+    console.error(`[driver] ${this.generatorError}`);
+    this.goClient = null;
+    if (this.goStopTimer) { clearTimeout(this.goStopTimer); this.goStopTimer = null; }
+    if (this.durationTimer) { clearTimeout(this.durationTimer); this.durationTimer = null; }
+    if (this.state !== "idle") {
+      this.state = "idle";
+      this.runId = null;
+      this.startedAt = null;
+      this.stoppedAt = null;
+    }
   }
 
   /** Wire the ingest function (in-process, called from the metrics module). */
@@ -398,25 +448,33 @@ export class Driver {
   // it, and the go path starts a child process whose readiness this will need
   // to wait on again
   async init(): Promise<void> {
-    if (this.go()) {
-      // the flush timer exists only for the ts backend: the worker streams its
+    if (this.backend === "go") {
+      // the flush timer exists only for the ts fixture: the worker streams its
       // own batches and pushes them as events instead
+      if (this.go() === null) console.error(`[driver] ${this.generatorError}`);
       return;
     }
+    console.warn(
+      "[driver] LOADGEN_BACKEND=ts — generating load in-process. This is a test fixture, " +
+      "not a supported configuration: connection timing is unavailable, and this process's " +
+      "own scheduling delay lands inside every measurement it takes."
+    );
     this.flushTimer = setInterval(() => void this.flush(), FLUSH_MS);
     this.flushTimer.unref?.();
   }
 
-  start(runId: string): { ok: true; runId: string } {
-    const goClient = this.go();
-    if (goClient) {
+  start(runId: string): { ok: true; runId: string } | { ok: false; error: string } {
+    if (this.backend === "go") {
+      this.generatorError = null;   // a rebuilt binary must be picked up here
+      const goClient = this.go();
+      if (goClient === null) return { ok: false, error: this.generatorError ?? "the load generator is unavailable" };
       if (this.state === "running") return { ok: true, runId: this.runId ?? runId };
       // a stop still waiting on its ack is superseded by this run
       if (this.goStopTimer) { clearTimeout(this.goStopTimer); this.goStopTimer = null; }
       void goClient.ensureStarted().then(() => {
         goClient.configure(this.gw, this.profile, this.sutUrl);
         goClient.start(runId);
-      });
+      }).catch((e) => this.generatorFailed(e as Error));
       this.state = "running";
       this.runId = runId;
       this.startedAt = Date.now();
@@ -926,7 +984,9 @@ export class Driver {
           invalidLeaked: s?.invalidLeaked ?? 0
         },
         gateway: this.currentGw,
-        targetIsSelf: { rest: this.isSelf(this.gw.rest), soap: this.isSelf(this.gw.soap) }
+        targetIsSelf: { rest: this.isSelf(this.gw.rest), soap: this.isSelf(this.gw.soap) },
+        backend: this.backend,
+        generatorError: this.generatorError
       };
     }
     return {
@@ -941,7 +1001,9 @@ export class Driver {
       effectiveMaxConcurrency: this.effectiveMaxConcurrency,
       throttledSinceMs: this.state === "running" ? this.throttledSinceMs : null,
       counters: { ...this.counters },
-      targetIsSelf: { rest: this.isSelf(this.gw.rest), soap: this.isSelf(this.gw.soap) }
+      targetIsSelf: { rest: this.isSelf(this.gw.rest), soap: this.isSelf(this.gw.soap) },
+      backend: this.backend,
+      generatorError: this.generatorError
     };
   }
 

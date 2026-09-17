@@ -1,6 +1,7 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { LIMITS, MEASUREMENT_VERSION, type AggregateBatch } from "@apigw/shared";
 import { Driver, THROTTLE_TICKS_TO_WARN } from "./driver.js";
+import { GoWorkerClient } from "./goClient.js";
 
 // The default backend flipped to "go" once the worker shipped; these tests
 // exercise the in-process driver's internals directly and must not switch.
@@ -12,6 +13,77 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const ingestedCount = (b: AggregateBatch): number => b.cells.reduce((n, c) => n + c.count, 0);
 /** reach into the driver's internals to simulate in-flight state */
 const priv = (d: Driver) => d as unknown as Record<string, any>;
+
+describe("no fallback generator", () => {
+  // The in-process driver used to be what a missing or unstartable worker
+  // binary silently fell back to. It cannot observe connection events, so
+  // connectMs is null on every request it takes and non-backend time quietly
+  // absorbs socket acquisition; and it reads every clock on the loop it
+  // schedules on, so its windows are judged against a different instrument.
+  // Switching to it without saying so produced numbers that looked identical
+  // and meant something else.
+
+  it("refuses the run when the worker binary is missing, and says how to build it", () => {
+    const d = new Driver();
+    priv(d).backend = "go";
+    priv(d).workerBinary = () => null;
+
+    const out = d.start("run-nobinary");
+    expect(out.ok).toBe(false);
+    expect((out as { error: string }).error).toContain("gwtester-worker");
+    expect((out as { error: string }).error).toContain("go build");
+    // and nothing is generated: no run, no state change, no traffic
+    expect(priv(d).state).toBe("idle");
+    expect(priv(d).tickTimer).toBeNull();
+    expect(d.status().backend).toBe("go");
+    expect(d.status().generatorError).toContain("missing");
+  });
+
+  it("retries the binary on the next start instead of latching the failure", () => {
+    // an operator who reads the message, builds the worker and presses start
+    // again must not have to restart the process to be believed
+    const d = new Driver();
+    priv(d).backend = "go";
+    priv(d).workerBinary = () => null;
+    expect(d.start("run-1").ok).toBe(false);
+
+    priv(d).workerBinary = () => "C:/fake/gwtester-worker.exe";
+    const go = {
+      ensureStarted: async () => {}, configure: () => {}, start: () => {}, stop: () => {}, shutdown: async () => {}
+    };
+    priv(d).go = () => go;
+    expect(d.start("run-2").ok).toBe(true);
+    expect(d.status().generatorError).toBeNull();
+  });
+
+  it("ends the run when the worker fails to start after start() already said yes", async () => {
+    // spawning is async, so the failure can land after the API has answered.
+    // Leaving the dashboard on "running" against a generator that does not
+    // exist is the one outcome worse than refusing up front.
+    const d = new Driver();
+    priv(d).backend = "go";
+    priv(d).workerBinary = () => "C:/fake/gwtester-worker.exe";
+    const spy = spyOn(GoWorkerClient.prototype, "ensureStarted")
+      .mockImplementation(() => Promise.reject(new Error("exec format error")));
+    try {
+      const out = d.start("run-doomed");
+      expect(out.ok).toBe(true);          // nothing has failed yet
+      await sleep(50);                    // the spawn rejection lands
+      expect(d.status().state).toBe("idle");
+      expect(d.status().runId).toBeNull();
+      expect(d.status().generatorError).toContain("exec format error");
+    } finally {
+      spy.mockRestore();
+      await d.shutdown();
+    }
+  });
+
+  it("reports which process generated the load, so a fixture window is never mistaken for a real one", () => {
+    const d = new Driver();
+    expect(d.status().backend).toBe("ts");   // this file pins LOADGEN_BACKEND=ts
+    expect(d.status().generatorError).toBeNull();
+  });
+});
 
 describe("Driver.stop() drain", () => {
   it("waits for in-flight requests regardless of how long the run has been going", async () => {
@@ -554,6 +626,9 @@ describe("Driver bounded runs", () => {
       stop: () => {},
       shutdown: async () => {}
     };
+    // this file pins LOADGEN_BACKEND=ts; the Go path is now chosen up front and
+    // never switched, so both the backend and its client have to be stubbed
+    priv(d).backend = "go";
     priv(d).go = () => go;
     // one-hundredth of a minute is 600ms — long enough to prove the watchdog
     // fires, short enough to not stall the suite

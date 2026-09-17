@@ -296,6 +296,26 @@ export default function App() {
         </div>
       )}
 
+      {/* No run can be started at all. There is no second generator to quietly
+          switch to, and a rig that changes instrument without saying so is
+          worse than one that stops. */}
+      {status?.generatorError && (
+        <div className="banner err" role="alert">
+          <strong>No load generator.</strong> {status.generatorError}
+        </div>
+      )}
+
+      {/* The in-process driver is a test fixture: it cannot time connections,
+          and its own scheduling delay lands inside what it measures. */}
+      {status?.backend === "ts" && (
+        <div className="banner err" role="alert">
+          <strong>Running on the in-process test fixture (LOADGEN_BACKEND=ts).</strong>{" "}
+          Connection setup is not measured and is included in non-backend time, and this
+          process&rsquo;s own scheduling delay is inside every number below. Not a supported
+          configuration — unset LOADGEN_BACKEND to use the Go worker.
+        </div>
+      )}
+
       {/* The generator, not the gateway, may be the story. Say so before the
           reader has drawn any conclusions from the percentiles below. */}
       {validity && !validity.ok && (
