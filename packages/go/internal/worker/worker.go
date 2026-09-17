@@ -65,8 +65,10 @@ const MaxShedBuckets = 2_000
 // DrainTimeout bounds how long stop waits for in-flight requests.
 const DrainTimeout = 5 * time.Second
 
-// LatencyAllowanceSec mirrors LATENCY_ALLOWANCE_SEC: Little's law allowance
-// used to size the effective concurrency ceiling.
+// LatencyAllowanceSec mirrors LATENCY_ALLOWANCE_SEC: the Little's law
+// allowance used to *advise* on the concurrency ceiling, not to set it. The
+// configured ceiling is honoured; a target rate it cannot sustain shows up as
+// shed load, which is reported.
 const LatencyAllowanceSec = 5
 
 // LimitMaxConcurrency mirrors LIMITS.maxConcurrency.
@@ -227,11 +229,11 @@ func (w *Worker) Start(runID string) {
 	w.resultsLostSeen = 0 // counters.Reset zeroed the source above
 	w.shedMu.Unlock()
 
-	need := int64(math.Ceil(schedule.PeakTargetRPS(&w.profile) * LatencyAllowanceSec))
+	// The configured ceiling, clamped only by the system limit. See
+	// LatencyAllowanceSec: this used to be max(configured, rps*5), which made
+	// the operator's ceiling a floor and let a slow target drag thousands of
+	// sockets into the generator on a host that could not carry them.
 	eff := int64(w.profile.MaxConcurrency)
-	if need > eff {
-		eff = need
-	}
 	if eff > LimitMaxConcurrency {
 		eff = LimitMaxConcurrency
 	}
@@ -239,6 +241,11 @@ func (w *Worker) Start(runID string) {
 		eff = 1
 	}
 	w.effectiveMaxConcurrency = int(eff)
+	if advised := int64(math.Ceil(schedule.PeakTargetRPS(&w.profile) * LatencyAllowanceSec)); advised > eff {
+		fmt.Fprintf(os.Stderr,
+			"[worker] maxConcurrency %d may cap throughput below the %.0f rps target: sustaining it needs ~%d in flight at %ds latency\n",
+			eff, schedule.PeakTargetRPS(&w.profile), advised, LatencyAllowanceSec)
+	}
 	w.sem = make(chan struct{}, w.effectiveMaxConcurrency)
 
 	w.reference.Reset()

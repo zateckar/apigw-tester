@@ -219,9 +219,22 @@ const MAX_TRACKED_IDS = 2_000;
 const MAX_INGEST_ATTEMPTS = 3;
 /** per-minute scheduler buckets held before a flush; bounded like the spool */
 const MAX_SHED_BUCKETS = 2_000;
-/** raise the concurrency ceiling to hold 5s worth of peak load: Little's law
- *  (rate × latency) says that is how much in-flight the target rate needs at
- *  5s mean latency — generous, most targets answer far faster */
+/**
+ * Latency allowance used to *advise* on the concurrency ceiling.
+ *
+ * Little's law: sustaining a rate needs rate × latency in flight, so a ceiling
+ * below that caps throughput at ceiling / latency. This number turns a target
+ * rate into the in-flight figure that rate would need at a generous 5s mean
+ * latency, which is what the run-start advisory quotes.
+ *
+ * It used to size the ceiling directly, overriding the operator: the effective
+ * cap was max(profile.maxConcurrency, rps × 5), so a configured 300 became
+ * 5,000 at a 1,000 rps target. That turned the one knob protecting a small host
+ * into a floor, and on a 2 vCPU box a slow target then pulled thousands of
+ * concurrent sockets into the generator until it fell over — the ceiling only
+ * binds when the target is slow, which is exactly when it is needed. The
+ * operator's number is now honoured and the advice is printed instead.
+ */
 const LATENCY_ALLOWANCE_SEC = 5;
 /** how long the concurrency cap must stay saturated before it is reported —
  *  a duration, not a tick count, so changing the scheduler cadence does not
@@ -569,17 +582,17 @@ export class Driver {
     // the creds are constant for the run; refresh them here instead of per request
     this.authHeader = expectedAuthHeader()?.toString("utf-8") ?? null;
 
-    // Little's law: sustaining a rate needs rps × latency in flight, so a low
-    // maxConcurrency silently caps throughput at maxConcurrency / latency —
-    // the shipped default of 25 reaches only ~65 rps against a 385ms target.
-    // Treat the profile value as a floor and size the real ceiling for the
-    // peak rate, with 5s of latency as a generous allowance.
-    const need = Math.ceil(peakTargetRps(this.profile) * LATENCY_ALLOWANCE_SEC);
-    this.effectiveMaxConcurrency = Math.min(LIMITS.maxConcurrency, Math.max(this.profile.maxConcurrency, need));
-    if (this.effectiveMaxConcurrency > this.profile.maxConcurrency) {
+    // The configured ceiling, clamped only by the system limit. Advise when it
+    // is too small for the target rate rather than overriding it: a ceiling the
+    // operator did not choose is not a safety limit, and the shortfall it
+    // causes is already reported as shed load.
+    this.effectiveMaxConcurrency = Math.min(LIMITS.maxConcurrency, Math.max(1, this.profile.maxConcurrency));
+    const advised = Math.ceil(peakTargetRps(this.profile) * LATENCY_ALLOWANCE_SEC);
+    if (advised > this.effectiveMaxConcurrency) {
       console.log(
-        `[driver] auto-raised maxConcurrency ${this.profile.maxConcurrency} -> ${this.effectiveMaxConcurrency}` +
-        ` for rps target ${Math.round(peakTargetRps(this.profile))}`
+        `[driver] maxConcurrency ${this.effectiveMaxConcurrency} may cap throughput below the ` +
+        `${Math.round(peakTargetRps(this.profile))} rps target: sustaining it needs ~${advised} in flight at ` +
+        `${LATENCY_ALLOWANCE_SEC}s latency (fewer if the target is faster). Shed load is reported either way.`
       );
     }
 

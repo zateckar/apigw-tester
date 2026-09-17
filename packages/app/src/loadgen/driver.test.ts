@@ -686,13 +686,18 @@ describe("Driver.status()", () => {
 });
 
 describe("Driver concurrency ceiling", () => {
-  it("auto-raises maxConcurrency to hold 5s of the target rate", async () => {
+  it("honours the configured ceiling even when it cannot sustain the rate", async () => {
+    // This used to auto-raise to rps × 5 = 2,500, which turned the operator's
+    // safety limit into a floor. A ceiling only ever binds when the target is
+    // slow — which is precisely when a small host needs it — so overriding it
+    // removed the brake at the only moment it mattered. The shortfall is
+    // reported as shed load rather than engineered away.
     const d = new Driver();
     d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 25 });
     d.start("run-scale");
-    expect(priv(d).effectiveMaxConcurrency).toBe(2500);
+    expect(priv(d).effectiveMaxConcurrency).toBe(25);
     const s = d.status();
-    expect(s.effectiveMaxConcurrency).toBe(2500);
+    expect(s.effectiveMaxConcurrency).toBe(25);
     expect(s.throttledSinceMs).toBeNull();
     await d.shutdown();
   });
@@ -707,7 +712,7 @@ describe("Driver concurrency ceiling", () => {
 
   it("never exceeds LIMITS.maxConcurrency", async () => {
     const d = new Driver();
-    d.setProfile({ mode: "constant", rps: 10_000, maxConcurrency: 25 });
+    d.setProfile({ mode: "constant", rps: 10_000, maxConcurrency: LIMITS.maxConcurrency * 10 });
     d.start("run-huge");
     expect(priv(d).effectiveMaxConcurrency).toBe(LIMITS.maxConcurrency);
     await d.shutdown();
@@ -715,7 +720,10 @@ describe("Driver concurrency ceiling", () => {
 
   it("flags sustained saturation as throttled and counts the dropped load", async () => {
     const d = new Driver();
-    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 25 });
+    // 2,500 is now the operator's choice rather than something the driver
+    // arrived at on its own; the ceiling has to exceed the stub's per-tick
+    // demand or the recovery step below can never find headroom
+    d.setProfile({ mode: "constant", rps: 500, maxConcurrency: 2500 });
     d.start("run-throttle");
     const bucket = priv(d).bucket as { tick: (nowMs: number, p: unknown, s: number) => { due: number; targetRps: number } };
     const origTick = bucket.tick.bind(bucket);
