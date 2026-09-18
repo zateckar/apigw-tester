@@ -51,6 +51,12 @@ export interface GoStatusMsg {
   dropped: number;
   /** measurements discarded after the request was served */
   resultsLost: number;
+  /** the ceiling this run applies: the operator's number clamped by
+   *  LIMITS.maxConcurrency. Only the worker knows it — the control plane used
+   *  to report its own default here, so a configured 500 read as 25. */
+  effectiveMaxConcurrency: number;
+  /** epoch ms since the ceiling started continuously refusing load, 0 if not */
+  throttledSinceMs: number;
 }
 
 interface OutMsg {

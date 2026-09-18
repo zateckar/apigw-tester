@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { buildApp, repointStrandedSelfTargets } from "./app.js";
 import { readConfig } from "./config.js";
+import { TestDriver } from "./loadgen/testDriver.js";
 import { DEFAULT_GW_CONFIG, type GwTargets } from "@apigw/shared";
 
 // These tests are about one failure: the rig pointed at a host that is up and
@@ -8,7 +9,6 @@ import { DEFAULT_GW_CONFIG, type GwTargets } from "@apigw/shared";
 // while nothing in the UI looks broken.
 
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
-process.env["LOADGEN_BACKEND"] = "ts";
 const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 const targets = (baseUrl: string, pathPrefix = ""): GwTargets => ({
@@ -83,7 +83,7 @@ describe("the gateway target the dashboard is handed", () => {
       dbPath: ":memory:",
       publicDir: "nope",
       defaultGateway: targets(sutUrl)
-    });
+    }, { driver: new TestDriver() });
     server = built.listen(0);
     base = `http://127.0.0.1:${server.port}`;
   });
@@ -127,7 +127,7 @@ describe("the gateway test button", () => {
         ? new Response("ok")
         : new Response("not found", { status: 404 })
     });
-    built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
+    built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" }, { driver: new TestDriver() });
     server = built.listen(0);
     base = `http://127.0.0.1:${server.port}`;
   });

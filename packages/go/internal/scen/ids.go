@@ -9,8 +9,8 @@ import (
 const MaxTrackedIDs = 2_000
 
 // IDTracker tracks pet ids this run created, so deletePet removes real pets.
-// It mirrors the ceremony in the TS driver: swap-with-last-pick removal,
-// fallback to a high id (which will 404) when nothing has been created.
+// Swap-with-last-pick removal, and a fallback to a high id (which will 404)
+// when nothing has been created yet.
 type IDTracker struct {
 	mu        sync.Mutex
 	created   []int

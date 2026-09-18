@@ -127,11 +127,11 @@ A load generator that cannot keep up makes the *gateway* look better: it issues 
 | `resultsLost` | > 0 | the gateway served these and we failed to record them, so the percentiles cover a sample biased toward the quiet moments |
 | `cpuProcessPctMax` | > 85 % | the rig is competing with itself for CPU |
 | `workerSchedP99MsMax` | > 2 ms | the generator's goroutine sat runnable this long before it could read the clock; that delay is added to TTFB and not to the backend's own clock, so it reads as non-backend time that never happened |
-| `eventLoopP99MsMax` | > 50 ms | only with `LOADGEN_BACKEND=ts`, where the control plane's event loop *is* the instrument |
+| `eventLoopP99MsMax` | > 50 ms | fallback only, for a window no worker reported health for — then this loop is the one reading available |
 
-Exactly one of the last two applies to any window, and the report names which instrument it is quoting. With the Go worker the clock lives over there, so the control plane times nothing and its event-loop delay is not evidence — it used to be consulted anyway, and disqualified idle windows for the host's timer granularity. See `VALIDITY_LIMITS` in `packages/shared/src/index.ts`, where each limit records the measurements it was set from.
+Exactly one of the last two applies to any window, and the report names which instrument it is quoting. Normally it is the worker: the clock lives over there, so the control plane times nothing and its event-loop delay is not evidence — it used to be consulted anyway, and disqualified idle windows for the host's timer granularity. See `VALIDITY_LIMITS` in `packages/shared/src/index.ts`, where each limit records the measurements it was set from.
 
-**There is one load generator.** The Go worker is it. If its binary is missing or it fails to spawn, the rig refuses to start a run and says why, on the dashboard and as a `503` from `POST /api/run/start`. It does not fall back: the in-process TypeScript driver (`LOADGEN_BACKEND=ts`) is a **test fixture**, it cannot observe connection events at all — `connectMs` is null on every request it takes, so non-backend time silently absorbs socket acquisition — and its windows are judged against a different instrument. A rig that swaps instruments without saying so produces numbers that look identical and mean something else.
+**There is one load generator.** The Go worker is it. If its binary is missing or it fails to spawn, the rig refuses to start a run and says why, on the dashboard and as a `503` from `POST /api/run/start`. There is no fallback and no second implementation to fall back to: a rig that swaps instruments without saying so produces numbers that look identical and mean something else. `packages/app/src/loadgen/` is now the control plane for that worker — configure it, start it, stop it, report what it says — plus the scenario definitions the Go port mirrors and the petstore contract tests use as fixtures.
 
 `droppedRequests` is counted by the scheduler itself — tokens it wanted to spend and could not — so "8 rps target → 7.9 rps achieved" appears as a KPI instead of being silently invisible. A window that fails the gate cannot produce a pass verdict (see below).
 
@@ -236,12 +236,13 @@ and from the Docker context.
 |---|---|---|
 | Petstore SUT | `packages/app/src/petstore/` | REST CRUD + SOAP; per-endpoint latency distributions, response padding, optional chaos via `/admin/*`. Stress endpoints: `GET /api/big/:size`, `GET /api/slow/:ms`, `POST /api/echo`. Bounded in-memory store with FIFO eviction and a per-status index, so the SUT does not slow down over a long run |
 | API contract | `packages/app/src/petstore/openapi.ts`, `soap.ts` | Hand-written OpenAPI 3.0.3 + WSDL, served as downloads and asserted against the live routes in `contract.test.ts` |
-| Load driver | `packages/app/src/loadgen/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily / real`; weighted scenario + stress-class mix. Every request it issues goes through the gateway — there is no second stream |
+| Load generator | `packages/go/` | Token-bucket scheduler; modes `constant / ramp / spike / sine-daily / real`; weighted scenario + stress-class mix. Every request it issues goes through the gateway — there is no second stream |
+| Control plane | `packages/app/src/loadgen/` | Spawns and configures the worker, holds the run lifecycle, reports what the worker says. Generates no traffic itself |
 | Metrics store | `packages/app/src/metrics/` | `bun:sqlite` (no native deps), WAL mode, transactional ingest, 24h raw ring + minute + hour histogram roll-ups with per-class use |
 | Dashboard | `packages/ui/` | React 18 + Recharts + TanStack Query, dark theme; "non-backend time" is the headline metric |
 | Status dimension | `packages/shared/` (`STATUS_BUCKETS`) | Every response is bucketed by status, so 401/403/429 and 502/503/504 are visible instead of folded away — see below |
 | Policy probes | `packages/app/src/loadgen/policy.ts` | Eight deliberate probes (auth, quota, payload cap, upstream timeout, cache, route allowlist, CORS) with `pass` / `not-enforced` / `fail` / `error` outcomes |
-| Validity gate | `packages/app/src/metrics/server.ts` (`validityFor`) | Load shed, lost measurements, connect failures, and saturation **of the process that held the stopwatch** — the Go worker's goroutine scheduling p99, or the control plane's event loop when the in-process driver generated the run. A window the rig could not honestly measure is marked as such |
+| Validity gate | `packages/app/src/metrics/server.ts` (`validityFor`) | Load shed, lost measurements, connect failures, and saturation **of the process that held the stopwatch** — the Go worker's goroutine scheduling p99, falling back to the control plane's event loop only for a window no worker health covered. A window the rig could not honestly measure is marked as such |
 | Run report | `packages/app/src/report.ts` | Per-run JSON + Markdown with a `pass` / `fail` / `inconclusive` verdict against configured SLOs, API keys redacted |
 | Shared types | `packages/shared/` | Types **and** the config sanitizers the server, driver and UI all share |
 

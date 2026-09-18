@@ -19,7 +19,7 @@ func capRPS(n float64) float64 {
 
 // RealTrafficShaper holds the slow state for mode "real": a randomised
 // day-cycle phase, a mean-reverting noise level, and the last tick time. The
-// TokenBucket owns it, mirroring the TS scheduler.
+// TokenBucket owns it, so the drift advances exactly once per tick.
 type RealTrafficShaper struct {
 	phase      float64
 	noiseLevel float64
@@ -56,9 +56,9 @@ func (s *RealTrafficShaper) TargetRPS(nowMs float64, p *config.LoadProfile) floa
 	return math.Max(0, curveRps*s.noiseLevel*jitter)
 }
 
-// TargetRPSAt computes the profile's target rate at a point in time,
-// mirroring targetRpsAt in the TS scheduler. shaper may be nil for mode
-// "real", in which case the base curve is reported without advancing drift.
+// TargetRPSAt computes the profile's target rate at a point in time. shaper
+// may be nil for mode "real", in which case the base curve is reported without
+// advancing drift.
 func TargetRPSAt(p *config.LoadProfile, nowMs, startedAtMs float64, shaper *RealTrafficShaper) float64 {
 	switch p.Mode {
 	case "constant", "":
@@ -99,7 +99,7 @@ func TargetRPSAt(p *config.LoadProfile, nowMs, startedAtMs float64, shaper *Real
 }
 
 // PeakTargetRPS is the highest rate a profile can plausibly target; used to
-// size the concurrency ceiling, mirroring peakTargetRps in the TS scheduler.
+// size the concurrency ceiling.
 func PeakTargetRPS(p *config.LoadProfile) float64 {
 	switch p.Mode {
 	case "constant", "":

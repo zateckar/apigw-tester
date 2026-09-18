@@ -28,7 +28,8 @@ func NormalizeBase(u string) string {
 }
 
 // URLPrefixFor returns "base without trailing slashes" plus the optional path
-// prefix, in one precomputed string, mirroring urlPrefixFor in the TS driver.
+// prefix, in one precomputed string. Precomputed because it is the same for
+// every request of a run and it is on the per-request path.
 func URLPrefixFor(g GwConfig) string {
 	base := NormalizeBase(g.BaseURL)
 	p := strings.Trim(strings.TrimSpace(g.PathPrefix), "/")
@@ -39,7 +40,10 @@ func URLPrefixFor(g GwConfig) string {
 }
 
 // SendsBasicAuth decides whether the given target may carry the rig's own
-// Authorization: Basic header — mirroring sendsOurCredential in the TS driver.
+// Authorization: Basic header. This is the rule the load actually obeys; the
+// control plane's sendsOurCredential (packages/app/src/loadgen/driver.ts) is
+// the same decision applied to the policy probes, and the two must agree or a
+// probe describes a path the traffic does not take.
 func SendsBasicAuth(g GwConfig, selfOrigin string) bool {
 	switch g.ForwardBasicAuth {
 	case ForwardAlways:

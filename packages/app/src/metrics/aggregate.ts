@@ -182,9 +182,11 @@ class Aggregator {
 /**
  * Roll a raw batch up in one pass.
  *
- * Used by the in-process driver at flush time and by the store to accept the
- * public `/api/ingest` shape, so there is exactly one code path that turns
- * requests into rows however they arrived.
+ * Used by the store to accept the public `/api/ingest` shape, and by the tests
+ * that build a batch by hand, so there is exactly one code path that turns
+ * requests into rows however they arrived. The worker rolls up on its own side
+ * and sends the result of this shape, which is why it is worth one function
+ * rather than inlining it at the one remaining caller.
  */
 export function aggregateBatch(batch: IngestBatch): AggregateBatch {
   if (!batch || !Array.isArray(batch.results) || typeof batch.batchId !== "string" || batch.batchId === "") {

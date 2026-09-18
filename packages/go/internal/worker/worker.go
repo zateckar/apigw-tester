@@ -37,7 +37,7 @@ import (
 // at the granularity the OS timer can actually honour, and 1000 wakeups a
 // second is nothing on a goroutine that is not the one taking measurements.
 // The bucket measures real elapsed time, so a late tick is absorbed rather than
-// accumulated. The TS driver deliberately runs coarser — see TICK_MS there.
+// accumulated.
 const TickMS = 1
 
 // FlushInterval is the results-batch cadence. One second, so the dashboard's
@@ -68,6 +68,14 @@ const LatencyAllowanceSec = 5
 
 // LimitMaxConcurrency mirrors LIMITS.maxConcurrency.
 const LimitMaxConcurrency = 5_000
+
+// ThrottleWarnAfterMS is how long the concurrency ceiling must stay saturated
+// before the run is reported as throttled. A duration rather than a tick count,
+// so changing TickMS does not silently change how twitchy the signal is.
+const ThrottleWarnAfterMS = 200
+
+// ThrottleTicksToWarn is that duration in ticks.
+const ThrottleTicksToWarn = ThrottleWarnAfterMS / TickMS
 
 // Params are the worker's construction-time dependencies.
 type Params struct {
@@ -101,6 +109,10 @@ type Worker struct {
 	effectiveMaxConcurrency int
 	sem                     chan struct{} // buffered semaphore for the cap
 	targetRps               atomic.Value  // float64
+	// throttleTicks is tick-goroutine-local; throttledSinceMs is read by the
+	// status goroutine, so it is atomic. 0 means "not throttled".
+	throttleTicks    int
+	throttledSinceMs atomic.Int64
 
 	bucket  *schedule.TokenBucket
 	reaper  *schedule.Reaper
@@ -111,7 +123,8 @@ type Worker struct {
 
 	counters Counters
 
-	// shed accounting per minute bucket (mirrors the TS shed map)
+	// shed accounting per minute bucket, so a validity gate can name the
+	// minute in which load was refused rather than the whole run
 	shedMu sync.Mutex
 	shed   map[int64]*wire.LoadShedSample
 	// counters.ResultsLost already attributed to a minute bucket; guarded by
@@ -215,6 +228,8 @@ func (w *Worker) Start(runID string) {
 	w.counters.Reset()
 	w.bucket = schedule.NewTokenBucket()
 	w.reqIDs.Reset()
+	w.throttleTicks = 0
+	w.throttledSinceMs.Store(0)
 	w.shedMu.Lock()
 	w.shed = map[int64]*wire.LoadShedSample{}
 	w.resultsLostSeen = 0 // counters.Reset zeroed the source above
@@ -284,8 +299,9 @@ func (w *Worker) Stop() {
 	select {
 	case <-done:
 	case <-time.After(time.Until(deadline)):
-		// leaked requests are counted in the flush as they land; proceeding is
-		// the TS driver's behaviour after its drain timeout
+		// leaked requests are still counted in the flush as they land, so
+		// proceeding loses no measurement — and blocking here instead would
+		// wedge the run on a target that never answers
 	}
 	w.flush(true)
 	// the final tally, after the drain: without it the last status is up to
@@ -353,6 +369,10 @@ func (w *Worker) tick() bool {
 
 	due := res.Due
 	dropped := int64(res.Missed)
+	// capped counts only what the ceiling refused, separately from the token
+	// bucket's own missed ticks: the ceiling binding and the scheduler running
+	// behind are different diagnoses and only the first is throttling.
+	capped := 0
 	for i := 0; i < due; i++ {
 		select {
 		case w.sem <- struct{}{}:
@@ -361,13 +381,31 @@ func (w *Worker) tick() bool {
 			go w.execute(runID, &profile)
 		default:
 			dropped++
+			capped++
 		}
 	}
 	if dropped > 0 {
 		w.counters.Dropped.Add(dropped)
 		w.noteShed(nowMs, dropped)
 	}
+	w.noteThrottle(nowMs, capped > 0)
 	return true
+}
+
+// noteThrottle tracks how long the concurrency ceiling has been continuously
+// refusing load. One full semaphore is normal at any rate; a sustained one is
+// the ceiling capping throughput below the target, which is a fact about this
+// rig's configuration rather than about the gateway.
+func (w *Worker) noteThrottle(nowMs int64, capped bool) {
+	if !capped {
+		w.throttleTicks = 0
+		w.throttledSinceMs.Store(0)
+		return
+	}
+	w.throttleTicks++
+	if w.throttleTicks == ThrottleTicksToWarn {
+		w.throttledSinceMs.Store(nowMs)
+	}
 }
 
 // execute is one in-flight request, from build to result enqueue.
@@ -407,7 +445,7 @@ func (w *Worker) execute(runID string, profile *config.LoadProfile) {
 
 	w.firer.Fire(j)
 
-	// counters — the same classification the TS driver applies
+	// counters — the classification the dashboard's headline numbers read
 	w.counters.Sent.Add(1)
 	if spec.ExpectInvalid {
 		w.counters.InvalidSent.Add(1)
@@ -590,7 +628,7 @@ func uuidV4() string {
 		hex.EncodeToString(b[6:8]) + "-" + hex.EncodeToString(b[8:10]) + "-" + hex.EncodeToString(b[10:16])
 }
 
-// ------- shed accounting (mirrors the TS driver) -------
+// ------- shed accounting -------
 
 func (w *Worker) shedBucket(nowMs int64) *wire.LoadShedSample {
 	bts := nowMs / 60_000 * 60_000
@@ -680,6 +718,7 @@ func (w *Worker) statusLoop() {
 func (w *Worker) emitStatus() {
 	w.mu.Lock()
 	runID := w.runID
+	eff := w.effectiveMaxConcurrency
 	w.mu.Unlock()
 	target, _ := w.targetRps.Load().(float64)
 	w.params.Emitter.Status(wire.StatusMsg{
@@ -698,6 +737,8 @@ func (w *Worker) emitStatus() {
 		TargetRps:                target,
 		Dropped:                  w.counters.Dropped.Load(),
 		ResultsLost:              w.counters.ResultsLost.Load(),
+		EffectiveMaxConcurrency:  eff,
+		ThrottledSinceMs:         w.throttledSinceMs.Load(),
 	})
 }
 

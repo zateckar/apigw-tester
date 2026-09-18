@@ -76,6 +76,20 @@ func TestSineDailyBounds(t *testing.T) {
 	}
 }
 
+// A profile whose mode this build does not know about must still generate
+// load at the configured rate rather than falling to zero. The operator can
+// save an arbitrary string, and an older binary reading a newer profile is the
+// ordinary way that happens.
+func TestUnknownModePacesLikeConstant(t *testing.T) {
+	p := &config.LoadProfile{Mode: "no-such-mode", RPS: fp(42), MaxConcurrency: 10}
+	if got := TargetRPSAt(p, 5_000, 0, nil); got != 42 {
+		t.Fatalf("unknown mode target: %v, want 42", got)
+	}
+	if got := PeakTargetRPS(p); got != 42 {
+		t.Fatalf("unknown mode peak: %v, want 42", got)
+	}
+}
+
 func TestPeakTargetRPS(t *testing.T) {
 	if PeakTargetRPS(&config.LoadProfile{Mode: "constant", RPS: fp(42)}) != 42 {
 		t.Fatal("constant peak")

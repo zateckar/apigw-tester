@@ -219,11 +219,12 @@ export function createSystemSampler(opts: SystemSamplerOpts = {}): SystemSampler
   // more outliers, and p99 is indistinguishable from max here at ~100 samples
   // per interval, so neither is a lever. The floor is the platform's, not ours.
   //
-  // So this is only evidence when this process is the one holding the clock —
-  // the in-process TS driver. With the Go worker, validityFor reads the
-  // worker's goroutine scheduling p99 instead and does not consult this at all;
-  // it used to, and disqualified idle windows for the host's timer granularity.
-  // VALIDITY_LIMITS.eventLoopP99Ms is set above the measured floor accordingly.
+  // The worker holds the clock, so validityFor reads the worker's goroutine
+  // scheduling p99 and does not consult this at all for a window the worker
+  // covered; it used to, and disqualified idle windows for the host's timer
+  // granularity. This remains the fallback for a window with no worker health,
+  // and VALIDITY_LIMITS.eventLoopP99Ms is set above the measured floor so that
+  // fallback is a gate rather than a permanent fail.
   let loopHist: ReturnType<typeof monitorEventLoopDelay> | null = null;
   try {
     loopHist = monitorEventLoopDelay({ resolution: 20 });

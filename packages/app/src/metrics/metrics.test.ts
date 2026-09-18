@@ -282,9 +282,10 @@ describe("measurement validity", () => {
   });
 
   it("a generator that cannot tell the two apart reports no faults, not zero faults", () => {
-    // genFaults is absent from the in-process TS driver, whose fetch failures
-    // are not separable. Absent must read as "nothing claimed" and leave the
-    // window judged on everything else.
+    // /api/ingest is public, and a generator whose failures are not separable
+    // into "never left us" and "the target refused" simply omits genFaults.
+    // Absent must read as "nothing claimed" and leave the window judged on
+    // everything else.
     const s = createMetricsStore(":memory:");
     const ts = Date.now();
     const bucketTs = Math.floor(ts / 60_000) * 60_000;
@@ -384,12 +385,13 @@ describe("measurement validity", () => {
       s.close();
     });
 
-    it("still judges this event loop when the in-process driver generated the load", () => {
-      // no worker health for the window means nothing else was holding the
-      // clock, and then this loop's delay is in every number the window reports
+    it("falls back to this event loop when no worker health covered the window", () => {
+      // rows from an older build, or a worker whose health batch never landed:
+      // nothing reported a scheduler, so this loop is the only reading there
+      // is. Judging it beats calling a window with traffic in it unjudged.
       const s = createMetricsStore(":memory:");
       const ts = Date.now();
-      s.ingestBatch({ batchId: "tsdriver", results: many(10, { ts }) });
+      s.ingestBatch({ batchId: "noworkerhealth", results: many(10, { ts }) });
       s.recordHealth(health({ ts, cpuProcessPct: 1, eventLoopP99ms: 450 }));
 
       const v = s.summary(300_000).validity;
@@ -564,9 +566,9 @@ describe("pre-aggregated ingest", () => {
   });
 
   it("says nothing rather than 'perfect reuse' when the generator cannot see connections", () => {
-    // the in-process driver reports connectMs = null. A share computed off the
-    // request count would read 0% setups there, which is a claim about the
-    // gateway that nothing measured.
+    // a generator posting to /api/ingest without connection-level hooks reports
+    // connectMs = null. A share computed off the request count would read 0%
+    // setups there, which is a claim about the gateway that nothing measured.
     const s = createMetricsStore(":memory:");
     s.ingestBatch({ batchId: "blind", results: many(50, { connectMs: null }) });
     const c = s.summary(300_000).connSetup;

@@ -198,12 +198,10 @@ describe("weightedPick edge cases", () => {
   });
 });
 
-describe("mode safety", () => {
-  it("unknown mode returns constant equivalent", async () => {
-    const { targetRpsAt } = await import("./scheduler.js");
-    expect(targetRpsAt({ ...p, mode: "unknown" as LoadProfile["mode"] }, Date.now(), Date.now())).toBe(p.rps!);
-  });
-});
+// A "mode safety" case lived here, asserting that an unrecognised mode paced
+// like `constant`. It read targetRpsAt() out of the retired in-process
+// scheduler. Pacing is the worker's now, so the guarantee moved to where it is
+// implemented: TestUnknownModePacesLikeConstant in packages/go/internal/schedule.
 
 describe("pickClass honours the profile knobs", () => {
   it("soapRatioPct=0 produces no SOAP; =100 produces only SOAP", () => {

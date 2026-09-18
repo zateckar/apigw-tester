@@ -507,8 +507,10 @@ export function createMetricsStore(dbPath: string): MetricsStore {
     // idle bookkeeping — on an idle Bun process on Windows its p99 reads up to
     // ~21ms against what used to be a 10ms limit, so consulting it here
     // disqualified windows for the host's timer granularity. Worker health
-    // present means the worker generated the window; absent means the
-    // in-process driver did, and then this loop IS the instrument.
+    // present means the worker reported a scheduler for this window, and that
+    // scheduler is what gets judged. Absent — rows from an older build, or a
+    // health batch that never landed — leaves this loop as the only reading
+    // there is, so it is consulted rather than calling the window unjudged.
     const workerWindows = Number(worker.windows) || 0;
     const workerMeasured = workerWindows > 0;
     const schedMax = workerMeasured && worker.schedMax >= 0 ? worker.schedMax : null;
@@ -810,8 +812,9 @@ export function createMetricsStore(dbPath: string): MetricsStore {
 
       // and so does the generator's own health, for the same reason: a window
       // can never show what was measured without what the instrument was doing
-      // while it measured. Written even when the array is empty — the row's
-      // absence is what "the TS driver generated this" means downstream.
+      // while it measured. An empty array writes nothing, and that absence is
+      // what validityFor reads as "no worker reported a scheduler for this
+      // window" — which is why it must stay an absence rather than a zero row.
       for (const h of agg.health ?? []) {
         if (!Number.isFinite(h?.windowTs)) continue;
         upsertWorkerHealth.run(

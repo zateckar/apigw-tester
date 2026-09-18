@@ -458,9 +458,10 @@ export interface RequestResult {
    * request, not a constant borrowed from another distribution.
    *
    * Null means not measured, which is distinct from measured-and-zero. The
-   * in-process driver issues requests through `fetch`, which exposes no
-   * connection-level hook, so it always reports null and its non-backend time
-   * carries socket setup. The Go worker uses httptrace and separates them.
+   * worker uses httptrace and always fills this in; anything posting to the
+   * public /api/ingest may not be able to see connection events at all (a
+   * `fetch`-based generator, for one), and null is how it says so. A null here
+   * leaves socket setup inside that request's non-backend time.
    */
   connectMs?: number | null;
   /** whether the socket came from the pool. Only meaningful when `connectMs`
@@ -823,10 +824,10 @@ export const VALIDITY_LIMITS = {
   /**
    * Event-loop stall that starts showing up in measured latency.
    *
-   * Applies only when the control plane's own loop is the instrument — i.e. the
-   * in-process TS driver. With the Go backend every clock is read inside the
-   * worker, and this process's loop delay says nothing about the numbers; the
-   * verdict gates on workerSchedP99Ms instead and does not consult this at all.
+   * Every clock is read inside the worker, so for a window the worker reported
+   * health for, this process's loop delay says nothing about the numbers and
+   * the verdict gates on workerSchedP99Ms instead. This applies only to a
+   * window with no worker health, where it is the one reading available.
    *
    * Was 10ms, which is below this instrument's noise floor and so could not
    * pass. Measured on Windows (15.6ms system tick), control plane started and
@@ -923,12 +924,12 @@ export interface WindowValidity {
   /** peak process CPU of whichever process held the clock, as a share of the
    *  whole machine. Null when nothing measured it. */
   cpuProcessPctMax: number | null;
-  /** peak event-loop p99 of the control plane. Null when the control plane was
-   *  not the instrument — a Go-backed run reads workerSchedP99MsMax instead,
-   *  and this process's loop delay is not evidence about those numbers. */
+  /** peak event-loop p99 of the control plane. Null whenever worker health
+   *  covered the window, which is the normal case: workerSchedP99MsMax is the
+   *  reading then, and this process's loop delay is not evidence about it. */
   eventLoopP99MsMax: number | null;
   /** peak goroutine scheduling p99 inside the Go worker, ms. Null when no
-   *  worker health covered the window (no run, or the TS driver). */
+   *  worker health covered the window — no run, or rows from an older build. */
   workerSchedP99MsMax: number | null;
   /** peak CPU inside the Go worker, as a share of its runtime's available CPU */
   workerCpuPctMax: number | null;
@@ -1027,9 +1028,9 @@ export interface MetricSummary {
  * latency and averaging it into one would misattribute it. Reported separately
  * so it can be seen and judged on its own terms.
  *
- * `measured` is 0 when the generator cannot see connection events at all (the
- * in-process driver), which is why `pct` is a share of measured requests rather
- * than of all of them — a zero here would otherwise read as "perfect reuse".
+ * `measured` is 0 when the generator cannot see connection events at all, which
+ * is why `pct` is a share of measured requests rather than of all of them — a
+ * zero here would otherwise read as "perfect reuse".
  */
 export interface ConnSetupStats {
   /** requests that opened a connection instead of reusing one */
@@ -1338,9 +1339,11 @@ export interface RunStatus {
   uptimeSec: number | null;
   profile: LoadProfile | null;
   targetRps: number;
-  /** Concurrency ceiling the driver actually applies: auto-raised above
-   *  profile.maxConcurrency when that value would itself throttle the
-   *  target rate. */
+  /** Concurrency ceiling the run actually applies: the operator's
+   *  profile.maxConcurrency, capped at LIMITS.maxConcurrency and floored at 1.
+   *  Reported by the generator, because only it knows what the clamp did — the
+   *  control plane used to answer with its own default here, so a configured
+   *  500 read as 25 on every worker-driven run. */
   effectiveMaxConcurrency: number;
   /** epoch ms when sustained concurrency-cap throttling began; null while healthy */
   throttledSinceMs: number | null;
@@ -1349,32 +1352,23 @@ export interface RunStatus {
   /**
    * Whether each target resolves to this very process, i.e. the bundled
    * petstore with no gateway in the path. Everything gateway-shaped — contract
-   * blocking, gateway faults, overhead — is vacuous in that configuration, and
-   * the dashboard must say so rather than reporting "0% blocked" in red.
+   * blocking, gateway faults, non-backend time — is vacuous in that
+   * configuration, and the dashboard must say so rather than reporting
+   * "0% blocked" in red.
    */
   targetIsSelf: { rest: boolean; soap: boolean };
   /**
-   * Which process generates the load. "go" is the only supported one; "ts" is a
-   * test fixture, reported so a window measured by it is never mistaken for a
-   * production measurement — it cannot see connection events at all, and its
-   * validity rests on the control plane's event loop rather than on the
-   * generator's scheduler.
-   */
-  backend: LoadgenBackend;
-  /**
    * Why no load can be generated right now, or null.
    *
-   * There used to be a silent fallback here: a missing or unstartable worker
-   * binary quietly handed generation to the in-process driver, and the run went
-   * ahead on a different instrument with a different validity story and no
-   * connection timing, with nothing in the UI to say so. A rig that changes
-   * instrument without telling anyone is worse than one that stops.
+   * There is one generator — the Go worker — and nothing to fall back to. A
+   * missing or unstartable binary used to hand generation to a second,
+   * in-process implementation, and the run went ahead on a different instrument
+   * with no connection timing and a different validity story, with nothing in
+   * the UI to say so. A rig that changes instrument without telling anyone is
+   * worse than one that stops.
    */
   generatorError: string | null;
 }
-
-/** Which process generates the load. Only "go" is supported; see RunStatus. */
-export type LoadgenBackend = "ts" | "go";
 
 export interface RunCounters {
   sent: number;

@@ -22,7 +22,9 @@ import (
 // SERVER_MS_HEADER in packages/app/src/petstore/server.ts.
 const ServerMSHeader = "X-Server-Ms"
 
-// Timeout budgets per class, mirroring the TS driver.
+// Timeout budgets per class. Generous on purpose: a timeout here is recorded
+// as a failure of the target, so the budget has to be past anything a healthy
+// gateway would do, not near it.
 const (
 	budgetSmallMs = 15_000
 	budgetLargeMs = 60_000
@@ -233,8 +235,10 @@ func (f *Firer) Fire(j *Job) {
 	}
 }
 
-// ParseServerMs mirrors parseServerMs in the TS driver: absent or garbage →
-// nil, a non-negative number → the SUT's own processing time.
+// ParseServerMs reads the SUT's own processing time out of ServerMSHeader:
+// absent or garbage → nil, a non-negative number → the value. nil rather than
+// zero, because zero is a real reading and "the backend did not tell us" must
+// not be charged to the gateway as non-backend time.
 func ParseServerMs(raw string) *float64 {
 	if raw == "" {
 		return nil

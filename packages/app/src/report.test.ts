@@ -9,8 +9,8 @@ import { buildRunReport, redactGateway, renderRunReportMarkdown } from "./report
 const okValidity: WindowValidity = {
   ok: true, reasons: [], droppedRequests: 0, shedPct: 0, resultsLost: 0, genFaults: 0,
   targetRps: 25, achievedRps: 25, cpuProcessPctMax: 20,
-  // the in-process driver's shape: this loop is the instrument, so the worker
-  // numbers are null. A Go-backed window is the mirror image.
+  // a window with no worker health: this loop is the only reading there is, so
+  // the worker numbers are null. A worker-covered window is the mirror image.
   eventLoopP99MsMax: 4, workerSchedP99MsMax: null, workerCpuPctMax: null
 };
 

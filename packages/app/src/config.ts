@@ -36,13 +36,16 @@ const PKG_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
  *   often enough to disqualify most health windows.
  * - `ts` — the original in-process route table on the app's own port. Kept as a
  *   fallback for when the binary is missing, and as the executable spec the Go
- *   port is checked against.
+ *   port is checked against — `contract.test.ts` asserts both against the same
+ *   hand-written OpenAPI and WSDL.
  *
- * Unlike LOADGEN_BACKEND, this still falls back to `ts` when the binary is
- * absent. The asymmetry is deliberate but not obviously right: the load
- * generator is the instrument and must never be swapped silently, while this is
- * the thing being measured — but the in-process petstore does share the control
- * plane's event loop, so its X-Server-Ms is not independent of it either.
+ * The load generator has no such fallback: a missing worker binary refuses the
+ * run outright. The asymmetry is deliberate but not obviously right. The
+ * generator is the instrument and must never be swapped silently; this is the
+ * thing being measured, and a rig that cannot measure anything is less useful
+ * than one measuring a slower subject. But the in-process petstore does share
+ * the control plane's event loop, so its X-Server-Ms is not independent of it
+ * either, and falling back here quietly changes what the numbers mean too.
  */
 export type SutBackend = "go" | "ts";
 

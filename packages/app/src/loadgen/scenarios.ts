@@ -9,6 +9,23 @@ import { PET_STATUSES } from "@apigw/shared";
  * validation switched on should pass all of it. The `invalid` class exists
  * precisely to prove the validation is on: it emits contract violations that a
  * validating gateway is expected to reject with a 4xx.
+ *
+ * **Nothing in production calls this any more.** The Go worker generates the
+ * load and builds its own specs (packages/go/internal/scen), which mirrors this
+ * file by hand. It is kept, deliberately, for two reasons:
+ *
+ *   - it is the *specification* the Go port is written against, and it is pure
+ *     — a profile in, a spec out, no I/O — so scenarios.test.ts can assert
+ *     things about the traffic mix (ratios land near their knobs, every valid
+ *     request stays inside the documented parameter ranges, every invalid one
+ *     is genuinely malformed) far more cheaply and precisely than any test that
+ *     has to observe real requests;
+ *   - the petstore contract tests fire these specs directly at both SUT
+ *     implementations, which is how "the traffic we generate conforms to the
+ *     contract we publish" is checked at all.
+ *
+ * Change this and the Go port together, or the two drift and the assertion that
+ * the generated traffic is contract-clean stops describing what is sent.
  */
 
 export interface ReqSpec {
@@ -232,20 +249,6 @@ function bigRequestBody(size: number): string {
     bigRequestBodies.set(size, body);
   }
   return body;
-}
-
-const SMALL_BYTES = 1024;
-
-/**
- * Cheap byte length of a spec body. `Buffer.byteLength` walks and encodes the
- * whole string — at high rps it spends real time on buffered 1MB pads. The
- * pad bodies are pure ASCII, so char length IS byte length; and a small body
- * (name/status JSON, SOAP envelope) is cheap to walk, so it's measured anew.
- */
-export function bigRequestBytes(body: string | null): number {
-  if (body === null) return 0;
-  if (body.length > SMALL_BYTES) return body.length; // big-request pads are ASCII
-  return Buffer.byteLength(body);
 }
 
 export function buildSlowSpec(rand: () => number = Math.random): ReqSpec {

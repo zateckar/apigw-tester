@@ -14,8 +14,8 @@ import (
 	"github.com/apigw-tester/go/internal/wire"
 )
 
-// RequestIds generates correlation ids the way the TS driver does: one
-// random 6-byte prefix per run plus a counter, so ids are unique within and
+// RequestIds generates correlation ids as one random 6-byte prefix per run
+// plus a counter, so ids are unique within and
 // across runs, monotonic in send order, and near-free compared to randomUUID
 // per request.
 type RequestIds struct {
@@ -43,7 +43,7 @@ func (r *RequestIds) Reset() {
 
 // Next returns a 32-hex id usable verbatim as a W3C trace-id plus the
 // traceparent header built from it. The span id mixes run entropy with the
-// counter, matching the TS driver.
+// counter, so it is distinct from the trace id without a second draw.
 func (r *RequestIds) Next() (requestID string, traceparent string) {
 	seq := r.seq.Add(1)
 	seqHex := fmt.Sprintf("%020x", seq)

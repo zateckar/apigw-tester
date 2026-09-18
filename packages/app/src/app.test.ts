@@ -1,13 +1,12 @@
 import { describe, expect, it, beforeAll, afterAll } from "bun:test";
 import { buildApp } from "./app.js";
 import { readConfig } from "./config.js";
+import { TestDriver } from "./loadgen/testDriver.js";
 import { MEASUREMENT_VERSION, POLICY_LIMITS, type RequestResult, type SystemMetrics } from "@apigw/shared";
 
 // Auth: tests run with a fixed known credential
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
-// Exercise the TS driver here (backend coverage lives in driver.go.test.ts),
-// otherwise these runs spawn the Go worker whenever its binary is present.
-process.env["LOADGEN_BACKEND"] = "ts";const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
+const AUTH = `Basic ${Buffer.from("test:pw-123").toString("base64")}`;
 
 let base: string;
 let built: ReturnType<typeof buildApp>;
@@ -45,7 +44,12 @@ function makeResult(i: number, ts: number, protocol: "rest" | "soap" = "rest", c
 beforeAll(async () => {
   // in-process petstore: this suite asserts on the control plane's own routing
   // and on petstore paths answering from the same port
-  built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
+  // TestDriver so this suite does not spawn a worker child process it has no
+  // use for; end-to-end generation is covered in driver.go.test.ts
+  built = buildApp(
+    { ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" },
+    { driver: new TestDriver() }
+  );
   server = built.listen(0);
   base = `http://127.0.0.1:${server.port}`;
 });

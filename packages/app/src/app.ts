@@ -196,7 +196,21 @@ function match(route: ParsedRoute, method: string, segs: string[]): Record<strin
 const json = (status: number, body: unknown, extra?: Record<string, string>): Response =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extra } });
 
-export function buildApp(cfg: AppConfig): BuiltApp {
+/**
+ * Options that are not configuration.
+ *
+ * `driver` is a seam, not a feature: constructing a Driver spawns the Go worker
+ * as a child process, which most of the app's tests neither need nor want. They
+ * used to avoid it by setting LOADGEN_BACKEND=ts, which selected a second,
+ * in-process generator — and that second generator was worth far more than a
+ * test seam, so it stayed in production and quietly diverged. This is the seam
+ * on its own.
+ */
+export interface BuildOpts {
+  driver?: Driver;
+}
+
+export function buildApp(cfg: AppConfig, opts: BuildOpts = {}): BuiltApp {
   // ---------------- SUT: petstore ----------------
   // `runtime` is a copy because an ephemeral SUT port is not known until the
   // child has bound it, and the caller's config object is not ours to rewrite.
@@ -241,8 +255,8 @@ export function buildApp(cfg: AppConfig): BuiltApp {
   // host/process sampler for /api/system — memory-only, no DB writes
   const sampler = createSystemSampler();
 
-  // ---------------- load driver (in-process) ----------------
-  const driver = new Driver();
+  // ---------------- load generator control plane ----------------
+  const driver = opts.driver ?? new Driver();
   sampler.start();
   // Batches reach here pre-rolled: a few dozen cells and a capped raw tail,
   // whatever the request rate. Everything on this line — the structured clone

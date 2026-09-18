@@ -7,8 +7,9 @@ import (
 	"sync"
 )
 
-// StatusMsg is the {"op":"status"} snapshot. Field names match the TS driver
-// status channel exactly.
+// StatusMsg is the {"op":"status"} snapshot. Field names match GoStatusMsg in
+// packages/app/src/loadgen/goClient.ts exactly; that interface is how the
+// control plane reads this, and it does no renaming.
 type StatusMsg struct {
 	RunID                    string  `json:"runId"`
 	Sent                     int64   `json:"sent"`
@@ -27,6 +28,16 @@ type StatusMsg struct {
 	// measurements discarded after the request was served. Never merge them.
 	Dropped     int64 `json:"dropped"`
 	ResultsLost int64 `json:"resultsLost"`
+	// EffectiveMaxConcurrency is the ceiling this run actually applies: the
+	// operator's number clamped by LimitMaxConcurrency. Reported because the
+	// control plane cannot derive it — it used to display its own default here
+	// on every worker-driven run, so a configured 500 read as 25.
+	EffectiveMaxConcurrency int `json:"effectiveMaxConcurrency"`
+	// ThrottledSinceMs is when the ceiling started continuously refusing load,
+	// or 0 while healthy. A duration rather than an instantaneous flag: one
+	// full semaphore is normal at any rate, a sustained one is the ceiling
+	// binding and the reason the target is not being met.
+	ThrottledSinceMs int64 `json:"throttledSinceMs"`
 }
 
 type statusEnvelope struct {

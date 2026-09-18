@@ -2,11 +2,18 @@ import { describe, expect, it } from "bun:test";
 import { buildApp } from "../app.js";
 import { readConfig } from "../config.js";
 import { workerBinaryPath } from "./goClient.js";
-import { MEASUREMENT_VERSION, type MetricSummary, type RequestResult, type RunCounters } from "@apigw/shared";
+import {
+  MEASUREMENT_VERSION,
+  type MetricSummary,
+  type RequestResult,
+  type RunCounters,
+  type RunStatus
+} from "@apigw/shared";
 
-// This integration test exercises Driver against the Go worker end-to-end.
-// Both cases are skipped when the worker binary is absent (dev machines
-// without Go installed); the ts-control case guards regressions in shape.
+// This is the only test that generates real load. Everything else stubs the
+// worker out (see TestDriver), so this is where the contract between the two
+// processes — result shape, counters, roll-ups, the status surface — is checked
+// against traffic that actually happened. Skipped when the binary is absent.
 const HAVE_GO_WORKER = workerBinaryPath() !== null;
 
 process.env["APP_BASIC_AUTH"] = "test:pw-123";
@@ -28,22 +35,18 @@ interface RunOutcome {
   results: RequestResult[];
   /** the generator's own exact tallies, read just before stop */
   counters: RunCounters;
+  /** the whole status surface the dashboard reads, as the run wound down */
+  status: RunStatus;
   /** the store's view of the run, where the histograms are read back */
   summary: MetricSummary;
 }
 
 /**
- * Start the full app on an ephemeral port with the given loadgen backend,
- * run a bounded constant-rate load against the bundled petstore (the gateway
- * target defaults to self), then pull the ingested rows back out.
+ * Start the full app on an ephemeral port, run a bounded constant-rate load
+ * against the bundled petstore (the gateway target defaults to self), then pull
+ * the ingested rows back out.
  */
-async function runOnce(
-  backend: "ts" | "go",
-  seconds: number,
-  rps: number,
-  profile: Record<string, unknown>
-): Promise<RunOutcome> {
-  process.env["LOADGEN_BACKEND"] = backend;
+async function runOnce(seconds: number, profile: Record<string, unknown>): Promise<RunOutcome> {
   // selfUrl is what "us" means for forwardBasicAuth: "auto". It defaults to the
   // split-out SUT's own port, so pinning PORT is not enough — this run keeps the
   // petstore in-process, so selfUrl has to be walked back to the app's ephemeral
@@ -52,8 +55,8 @@ async function runOnce(
   process.env["PORT"] = String(port);
   const built = buildApp({
     ...readConfig(),
-    // in-process petstore: this test is about the two load generators, and
-    // spawning a second process would add a variable it is not measuring
+    // in-process petstore: this test is about the load generator, and spawning
+    // a third process would add a variable it is not measuring
     sutBackend: "ts",
     selfUrl: `http://127.0.0.1:${port}`,
     dbPath: ":memory:",
@@ -65,7 +68,7 @@ async function runOnce(
 
   // Batches land in SQLite through the store's ingest; we pull rows back out
   // via /api/recent (the same read path the dashboard uses), which keeps this
-  // black-box for both backends.
+  // black-box: nothing below reaches into the Driver.
 
   const authed = (path: string, init?: RequestInit) =>
     fetch(`${base}${path}`, {
@@ -111,20 +114,18 @@ async function runOnce(
 
     const stop = await authed("/api/run/stop", { method: "POST" });
     expect(stop.status).toBe(200);
-    // final batches land after stop: the TS driver flushes synchronously in
-    // stop(), the Go worker drains its in-flight set then flushes — plus one
-    // results-socket round trip
+    // final batches land after stop: the worker drains its in-flight set, then
+    // flushes — plus one results-socket round trip
     await sleep(2500);
 
     // Volume comes from the generator's own counters, not from the recent
     // tail: that tail is sampled above ~500 rows, so counting it as issued
     // load reads a sampling change as a throughput regression. Read after the
-    // drain, when nothing is in flight — mid-run, the two backends differ in
-    // when a request joins `sent` versus `ok`, which is not a difference worth
-    // asserting on.
+    // drain, when nothing is in flight — mid-run a request sits in `sent` but
+    // not yet in `ok`, so the ratio below would be asserting on timing.
     const statusRes = await authed("/api/run/status");
     expect(statusRes.status).toBe(200);
-    const { counters } = await statusRes.json() as { counters: RunCounters };
+    const status = await statusRes.json() as RunStatus;
 
     const recent = await authed(`/api/recent?limit=500`);
     expect(recent.status).toBe(200);
@@ -134,27 +135,30 @@ async function runOnce(
     expect(summaryRes.status).toBe(200);
     const summary = await summaryRes.json() as MetricSummary;
 
-    return { results: (body.items ?? []).filter((r) => r.runId === runId), counters, summary };
+    return {
+      results: (body.items ?? []).filter((r) => r.runId === runId),
+      counters: status.counters,
+      status,
+      summary
+    };
   } finally {
     await built.shutdown();
     server.stop(true);
-    delete process.env["LOADGEN_BACKEND"];
     delete process.env["PORT"];
   }
 }
 
-describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
+describe.skipIf(!HAVE_GO_WORKER)("the Go load generator, end to end", () => {
   it(
-    "ingests batches whose results match the TS contract in shape and volume",
+    "ingests batches whose results carry the full measurement contract",
     async () => {
-      // Fourteen seconds, not three. The reference stream runs at 2% of the
-      // load — 4 observations a second here — and the headline Δ pools only the
-      // latency-sensitive classes, which is roughly half of them. A p50 needs
-      // 20 on the thinner side, so a shorter run would report the Δ as
-      // unavailable and this test would assert nothing about the measurement.
-      // Raising the rate instead of the duration is the wrong trade: the TS
-      // control shares a process with the SUT, and pushing it to saturation
-      // would disqualify the very windows being measured.
+      // There was a second run here, driving the same shape through an
+      // in-process TS generator, and two assertions comparing the two. That
+      // generator is gone, and the comparison was largely redundant anyway: the
+      // absolute bands below (delivered volume, ok ratio) say the same thing
+      // without needing a second implementation to say it against. The run is
+      // long enough to put every scenario class and the invalid slice through
+      // the scheduler several times over.
       const SECONDS = 14;
       const RPS = 200;
       const expected = SECONDS * RPS;
@@ -165,11 +169,7 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
         scenarioWeights: { listPets: 50, getPet: 20, createPet: 10, updatePet: 5, deletePet: 5, placeOrder: 10 }
       };
 
-      // control run: the in-process TS driver against the same shape
-      const ts = await runOnce("ts", SECONDS, RPS, gwProfile);
-      expect(ts.counters.sent).toBeGreaterThan(expected * 0.6);
-
-      const go = await runOnce("go", SECONDS, RPS, gwProfile);
+      const go = await runOnce(SECONDS, gwProfile);
       const results = go.results;
 
       // allow a wide but bounded band because the concurrency ceiling and OS
@@ -178,7 +178,6 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
       expect(go.counters.sent).toBeLessThan(expected * 1.2);
       // nothing may be measured and then quietly discarded
       expect(go.counters.resultsLost).toBe(0);
-      expect(ts.counters.resultsLost).toBe(0);
 
       const sample = results[0]!;
       for (const key of [
@@ -203,32 +202,27 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
         expect(r.ttfbMs).not.toBeNull();
       }
 
-      // Both backends must measure non-backend time on the load itself, with no
-      // second stream to difference against. The count is the assertion that
-      // matters: it is per-request now, so it tracks the traffic rather than a
-      // 2% slice of it, and a percentile exists at any rate.
-      for (const outcome of [go, ts]) {
-        const nb = outcome.summary.nonBackendMs;
-        expect(nb.count).toBeGreaterThan(outcome.counters.ok * 0.8);
-        expect(nb.p50).not.toBeNull();
-        expect(nb.p99).not.toBeNull();
-      }
+      // Non-backend time is measured on the load itself, with no second stream
+      // to difference against. The count is the assertion that matters: it is
+      // per-request, so it tracks the traffic rather than a 2% slice of it, and
+      // a percentile therefore exists at any rate.
+      const nb = go.summary.nonBackendMs;
+      expect(nb.count).toBeGreaterThan(go.counters.ok * 0.8);
+      expect(nb.p50).not.toBeNull();
+      expect(nb.p99).not.toBeNull();
       // the target here IS the SUT, so there is no gateway in the path and the
       // number must be small — a large one would mean the measurement is
       // reading something other than time spent outside the backend handler
-      expect(Math.abs(go.summary.nonBackendMs.p50!)).toBeLessThan(50);
+      expect(Math.abs(nb.p50!)).toBeLessThan(50);
 
       // invalidRatioPct=2 must actually flow through the Go scheduler
       const invalid = results.filter((r) => r.class === "invalid");
       expect(invalid.length).toBeGreaterThan(0);
 
-      // equivalence with the TS control run: same outcome mix and same
-      // delivered volume within a tolerance — both ran at the same rps
-      // against the same SUT
-      const tsOk = ts.counters.ok / ts.counters.sent;
-      const goOk = go.counters.ok / go.counters.sent;
-      expect(Math.abs(tsOk - goOk)).toBeLessThan(0.05);
-      expect(Math.abs(ts.counters.sent - go.counters.sent) / ts.counters.sent).toBeLessThan(0.1);
+      // the ceiling the worker applied reaches the status surface. This was
+      // reported from the retired in-process path, so every real run showed the
+      // default rather than the configured 100.
+      expect(go.status.effectiveMaxConcurrency).toBe(100);
     },
     { timeout: 120_000 }
   );
@@ -241,7 +235,6 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
     // "stopping" until the process was restarted, and no further run could be
     // started. Asserting on the state after the stop is what catches that —
     // asserting the stop call returns 200 does not, because it always did.
-    process.env["LOADGEN_BACKEND"] = "go";
     const built = buildApp({ ...readConfig(), sutBackend: "ts", dbPath: ":memory:", publicDir: "nope" });
     const server = built.listen(0);
     await built.ready;
@@ -286,7 +279,6 @@ describe.skipIf(!HAVE_GO_WORKER)("driver with LOADGEN_BACKEND=go", () => {
     } finally {
       await built.shutdown();
       server.stop(true);
-      delete process.env["LOADGEN_BACKEND"];
     }
   }, { timeout: 180_000 });
 });
