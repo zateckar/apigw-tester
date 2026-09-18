@@ -34,9 +34,9 @@ type RequestResult struct {
 	ConnReused         bool     `json:"connReused"`
 	MeasurementVersion int      `json:"measurementVersion"`
 	BytesReq           int64    `json:"bytesReq"`
-	BytesResp      int64   `json:"bytesResp"`
-	ReachedBackend bool    `json:"reachedBackend"`
-	Error          *string `json:"error"`
+	BytesResp          int64    `json:"bytesResp"`
+	ReachedBackend     bool     `json:"reachedBackend"`
+	Error              *string  `json:"error"`
 	// GenFault marks a failure that never left this process — see
 	// fire.NeverLeftTheGenerator. Such a request is not evidence about the
 	// target and is kept out of its error rate; it is counted per minute in
